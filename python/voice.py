@@ -497,7 +497,13 @@ def resume_listening():
     with _speaking_lock:
         _speaking = max(0, _speaking - 1)
         _deaf_until = max(_deaf_until, time.monotonic() + _ECHO_TAIL_S)
-    _microphone()
+    try:
+        _microphone()
+    except Exception as exc:
+        # Igual que en listen_turn(): sin headset USB esto no puede tirar la
+        # App entera (App.run() no reintenta un loop() que lanza sin atrapar).
+        logger.warning(f"No se pudo reabrir el microfono ({exc}); reviso el headset USB")
+        _debug(f"⚠ sin microfono: {exc}")
 
 
 # --- Escucha: nombre del guia + la pregunta ---------------------------------
