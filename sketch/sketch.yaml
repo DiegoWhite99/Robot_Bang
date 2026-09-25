@@ -1,0 +1,14 @@
+profiles:
+  default:
+    fqbn:
+    platforms:
+      - platform: arduino:zephyr
+    libraries:
+      - dependency: Adafruit BusIO (1.17.4)
+      - Adafruit GFX Library (1.12.6)
+      - Adafruit ST7735 and ST7789 Library (1.10.4)
+      - dependency: Adafruit seesaw Library (1.7.9)
+      - dependency: SD (1.3.0)
+      - Servo (1.3.0)
+
+default_profile: default

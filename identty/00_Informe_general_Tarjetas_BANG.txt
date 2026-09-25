@@ -1,0 +1,147 @@
+========================================================================
+INFORME GENERAL — TARJETAS BANG (IdeaVerso / BANG Academy)
+Qué es la metodología y cómo se usa
+========================================================================
+Fuente: https://space-bang.com/platform/ideaverso/tarjetas
+Plataforma: BANG Academy — Academia de Innovación Creativa
+Fecha del informe: 07/09/2026
+
+
+1. CONTEXTO: DÓNDE VIVE LA METODOLOGÍA
+------------------------------------------------------------------------
+BANG Academy es una "Academia de Innovación Creativa". Dentro de la
+plataforma, el módulo de creatividad se llama IdeaVerso, descrito como
+"el universo donde tus ideas cobran forma. Elige un instrumento creativo
+y comienza a construir."
+
+IdeaVerso agrupa tres instrumentos creativos:
+
+  01 — Tarjetas BANG
+       Mazos de inspiración creativa con 5 personajes únicos.
+  02 — BangLite
+       Gestión de proyectos con estados sólido, gaseoso y líquido.
+  03 — Tarjetas Quillero
+       Cartas creativas para explorar nuevas perspectivas.
+
+Este informe se centra en el instrumento 01, Tarjetas BANG.
+
+
+2. QUÉ ES: TARJETAS BANG
+------------------------------------------------------------------------
+Tarjetas BANG es un mazo de inspiración creativa organizado en torno a
+CINCO PERSONAJES. Cada personaje es un "mazo" temático con su propia
+personalidad, su propio color y su propio estilo de pensar.
+
+La consigna que da la propia plataforma es:
+  "Elige un personaje para explorar su mazo de inspiración creativa.
+   Cada carta tiene un mensaje único para activar tus ideas."
+
+En términos prácticos, es una baraja de estímulos creativos (provocaciones
+breves tipo "oblique strategies" / lateral thinking) para desbloquear
+ideas, romper la página en blanco y forzar nuevos ángulos sobre un reto.
+
+Estructura del mazo:
+  - 5 personajes.
+  - 10 cartas por personaje.
+  - 50 cartas en total.
+  - Cada carta = un mensaje/provocación corto (una frase accionable).
+
+Los cinco personajes y su enfoque (identidad + color):
+
+  PERSONAJE   COLOR        ARQUETIPO CREATIVO (resumen)
+  ---------   ----------   ------------------------------------------
+  Crispi      Verde        El constructor: empezar pequeño, iterar,
+                           escalar y reutilizar.
+  Carmel      Ámbar        El estratega: transformar, priorizar
+                           fortalezas y crear valor con confianza.
+  Cesia       Rojo         La disruptora: romper miedos, reglas y
+                           supuestos; provocar.
+  Cori        Violeta      El pensador lateral juguetón: combinar,
+                           observar, jugar, mirar los dos lados.
+  Cristal     Cian         La musa reflexiva: inspirarse fuera, aprender,
+                           simplificar y preguntarse "¿qué pasaría si?".
+
+(Cada personaje tiene su reporte de personalidad individual en un archivo
+aparte, con las 10 cartas de su mazo.)
+
+
+3. CÓMO FUNCIONA LA INTERFAZ (mecánica observada)
+------------------------------------------------------------------------
+El flujo de uso en la plataforma es:
+
+  a) Entras a IdeaVerso y eliges "Tarjetas BANG".
+  b) Ves los 5 personajes, cada uno con la etiqueta "10 cartas".
+  c) Eliges un personaje ("Elige un personaje para explorar su mazo").
+  d) Se abre el visor de cartas: muestra UNA carta a la vez, con el
+     mensaje al centro, el nombre del personaje y un contador (p. ej.
+     "03 / 10").
+  e) El botón "Inspírate más" saca/rota otra carta del mazo del personaje.
+  f) Un botón de corazón (favorito) permite marcar cartas que te sirven.
+  g) "Elegir otro mazo" / "IdeaVerso" te devuelven a la selección para
+     cambiar de personaje.
+
+Idea de diseño: se saca de a una carta para concentrar la atención en un
+solo estímulo, en vez de abrumar con las 50 provocaciones a la vez.
+
+
+4. CÓMO SE USA (guía práctica de aplicación)
+------------------------------------------------------------------------
+La metodología funciona como un "generador de provocaciones" sobre un reto
+concreto. Un flujo recomendado:
+
+  PASO 1 — Define el reto en una frase.
+     Ej.: "¿Cómo hago que el laboratorio muestre mejor sus proyectos?"
+
+  PASO 2 — Elige un personaje según el tipo de empujón que necesitas.
+     - ¿Estás estancado y necesitas construir/aterrizar? -> Crispi.
+     - ¿Necesitas estrategia y foco de valor? -> Carmel.
+     - ¿Todo suena igual y hay que romper lo establecido? -> Cesia.
+     - ¿Necesitas ideas laterales y frescas? -> Cori.
+     - ¿Buscas inspiración externa o volver a lo esencial? -> Cristal.
+     (Si no sabes, saca de cualquiera: la sorpresa es parte del método.)
+
+  PASO 3 — Saca una carta ("Inspírate más").
+
+  PASO 4 — Aplica la carta a tu reto durante 2-5 minutos.
+     Obligación clave: la carta NO es una respuesta, es una LENTE. Se
+     responde: "Si tomo en serio esta frase, ¿qué idea aparece para MI
+     reto?". Anota 1-3 ideas.
+
+  PASO 5 — ¿Sirvió? Marca la carta como favorita (corazón).
+     ¿No sirvió? Saca otra. Cambia de personaje cuando quieras otro tono.
+
+  PASO 6 — Cierra: revisa favoritos, elige 1-3 ideas y conviértelas en
+     próximos pasos concretos.
+
+Modos de uso:
+  - INDIVIDUAL: para desbloquear ideación propia o vencer la página en
+    blanco.
+  - EN EQUIPO / FACILITACIÓN: repartir cartas, cada persona idea sobre la
+    suya y luego se ponen en común. Ideal para calentamiento de sesiones
+    de innovación, brainstorming o talleres.
+  - COMBINADO: una vez que tienes ideas con Tarjetas BANG, puedes pasarlas
+    a BangLite (gestión por estados sólido/gaseoso/líquido) para
+    aterrizarlas en proyecto.
+
+
+5. PRINCIPIOS DE LA METODOLOGÍA
+------------------------------------------------------------------------
+  - Estímulo breve > brief largo. Una frase corta obliga a interpretar y
+    genera más ideas que una instrucción cerrada.
+  - Personajes = lentes. Cada personaje impone una forma distinta de mirar
+    el mismo problema; cambiar de personaje = cambiar de perspectiva.
+  - Restricción creativa. Muchas cartas imponen una limitación deliberada
+    ("Menos es más", "Sé aburrido", "Comienza por lo último") porque la
+    restricción dispara la creatividad.
+  - Sacar de a una. Foco en un solo estímulo por vez.
+  - Divergir antes de converger. Primero se generan ideas con las cartas;
+    después se selecciona (favoritos) y se aterriza.
+
+
+6. RESUMEN EN UNA LÍNEA
+------------------------------------------------------------------------
+Tarjetas BANG es una baraja de 50 provocaciones creativas repartidas en
+5 personajes-lente (10 cartas c/u); eliges un personaje, sacas una carta,
+aplicas su frase como perspectiva sobre tu reto y capturas las ideas que
+aparecen — sola/o o en equipo — como motor de ideación dentro del módulo
+IdeaVerso de BANG Academy.

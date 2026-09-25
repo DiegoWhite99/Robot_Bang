@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//home/arduino/.arduino15/internal/**)",
+      "Read(//home/arduino/.arduino15/packages/arduino/hardware/zephyr/0.90.0/libraries/**)",
+      "Read(//home/arduino/.arduino15/internal/Adafruit_ST7735_and_ST7789_Library_1.10.4_c4e58bad7ca76cf3/**)",
+      "Bash(arduino-cli compile *)",
+      "Bash(arduino-app-cli app *)",
+      "Bash(timeout 20 arduino-app-cli monitor)",
+      "Bash(timeout 45 arduino-app-cli monitor)",
+      "Bash(timeout 40 arduino-app-cli monitor)",
+      "Bash(awk '{print}')"
+    ]
+  }
+}

@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0" />
+    <title>★ CHAT BANG ★</title>
+    <link rel="stylesheet" type="text/css" href="style.css" />
+  </head>
+  <body>
+    <div class="desktop">
+      <div class="window">
+        <div class="titlebar">
+          <span class="titlebar-text">📀 CHAT-BANG.EXE — Asistente de Innovación</span>
+          <div class="titlebar-buttons">
+            <span>_</span><span>□</span><span>✕</span>
+          </div>
+        </div>
+
+        <marquee class="marquee" behavior="scroll" scrollamount="5">
+          ★彡 BIENVENID@ A CHAT BANG 彡★ &nbsp;&nbsp;&nbsp; DI "CRISPI" Y TU PREGUNTA &nbsp;&nbsp;&nbsp; ★彡 LOS DEMÁS GUÍAS SE DESBLOQUEAN DESDE LA TERMINAL 彡★
+        </marquee>
+
+        <div class="toolbar">
+          <button id="bt-btn" class="btn95" type="button">🔵 BLUETOOTH</button>
+          <button id="terminal-btn" class="btn95" type="button">💻 TERMINAL</button>
+        </div>
+
+        <div class="content">
+          <fieldset class="panel-inset personas">
+            <legend>👾 Los 5 guías</legend>
+            <div id="persona-cards" class="persona-buttons">
+              <span class="loading">cargando guías...</span>
+            </div>
+          </fieldset>
+
+          <fieldset class="panel-inset bang-panel">
+            <legend>🧪 Reto BANG</legend>
+            <div class="phases">
+              <span class="phase" data-phase="solida">1 · SÓLIDA</span>
+              <span class="phase" data-phase="gaseosa">2 · GASEOSA</span>
+              <span class="phase" data-phase="liquida">3 · LÍQUIDA</span>
+            </div>
+            <div id="bang-reto" class="bang-line">Todavía no hay reto. Di "Crispi, mi reto es...".</div>
+            <div id="bang-pregunta" class="bang-line pregunta" hidden></div>
+            <div id="bang-cards" class="cards" hidden></div>
+            <div id="bang-ideas" class="bang-line" hidden></div>
+            <div class="bang-help">Por voz: "saca una tarjeta" · "siguiente fase" · "nuevo reto"</div>
+          </fieldset>
+
+          <fieldset class="panel-inset chat-area">
+            <legend>💬 Lo que el robot escucha y responde</legend>
+            <div id="chat-log" class="chat-log">
+              <div class="line system">Di "Crispi" cerca del micrófono y cuéntale tu reto. Después de que responda, tienes unos segundos para contestarle sin repetir su nombre.</div>
+            </div>
+          </fieldset>
+
+          <fieldset class="panel-inset chat-area">
+            <legend>🩺 Diagnóstico en vivo (qué sonido está captando)</legend>
+            <div id="debug-log" class="chat-log debug-log">
+              <div class="line system">Esperando sonido del micrófono...</div>
+            </div>
+          </fieldset>
+
+          <div id="status-bar" class="status-bar">conectando...</div>
+        </div>
+
+        <div class="statusbar-footer">
+          <span>© 1996-2026 BANG ACADEMY</span>
+          <span class="blink">● EN LÍNEA</span>
+          <span id="hit-counter">VISITAS: 0000042</span>
+        </div>
+      </div>
+    </div>
+
+    <div id="terminal" class="terminal-overlay" hidden>
+      <div class="window terminal-window" role="dialog" aria-label="Terminal">
+        <div class="titlebar">
+          <span class="titlebar-text">💻 C:\BANG\TERMINAL.EXE</span>
+          <div class="titlebar-buttons">
+            <span id="terminal-close" class="close" role="button" title="Cerrar">✕</span>
+          </div>
+        </div>
+        <div id="terminal-out" class="terminal-out"></div>
+        <form id="terminal-form" class="terminal-form" autocomplete="off">
+          <label for="terminal-input">C:\BANG&gt;</label>
+          <input id="terminal-input" type="text" spellcheck="false" autocapitalize="off" placeholder="/help" />
+        </form>
+      </div>
+    </div>
+
+    <div id="bt" class="terminal-overlay" hidden>
+      <div class="window terminal-window" role="dialog" aria-label="Bluetooth">
+        <div class="titlebar">
+          <span class="titlebar-text">🔵 BLUETOOTH.EXE — Bocina del robot</span>
+          <div class="titlebar-buttons">
+            <span id="bt-close" class="close" role="button" title="Cerrar">✕</span>
+          </div>
+        </div>
+        <div class="bt-body">
+          <div id="bt-status" class="bt-status">consultando...</div>
+          <div class="bt-actions">
+            <button id="bt-scan" class="btn95" type="button">🔍 BUSCAR BOCINAS</button>
+            <button id="bt-refresh" class="btn95" type="button">↻ ACTUALIZAR</button>
+          </div>
+          <div class="bt-hint">Para una bocina nueva: ponla en modo emparejar (luz parpadeando), toca BUSCAR y luego CONECTAR.</div>
+          <div id="bt-list" class="bt-list"></div>
+        </div>
+      </div>
+    </div>
+
+    <script src="libs/socket.io.min.js"></script>
+    <script src="libs/arduino.js"></script>
+    <script src="app.js"></script>
+  </body>
+</html>

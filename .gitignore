@@ -1,0 +1,10 @@
+# ignore app cache folder
+.cache/
+
+# credenciales: NUNCA versionar ni compartir
+google-credentials.json
+*-credentials.json
+certs/*.pem
+
+# estado local de la App (guias desbloqueados)
+data/
