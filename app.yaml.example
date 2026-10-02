@@ -1,0 +1,23 @@
+# Plantilla de app.yaml. El archivo real NO se versiona porque App Lab guarda
+# ahi la API_KEY de Gemini en texto plano (ver .gitignore).
+#
+# Para montar la App en una placa nueva:
+#   1. cp app.yaml.example app.yaml
+#   2. Abre Arduino App Lab -> esta App -> Bricks -> Cloud LLM
+#      y pega tu clave en API_KEY. App Lab la escribe en app.yaml.
+#      (O edita app.yaml a mano y pon la clave en lugar de TU_API_KEY_AQUI.)
+#
+# La clave se saca de https://aistudio.google.com/apikey
+#
+# OJO: la otra credencial, google-credentials.json (Speech-to-Text y
+# Text-to-Speech), va suelta en la raiz de la App y tampoco se versiona.
+
+name: Robot bang stable
+description: "Chatbot de voz con los 5 guías de la metodología de innovación BANG (CUN): Crispi, Carmel, Cesia, Cori y Cristal. Escucha y responde por un headset USB conectado a la placa."
+ports: []
+bricks:
+- arduino:web_ui: {}
+- arduino:cloud_llm:
+    variables:
+      API_KEY: TU_API_KEY_AQUI
+icon: 🤖

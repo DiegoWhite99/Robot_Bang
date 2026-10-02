@@ -8,3 +8,6 @@ certs/*.pem
 
 # estado local de la App (guias desbloqueados)
 data/
+
+#claves
+app.yaml

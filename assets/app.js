@@ -29,6 +29,23 @@ ui.on_message('heard', onHeard);
 ui.on_message('reply', onReply);
 ui.on_message('debug', onDebug);
 ui.on_message('bang_state', onBangState);
+ui.on_message('version', onVersion);
+
+// Version y aviso de actualizaciones: los manda Python al conectarse
+// (APP_VERSION en main.py), para que no haya dos numeros distintos entre el
+// dashboard y /status. Lo del HTML es solo el respaldo si no llega.
+function onVersion(data) {
+  if (!data) return;
+  if (data.version) {
+    const label = `v${data.version}`;
+    document.querySelectorAll('#version-chip, #footer-version').forEach((el) => {
+      el.textContent = label;
+    });
+  }
+  if (data.notice) {
+    document.querySelector('#version-text').textContent = data.notice;
+  }
+}
 
 function onUIConnected() {
   setStatus('conectado. cargando guías...');
@@ -311,6 +328,100 @@ ui.on_message('bt_response', (data) => {
   if (data.devices) renderBtDevices(data.devices);
   else btList.querySelectorAll('button').forEach((b) => (b.disabled = false));
 });
+
+// --- WiFi --------------------------------------------------------------------
+// Igual que el Bluetooth: el contenedor no puede hablar con NetworkManager, así
+// que Python se lo pasa al ayudante del host (tools/wifi_helper.py). La
+// respuesta llega por 'wifi_response'.
+//
+// Ojo: esto sirve para CAMBIAR de red. Si el robot se queda sin red, esta misma
+// página deja de cargar — es el huevo y la gallina, y no tiene arreglo por aquí.
+
+const wifiWin = document.querySelector('#wifi');
+const wifiStatus = document.querySelector('#wifi-status');
+const wifiList = document.querySelector('#wifi-list');
+const wifiScan = document.querySelector('#wifi-scan');
+const wifiRefresh = document.querySelector('#wifi-refresh');
+let wifiBusy = false;
+
+function wifiSend(action, extra, label) {
+  if (wifiBusy) return;
+  wifiBusy = true;
+  wifiScan.disabled = wifiRefresh.disabled = true;
+  wifiList.querySelectorAll('button').forEach((b) => (b.disabled = true));
+  wifiStatus.classList.remove('err');
+  wifiStatus.textContent = label || 'consultando...';
+  ui.send_message('wifi', Object.assign({ action }, extra || {}));
+}
+
+document.querySelector('#wifi-btn').addEventListener('click', () => {
+  wifiWin.hidden = false;
+  wifiSend('status');
+});
+document.querySelector('#wifi-close').addEventListener('click', () => (wifiWin.hidden = true));
+wifiWin.addEventListener('click', (e) => {
+  if (e.target === wifiWin) wifiWin.hidden = true;
+});
+wifiScan.addEventListener('click', () => wifiSend('scan', null, '🔍 buscando redes...'));
+wifiRefresh.addEventListener('click', () => wifiSend('status'));
+
+ui.on_message('wifi_response', (data) => {
+  wifiBusy = false;
+  wifiScan.disabled = wifiRefresh.disabled = false;
+  data = data || {};
+
+  if (!data.ok) {
+    wifiStatus.classList.add('err');
+    wifiStatus.textContent = `⚠ ${data.error || 'falló'}`;
+  } else {
+    const lines = [];
+    if (data.message) lines.push(`✅ ${data.message}`);
+    lines.push(`Red actual: ${data.ssid || 'ninguna'}`);
+    lines.push(`Internet: ${data.internet ? 'sí' : 'no'}`);
+    if (data.dashboard_url) lines.push(`Esta página: ${data.dashboard_url}`);
+    wifiStatus.textContent = lines.join('\n');
+  }
+  if (data.networks) renderWifiNetworks(data.networks);
+  else wifiList.querySelectorAll('button').forEach((b) => (b.disabled = false));
+});
+
+function renderWifiNetworks(networks) {
+  wifiList.innerHTML = '';
+  if (networks.length === 0) {
+    wifiList.innerHTML = '<div class="bt-empty">Ninguna red encontrada. Toca BUSCAR REDES.</div>';
+    return;
+  }
+  networks.forEach((n) => {
+    const row = document.createElement('div');
+    row.className = `bt-device${n.active ? ' connected' : ''}`;
+
+    const name = document.createElement('span');
+    name.className = 'name';
+    name.textContent = n.ssid;
+    const meta = document.createElement('span');
+    meta.className = 'meta';
+    const barras = '▂▄▆█'.slice(0, Math.max(1, Math.ceil(n.signal / 25)));
+    meta.textContent = `${barras} ${n.signal}%${n.secure ? ' · con clave' : ' · abierta'}${n.active ? ' · conectada' : ''}`;
+    name.appendChild(meta);
+
+    const btn = document.createElement('button');
+    btn.className = 'btn95';
+    btn.type = 'button';
+    btn.textContent = n.active ? 'OLVIDAR' : 'CONECTAR';
+    btn.addEventListener('click', () => {
+      if (n.active) {
+        wifiSend('forget', { ssid: n.ssid }, `olvidando ${n.ssid}...`);
+        return;
+      }
+      // La clave se pide aquí y viaja solo hasta la placa; no se guarda en la web.
+      const password = n.secure ? prompt(`Clave de "${n.ssid}":`) : '';
+      if (n.secure && password === null) return;
+      wifiSend('connect', { ssid: n.ssid, password }, `conectando a ${n.ssid}... (hasta 45 s)`);
+    });
+    row.append(name, btn);
+    wifiList.appendChild(row);
+  });
+}
 
 function renderBtDevices(devices) {
   btList.innerHTML = '';

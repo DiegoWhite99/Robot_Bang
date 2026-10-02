@@ -164,14 +164,40 @@ Dos credenciales de Google, para dos cosas **distintas**:
 
 ### 5.1 `API_KEY` de Gemini (LLM)
 
-- Declarada en `app.yaml` → `bricks: arduino:cloud_llm: variables: API_KEY: 'GCP_API_KEY'`.
-- **El valor `'GCP_API_KEY'` es el *nombre* de una variable de entorno / Brick
-  Configuration, no la clave en texto plano.** La clave real se resuelve en
-  runtime desde ahí — confirmado en pruebas: el warmup de `brain.py`
-  (`Initializing model google:gemini-3.1-flash-lite...` →
-  `Modelo precalentado: la primera respuesta ya sera rapida`) responde
-  correctamente sin que la clave aparezca en el repositorio.
-- Se obtiene en <https://aistudio.google.com/apikey>.
+- El brick `arduino:cloud_llm` lee la clave con `os.getenv("API_KEY")` (ver
+  el README del brick: `bricks_get arduino:cloud_llm`).
+- Hay **dos** lugares desde donde se puede poblar esa variable:
+
+  1. **Brick Configuration**, en la GUI de Arduino App Lab (App → Bricks →
+     Cloud LLM → configurar `API_KEY`). El valor lo guarda App Lab **fuera
+     de la carpeta de la App**, así que no queda en el repositorio. Es el
+     lugar recomendado para secretos.
+  2. El bloque `variables:` de `app.yaml`:
+     ```yaml
+     - arduino:cloud_llm:
+         variables:
+           API_KEY: <valor>
+     ```
+
+- ⚠️ **Trampa importante (costó una caída completa del LLM):** el bloque
+  `variables:` de `app.yaml` asigna un **valor literal**, *no* es una
+  indirección al nombre de otra variable de entorno. Escribir
+  `API_KEY: GCP_API_KEY` no busca una variable llamada `GCP_API_KEY`: le
+  entrega al brick la cadena literal `"GCP_API_KEY"` como si fuera la
+  clave, y Google responde:
+  ```
+  400 INVALID_ARGUMENT — API key not valid. Please pass a valid API key.
+  reason: API_KEY_INVALID · service: generativelanguage.googleapis.com
+  ```
+  Además, un valor puesto ahí **tapa** al de Brick Configuration. Para usar
+  Brick Configuration hay que **quitar el bloque `variables:`** de
+  `app.yaml` (dejar `- arduino:cloud_llm: {}`).
+
+- Ojo con `app_bricks_list`: reporta `isSet: true` en cuanto la variable
+  tiene *algún* valor no vacío — `true` **no** significa que la clave sea
+  válida.
+
+- La clave se obtiene en <https://aistudio.google.com/apikey>.
 
 ### 5.2 `google-credentials.json` (Speech-to-Text / Text-to-Speech)
 

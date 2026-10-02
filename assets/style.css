@@ -94,6 +94,32 @@ body {
   border-bottom: 2px solid #000;
 }
 
+/* Aviso de version y actualizaciones. El texto y el numero los manda Python
+   al conectarse (APP_VERSION en main.py); lo que esta en el HTML es solo el
+   respaldo por si el mensaje no llega. Estetica de "globo de ayuda" de
+   Windows 95: amarillo palido con borde duro. */
+.version-notice {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin: 8px 8px 0;
+  padding: 4px 6px;
+  background: #ffffcc;
+  border: 2px outset var(--face-shadow-light);
+  font-size: 11px;
+}
+
+.version-chip {
+  background: #000;
+  color: #0f0;
+  font-family: "Courier New", monospace;
+  font-weight: bold;
+  padding: 1px 5px;
+  border: 1px solid var(--face-shadow-dark);
+  white-space: nowrap;
+}
+
 .content {
   padding: 8px;
   display: flex;

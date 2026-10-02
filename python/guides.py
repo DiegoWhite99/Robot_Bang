@@ -20,13 +20,21 @@ _lock = threading.Lock()
 
 
 def _load():
+    """Los 5 guias arrancan desbloqueados.
+
+    Antes solo estaba Crispi y los demas se abrian con /unlock_<guia> desde la
+    terminal. Eso no sirve para el menu por voz: el niño tiene que poder decir
+    cualquiera de los cinco nombres y que le conteste. El bloqueo sigue
+    existiendo para quien lo quiera usar (/lock_cesia), pero ya no es el
+    estado de partida.
+    """
     try:
         keys = json.loads(_PATH.read_text()).get("unlocked", [])
     except FileNotFoundError:
-        keys = []
+        keys = list(brain.PERSONAS)  # instalacion nueva: los 5 disponibles
     except Exception as exc:
-        logger.warning(f"No pude leer {_PATH} ({exc}): solo queda Crispi")
-        keys = []
+        logger.warning(f"No pude leer {_PATH} ({exc}): dejo los 5 disponibles")
+        keys = list(brain.PERSONAS)
     return {k for k in keys if k in brain.PERSONAS} | {ALWAYS_UNLOCKED}
 
 

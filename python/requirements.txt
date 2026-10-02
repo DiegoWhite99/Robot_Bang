@@ -1,2 +1,5 @@
 google-cloud-speech==2.40.0
 google-cloud-texttospeech==2.37.0
+# Para el QR que lleva al dashboard (se dibuja en la pantalla TFT). Es Python
+# puro, no arrastra Pillow: solo se usa la matriz de modulos.
+qrcode==7.4.2

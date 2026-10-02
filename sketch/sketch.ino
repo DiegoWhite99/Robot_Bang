@@ -101,15 +101,21 @@
 #include "cori_face.h"
 #include "cristal_face.h"
 #include "bang_splash.h"
+#include "bang_aviso.h"
 #include "bang_cards.h"
 #include <Adafruit_GFX.h>
 #include <Adafruit_ST7789.h>
 #include <SPI.h>
 #include <Servo.h>
+#include <vector>
 
 #define TFT_CS   10
 #define TFT_DC    9
 #define TFT_RST   8
+
+// Version del producto, visible en la pantalla (ver drawVersionBadge()).
+// Debe coincidir con APP_VERSION de python/main.py.
+#define APP_VERSION "1.1.0"
 
 const int16_t SCREEN_W = 320;
 const int16_t SCREEN_H = 240;
@@ -136,6 +142,11 @@ class RegionCanvas : public GFXcanvas16 {
       : GFXcanvas16(w, h), _originX(originX), _originY(originY), _tft(tftRef) {}
 
     bool ready() const { return getBuffer() != nullptr; } // GFXcanvas16 hace malloc()
+
+    // Mueve el rincon de pantalla al que se vuelca este canvas. Sirve para
+    // reutilizar UN solo buffer en varias filas (ver el menu de personajes):
+    // cinco canvas separados no cabrian comodos en RAM.
+    void setOrigin(int16_t x, int16_t y) { _originX = x; _originY = y; }
 
     void flush() { flushRect(0, 0, width(), height()); }
 
@@ -381,6 +392,210 @@ RegionCanvas browLCanvas(BROW_REGION_W, BROW_REGION_H, BROW_L_REGION_X, BROW_REG
 RegionCanvas browRCanvas(BROW_REGION_W, BROW_REGION_H, BROW_R_REGION_X, BROW_REGION_Y, tft);
 RegionCanvas mouthCanvas(MOUTH_REGION_W, MOUTH_REGION_H, MOUTH_REGION_X, MOUTH_REGION_Y, tft);
 
+// --- Aviso de version, abajo a la derecha -----------------------------------
+// Se compone en RAM y se manda con el camino rapido de una sola llamada al
+// driver, NUNCA con tft.print() directo sobre la pantalla: writePixel() cuesta
+// 13 llamadas al driver por pixel (ver la cabecera de este archivo).
+//
+// Va en la esquina inferior derecha, por debajo de la region de la boca
+// (que termina en y=225), asi el redibujado parcial de la cara no lo pisa.
+const int16_t VER_W = 122, VER_H = 12;
+const int16_t VER_X = SCREEN_W - VER_W - 2;   // 196
+const int16_t VER_Y = SCREEN_H - VER_H - 2;   // 226
+RegionCanvas verCanvas(VER_W, VER_H, VER_X, VER_Y, tft);
+
+// Se llama tras cada repintado completo de pantalla (bienvenida, cambio de
+// guia, salir de una tarjeta), no en cada frame: el texto no cambia.
+void drawVersionBadge() {
+  if (!verCanvas.ready()) return;
+  verCanvas.fillScreen(ST77XX_BLACK);
+  verCanvas.setTextSize(1);
+  verCanvas.setTextColor(ST77XX_WHITE);
+  verCanvas.setCursor(1, 1);
+  verCanvas.print("BANG v" APP_VERSION " - beta");
+  verCanvas.flush();
+}
+
+// --- Indicador de WiFi -------------------------------------------------------
+// Cuatro barritas arriba a la derecha. Python manda el nivel con
+// Bridge.notify("wifi", 0..4): 0 = sin conexion (sale una X roja), 1..4 =
+// fuerza de la señal. Importa porque la conversacion va por la nube: si no
+// hay WiFi, el robot no puede responder y se tiene que ver de un vistazo.
+//
+// La esquina superior derecha esta libre: los ojos llegan hasta y=146 y las
+// cejas empiezan en y=46, asi que no pisa nada de la cara.
+const int16_t WIFI_W = 34, WIFI_H = 16;
+RegionCanvas wifiCanvas(WIFI_W, WIFI_H, SCREEN_W - WIFI_W - 3, 3, tft);
+
+const uint8_t NO_PENDING_WIFI = 0xFF;
+volatile uint8_t pendingWifi = NO_PENDING_WIFI;
+uint8_t wifiLevel = 0;  // 0 = sin conexion; 1..4 barras
+
+void drawWifiBadge(uint16_t bg) {
+  if (!wifiCanvas.ready()) return;
+  wifiCanvas.fillScreen(bg);
+
+  const uint16_t encendida = ST77XX_WHITE;
+  const uint16_t apagada = tft.color565(70, 70, 70);
+  // Cuatro barras que crecen de izquierda a derecha.
+  for (uint8_t i = 0; i < 4; i++) {
+    const int16_t h = 4 + i * 3;             // 4, 7, 10, 13
+    const int16_t x = 1 + i * 7;
+    const int16_t y = WIFI_H - h - 1;
+    wifiCanvas.fillRect(x, y, 5, h, (wifiLevel > i) ? encendida : apagada);
+  }
+  if (wifiLevel == 0) {
+    // Sin conexion: aspa roja encima, se entiende sin leer nada.
+    const uint16_t rojo = tft.color565(248, 80, 80);
+    for (int16_t i = 0; i < WIFI_H - 2; i++) {
+      wifiCanvas.drawPixel(2 + i, 1 + i, rojo);
+      wifiCanvas.drawPixel(2 + i, WIFI_H - 2 - i, rojo);
+    }
+  }
+  wifiCanvas.flush();
+}
+
+// Llamada desde Python con Bridge.notify("wifi", 0..4). Solo anota el byte.
+void wifi(uint8_t level) {
+  pendingWifi = level > 4 ? 4 : level;
+}
+
+// --- Codigo QR al dashboard --------------------------------------------------
+// El QR NO se calcula aqui: lo genera Python (que conoce la IP de la placa) y
+// lo manda ya resuelto por el Bridge como lista de bytes. Meter una libreria
+// de QR en el MCU costaria flash, y el flash es justo lo que escasea.
+//
+// Formato: [tamaño, b0, b1, ...] con los modulos empaquetados a bit, fila por
+// fila. Tamaño 0 = cerrar la pantalla del QR.
+const uint8_t QR_MAX = 45;                                  // hasta version 6
+const uint16_t QR_BYTES = (uint16_t)((QR_MAX * QR_MAX + 7) / 8);
+uint8_t qrBits[QR_BYTES];
+volatile uint8_t qrSizePending = 0;
+volatile bool qrPending = false;
+uint8_t qrSize = 0;
+bool qrOn = false;
+
+bool qrModule(uint8_t x, uint8_t y) {
+  const uint32_t bit = (uint32_t)y * qrSize + x;
+  return (qrBits[bit >> 3] >> (7 - (bit & 7))) & 1;
+}
+
+// Pantalla estatica y de una sola vez, como drawCard(): aqui si se puede usar
+// fillRect() aunque sea el camino lento, porque no se repinta por frame.
+void drawQr() {
+  tft.fillScreen(ST77XX_WHITE);
+  if (qrSize == 0) return;
+
+  const int16_t quiet = 3;  // margen obligatorio del QR, en modulos
+  int16_t escala = (SCREEN_H - 30) / (qrSize + 2 * quiet);
+  if (escala < 1) escala = 1;
+  const int16_t lado = (qrSize + 2 * quiet) * escala;
+  const int16_t ox = (SCREEN_W - lado) / 2;
+  const int16_t oy = (SCREEN_H - lado) / 2 - 6;
+
+  for (uint8_t y = 0; y < qrSize; y++) {
+    for (uint8_t x = 0; x < qrSize; x++) {
+      if (qrModule(x, y)) {
+        tft.fillRect(ox + (x + quiet) * escala, oy + (y + quiet) * escala,
+                     escala, escala, ST77XX_BLACK);
+      }
+    }
+  }
+  tft.setTextColor(ST77XX_BLACK);
+  tft.setTextSize(1);
+  tft.setCursor(ox, oy + lado + 6);
+  tft.print("Apunta la camara para configurar el WiFi");
+}
+
+// Llamada desde Python con Bridge.notify("qr", [tam, b0, b1, ...]).
+// Solo copia a RAM y anota: dibuja loop(), como todo lo demas.
+void qr(std::vector<int> data) {
+  if (data.empty()) return;
+  const int size = data[0];
+  if (size <= 0 || size > QR_MAX) {
+    qrSizePending = 0;
+    qrPending = true;
+    return;
+  }
+  const uint16_t need = (uint16_t)((size * size + 7) / 8);
+  if (data.size() < (size_t)(1 + need) || need > QR_BYTES) return;
+  for (uint16_t i = 0; i < need; i++) qrBits[i] = (uint8_t)data[1 + i];
+  qrSizePending = (uint8_t)size;
+  qrPending = true;
+}
+
+// consumePendingQr() vive mas abajo, junto a consumePendingMenu(): necesita
+// overlayPersona, que se declara con la bienvenida.
+
+// --- Animacion de "WiFi sincronizado" ---------------------------------------
+// Dibujada por codigo (ondas que se abren + palomita), no cuadros guardados:
+// cuesta ~0 bytes de flash, que es justo lo que no sobra. Bloquea ~1,4 s, y
+// eso esta bien: es un evento de una sola vez, no algo por frame.
+volatile bool wifiSyncPending = false;
+
+void wifi_sync() { wifiSyncPending = true; }
+
+void playWifiSync() {
+  const uint16_t verde = tft.color565(74, 222, 128);
+  const int16_t cx = SCREEN_W / 2, cy = SCREEN_H / 2 + 10;
+  tft.fillScreen(ST77XX_BLACK);
+
+  // Tres ondas que se abren desde el punto, como el icono de WiFi.
+  for (uint8_t onda = 1; onda <= 3; onda++) {
+    const int16_t r = onda * 26;
+    for (int16_t g = 0; g < 3; g++) {
+      tft.drawCircle(cx, cy, r + g, verde);
+      tft.drawCircle(cx, cy, r + g, verde);
+    }
+    // Se tapa la mitad de abajo para que parezcan arcos y no circulos.
+    tft.fillRect(0, cy + 1, SCREEN_W, SCREEN_H - cy, ST77XX_BLACK);
+    tft.fillCircle(cx, cy, 6, verde);
+    delay(260);
+  }
+
+  tft.setTextColor(verde);
+  tft.setTextSize(2);
+  tft.setCursor(cx - 96, cy + 34);
+  tft.print("WiFi conectado");
+  delay(600);
+}
+
+// --- Menu de seleccion de personaje -----------------------------------------
+// Pantalla APARTE: no toca nada del dibujado de las caras. Python la prende con
+// Bridge.notify("menu", 0..4) indicando cual esta resaltado, y la apaga con 255.
+// El niño elige diciendo el nombre en voz alta (listen_turn() del lado Python ya
+// reconoce los cinco nombres como palabra de activacion).
+//
+// Los colores son los mismos de brain.PERSONAS del lado Python, para que el
+// menu y el dashboard web muestren al mismo guia del mismo color.
+struct MenuEntry {
+  const char *name;
+  const char *tag;
+  uint8_t r, g, b;
+};
+
+const MenuEntry MENU_ENTRIES[] = {
+  {"CRISPI",  "El constructor",        74, 222, 128},
+  {"CARMEL",  "El estratega",         251, 191,  36},
+  {"CESIA",   "La disruptora",        248, 113, 113},
+  {"CORI",    "Pensadora lateral",    167, 139, 250},
+  {"CRISTAL", "La musa reflexiva",     34, 211, 238},
+};
+const uint8_t MENU_COUNT = 5;
+
+const int16_t MENU_ROW_W = 300, MENU_ROW_H = 32;
+const int16_t MENU_X = 10, MENU_TOP = 40, MENU_GAP = 5;
+
+// UN solo canvas para el titulo y las cinco filas: se mueve con setOrigin().
+RegionCanvas menuCanvas(MENU_ROW_W, MENU_ROW_H, MENU_X, MENU_TOP, tft);
+
+const uint8_t NO_PENDING_MENU = 0xFD;
+const uint8_t MENU_NO_SEL = 0xFE;  // menu con los 5 iguales, sin resaltar ninguno
+const uint8_t MENU_OFF = 0xFF;
+volatile uint8_t pendingMenu = NO_PENDING_MENU;
+bool menuOn = false;
+uint8_t menuIndex = 0;
+
 // Ultimo valor efectivamente dibujado: si no cambio, nos ahorramos el
 // redibujado + envio de esa region (arranca en -1 para forzar el primer
 // dibujo).
@@ -400,12 +615,23 @@ uint32_t framePxLeft = 0;
 bool forceFullRedraw = true;
 
 
+// --- Aviso de seguridad (LA PRIMERA pantalla), ver renderAviso() -------------
+// Orden de arranque: aviso -> bienvenida BANG -> menu de guias -> cara del
+// guia elegido. Arranca prendido para que se vea apenas bootea el MCU, sin
+// esperar a Python. Si Python nunca lo apaga, se apaga solo.
+const unsigned long AVISO_MAX_MS = 60000;
+const uint8_t NO_PENDING_AVISO = 0xFF;
+volatile uint8_t pendingAviso = 1;
+bool avisoOn = false;
+unsigned long avisoStartMs = 0;
+uint16_t avisoFrame = 0;
+unsigned long avisoFrameMs = 0;
+
 // --- Bienvenida (GIF de BANG), ver renderSplash() ---
-// Arranca prendida: se ve el GIF apenas bootea el MCU, sin esperar a Python.
-// Si Python nunca la apaga (se cayo), se apaga sola a los SPLASH_MAX_MS.
+// Ya NO arranca prendida: ahora va despues del aviso, cuando Python la pide.
 const unsigned long SPLASH_MAX_MS = 90000;
 const uint8_t NO_PENDING_SPLASH = 0xFF;
-volatile uint8_t pendingSplash = 1;
+volatile uint8_t pendingSplash = NO_PENDING_SPLASH;
 bool splashOn = false;
 unsigned long splashStartMs = 0;
 uint16_t splashFrame = 0;          // cuadro del GIF que esta en pantalla
@@ -449,6 +675,8 @@ void applyPersonaColors(uint8_t personaId) {
     buildSpriteLut(BG_COLOR, EYE_COLOR, MOUTH_COLOR, spriteFace->twoInks);
     const FaceSprite &base = *spriteFace->base;
     pushSpriteRect(base, 0, 0, base.w, base.h);
+    drawVersionBadge();  // la cara acaba de repintar la pantalla entera
+    drawWifiBadge(BG_COLOR);
     drawnEyeState = FACE_EYE_OPEN;
     drawnMouthLevel = 0;
     spriteBlinkStep = -1;
@@ -457,6 +685,8 @@ void applyPersonaColors(uint8_t personaId) {
   }
 
   tft.fillScreen(BG_COLOR); // fondo completo, una sola vez por cambio de personaje
+  drawVersionBadge();
+  drawWifiBadge(BG_COLOR);
 
   // El redibujado parcial solo se dispara cuando el valor dibujado cambia;
   // forzamos eso para que ojos, cejas y boca tomen los colores nuevos ya.
@@ -899,9 +1129,10 @@ void renderSpriteFace() {
   if (eyesFirst) stepSpriteMouth(mouthTarget, !sent);
 }
 
-// Manda un rectangulo de la bienvenida (indices de 8 bits a SPLASH_PALETTE,
-// w*h seguidos). Mismo camino rapido que pushSpriteRect().
-void pushSplashRect(const uint8_t *src, int16_t x, int16_t y, int16_t w, int16_t h) {
+// Manda un rectangulo de una imagen paletizada (indices de 8 bits, w*h
+// seguidos) con el camino rapido de pushSpriteRect(). Lo usan la bienvenida y
+// el aviso de seguridad, que comparten formato pero no paleta.
+void pushPalRect(const uint8_t *src, const uint16_t *pal, int16_t x, int16_t y, int16_t w, int16_t h) {
   if (w <= 0 || h <= 0) return;
   const int16_t rowsPerChunk = (int16_t)(SCRATCH_PX / (uint32_t)w);
   if (rowsPerChunk < 1) return; // no deberia pasar: w <= SCREEN_W
@@ -914,7 +1145,7 @@ void pushSplashRect(const uint8_t *src, int16_t x, int16_t y, int16_t w, int16_t
     const uint8_t *p = src + (uint32_t)row * w;
 
     uint32_t t0 = micros();
-    for (uint32_t i = 0; i < n; i++) spiScratch[i] = __builtin_bswap16(SPLASH_PALETTE[p[i]]);
+    for (uint32_t i = 0; i < n; i++) spiScratch[i] = __builtin_bswap16(pal[p[i]]);
     uint32_t t1 = micros();
 
     SPI.transfer(spiScratch, (size_t)n * 2);
@@ -928,9 +1159,66 @@ void pushSplashRect(const uint8_t *src, int16_t x, int16_t y, int16_t w, int16_t
   statsPixels += (uint32_t)w * h;
 }
 
+void pushSplashRect(const uint8_t *src, int16_t x, int16_t y, int16_t w, int16_t h) {
+  pushPalRect(src, SPLASH_PALETTE, x, y, w, h);
+}
+
+void pushAvisoRect(const uint8_t *src, int16_t x, int16_t y, int16_t w, int16_t h) {
+  pushPalRect(src, AVISO_PALETTE, x, y, w, h);
+}
+
+// --- Aviso de seguridad: misma mecanica que la bienvenida -------------------
+
+void showAviso() {
+  // El GIF es vertical: las bandas negras de los lados se pintan una sola vez
+  // aqui y no se guardan en flash (ver make_aviso.py).
+  tft.fillScreen(ST77XX_BLACK);
+  pushAvisoRect(AVISO_BASE, AVISO_X, AVISO_Y, AVISO_W, AVISO_H);
+  avisoOn = true;
+  avisoStartMs = avisoFrameMs = millis();
+  avisoFrame = 0;
+}
+
+void renderAviso() {
+  const AvisoFrame &f = AVISO_FRAMES[avisoFrame];
+  if (millis() - avisoFrameMs < f.durationMs) return;
+  for (uint16_t i = 0; i < f.rectCount; i++) {
+    const AvisoRect &r = AVISO_RECTS[f.firstRect + i];
+    pushAvisoRect(AVISO_PX + r.offset, AVISO_X + r.x, AVISO_Y + r.y, r.w, r.h);
+  }
+  avisoFrame = (avisoFrame + 1) % AVISO_FRAME_COUNT;
+  avisoFrameMs = millis();
+}
+
+// Prende/apaga el aviso, ya en el hilo de loop() (dueño del SPI).
+void consumePendingAviso() {
+  uint8_t want = pendingAviso;
+  if (want == NO_PENDING_AVISO && avisoOn && millis() - avisoStartMs >= AVISO_MAX_MS) {
+    want = 0;  // Python no lo apago: se sigue adelante igual
+  }
+  if (want == NO_PENDING_AVISO) return;
+  pendingAviso = NO_PENDING_AVISO;
+
+  if (want && !avisoOn) {
+    showAviso();
+  } else if (want && avisoOn) {
+    avisoStartMs = millis();
+  } else if (!want && avisoOn) {
+    avisoOn = false;
+    // No se repinta nada aqui: lo que venga despues (bienvenida o menu) pinta
+    // la pantalla entera por su cuenta.
+  }
+}
+
+// Llamada desde Python con Bridge.notify("aviso", 1 / 0).
+void aviso(uint8_t on) {
+  pendingAviso = on ? 1 : 0;
+}
+
 // Pantalla completa del cuadro 0 (un frame lento, ~0,6 s, una sola vez).
 void showSplash() {
   pushSplashRect(SPLASH_BASE, 0, 0, SPLASH_W, SPLASH_H);
+  drawVersionBadge();  // la bienvenida acaba de pintar la pantalla entera
   splashOn = true;
   splashStartMs = splashFrameMs = millis();
   splashFrame = 0;
@@ -952,8 +1240,10 @@ void renderSplash() {
 // Prende/apaga la bienvenida, ya en el hilo de loop() (dueño del SPI).
 void consumePendingSplash() {
   uint8_t want = pendingSplash;
+  bool porTiempo = false;
   if (want == NO_PENDING_SPLASH && splashOn && millis() - splashStartMs >= SPLASH_MAX_MS) {
-    want = 0; // Python no la apago: se vuelve a la cara igual
+    want = 0;          // Python no la apago (¿se cayo?): se sigue adelante
+    porTiempo = true;  // solo en ESTE caso se pinta la cara de respaldo
   }
   if (want == NO_PENDING_SPLASH) return;
   pendingSplash = NO_PENDING_SPLASH;
@@ -966,8 +1256,14 @@ void consumePendingSplash() {
     splashStartMs = millis(); // la vuelven a pedir: reinicia el plazo
   } else if (!want && splashOn) {
     splashOn = false;
-    currentPersona = 255;     // la pantalla ya no tiene la cara: redibujarla entera
-    applyPersonaColors(overlayPersona);
+    // Ni cara de Crispi ni el ultimo cuadro de la bienvenida congelado: se
+    // limpia a negro y ya. Lo que venga detras (el menu, o la cara del guia
+    // elegido) pinta encima de negro, sin fotogramas intermedios raros.
+    currentPersona = 255;     // la pantalla ya no tiene cara valida
+    tft.fillScreen(ST77XX_BLACK);
+    // Excepcion: si vencio por tiempo es que Python no contesta y no va a
+    // llegar nada detras. Ahi si conviene dejar la cara puesta.
+    if (porTiempo) applyPersonaColors(overlayPersona);
   }
 }
 
@@ -1030,6 +1326,131 @@ void drawCard(uint8_t index) {
   tft.endWrite();
 
   statsPixels += (uint32_t)CARD_W * CARD_H;
+}
+
+// --- Dibujado del menu de personajes ---------------------------------------
+// Todo se compone en RAM y se manda con el camino rapido de una llamada al
+// driver, igual que la cara: nunca tft.print() sobre la pantalla.
+
+// `hablando` NO es un cursor de seleccion: solo marca al guia que se esta
+// presentando en voz alta durante el repaso inicial. Al terminar el repaso
+// todos quedan iguales, para que nadie piense que hay que pulsar nada.
+void drawMenuRow(uint8_t i, bool hablando) {
+  if (!menuCanvas.ready() || i >= MENU_COUNT) return;
+  const MenuEntry &e = MENU_ENTRIES[i];
+  menuCanvas.setOrigin(MENU_X, MENU_TOP + i * (MENU_ROW_H + MENU_GAP));
+  menuCanvas.fillScreen(ST77XX_BLACK);
+
+  const uint16_t color = tft.color565(e.r, e.g, e.b);
+  menuCanvas.fillRoundRect(0, 0, MENU_ROW_W, MENU_ROW_H, 7, color);
+
+  menuCanvas.setTextColor(ST77XX_BLACK);
+  // Las comillas angulares dicen "esto se DICE", no "esto se pulsa".
+  menuCanvas.setTextSize(2);
+  menuCanvas.setCursor(12, 5);
+  menuCanvas.print("\"");
+  menuCanvas.print(e.name);
+  menuCanvas.print("\"");
+  menuCanvas.setTextSize(1);
+  menuCanvas.setCursor(14, 22);
+  menuCanvas.print(e.tag);
+
+  // Mientras se le nombra, un bocadillo a la derecha. Es momentaneo: no es
+  // un estado "elegido".
+  if (hablando) {
+    menuCanvas.fillCircle(MENU_ROW_W - 26, MENU_ROW_H / 2, 8, ST77XX_BLACK);
+    menuCanvas.fillCircle(MENU_ROW_W - 26, MENU_ROW_H / 2, 6, color);
+    menuCanvas.fillCircle(MENU_ROW_W - 14, MENU_ROW_H / 2 + 4, 3, ST77XX_BLACK);
+  }
+  menuCanvas.flush();
+}
+
+// Icono de microfono dibujado a mano (no hay fuente con simbolos): capsula
+// redondeada, arco y pie.
+void drawMic(int16_t cx, int16_t cy, uint16_t color) {
+  menuCanvas.fillRoundRect(cx - 3, cy - 9, 7, 12, 3, color);
+  menuCanvas.drawCircle(cx, cy + 1, 6, color);
+  menuCanvas.drawCircle(cx, cy + 1, 7, color);
+  menuCanvas.fillRect(cx - 1, cy + 7, 3, 4, color);
+  menuCanvas.fillRect(cx - 5, cy + 11, 11, 2, color);
+}
+
+void drawMenuTitle() {
+  if (!menuCanvas.ready()) return;
+  menuCanvas.setOrigin(MENU_X, 4);
+  menuCanvas.fillScreen(ST77XX_BLACK);
+  menuCanvas.setTextColor(ST77XX_WHITE);
+  menuCanvas.setTextSize(2);
+  menuCanvas.setCursor(22, 2);
+  menuCanvas.print("DI UN NOMBRE");
+  // El microfono deja claro que se habla, sin depender de que sepan leer.
+  drawMic(MENU_ROW_W - 40, 13, ST77XX_WHITE);
+  menuCanvas.setTextSize(1);
+  menuCanvas.setTextColor(tft.color565(180, 180, 180));
+  menuCanvas.setCursor(22, 21);
+  menuCanvas.print("en voz alta - no hay botones");
+  menuCanvas.flush();
+}
+
+// `index` >= MENU_COUNT significa "ninguno resaltado": los 5 iguales, que es
+// como queda el menu en reposo esperando a que el niño diga un nombre.
+// `completo` = primera vez que se abre (pinta todo). Durante el repaso solo se
+// repintan las dos filas que cambian.
+void drawMenu(uint8_t index, bool completo) {
+  if (completo) {
+    tft.fillScreen(ST77XX_BLACK);
+    drawMenuTitle();
+    for (uint8_t i = 0; i < MENU_COUNT; i++) drawMenuRow(i, i == index);
+    drawVersionBadge();
+    drawWifiBadge(ST77XX_BLACK);
+  } else if (index != menuIndex) {
+    if (menuIndex < MENU_COUNT) drawMenuRow(menuIndex, false);
+    if (index < MENU_COUNT) drawMenuRow(index, true);
+  }
+  menuIndex = index;
+  menuOn = true;
+}
+
+// Prende/apaga el menu, ya en el hilo de loop() (dueño del SPI).
+void consumePendingMenu() {
+  const uint8_t want = pendingMenu;
+  if (want == NO_PENDING_MENU) return;
+  pendingMenu = NO_PENDING_MENU;
+
+  if (want < MENU_COUNT || want == MENU_NO_SEL) {
+    if (splashOn) return;  // la bienvenida manda mientras esta en pantalla
+    if (!menuOn && currentPersona < FACE_PALETTES_COUNT) overlayPersona = currentPersona;
+    drawMenu(want, !menuOn);
+  } else if (menuOn) {
+    menuOn = false;
+    currentPersona = 255;  // la pantalla ya no tiene la cara: repintarla entera
+    applyPersonaColors(overlayPersona);
+  }
+}
+
+// Llamada desde Python con Bridge.notify("menu", 0..4) o 255 para cerrarlo.
+// Misma regla que face_gesture(): solo anota el byte, loop() dibuja.
+void menu(uint8_t index) {
+  if (index < MENU_COUNT || index == MENU_NO_SEL) pendingMenu = index;
+  else pendingMenu = MENU_OFF;
+}
+
+// Prende/apaga el QR, ya en el hilo de loop() (dueño del SPI). Va aqui y no
+// junto al resto del codigo del QR porque necesita overlayPersona.
+void consumePendingQr() {
+  if (!qrPending) return;
+  qrPending = false;
+  qrSize = qrSizePending;
+  if (qrSize > 0) {
+    if (splashOn || avisoOn) return;  // el aviso y la bienvenida mandan
+    if (!qrOn && currentPersona < FACE_PALETTES_COUNT) overlayPersona = currentPersona;
+    qrOn = true;
+    drawQr();
+  } else if (qrOn) {
+    qrOn = false;
+    currentPersona = 255;
+    applyPersonaColors(overlayPersona);
+  }
 }
 
 // Muestra/saca la tarjeta, ya en el hilo de loop() (dueño del SPI).
@@ -1099,9 +1520,9 @@ void consumePendingGesture() {
   const uint8_t personaId = encoded / GESTURE_COUNT;
   const uint8_t gesture = encoded % GESTURE_COUNT;
 
-  // Con la bienvenida o una tarjeta en pantalla, el guia se anota y aparece al sacarla
-  // (los servos y lo demas siguen igual).
-  if (splashOn || cardOn) overlayPersona = personaId < FACE_PALETTES_COUNT ? personaId : 0;
+  // Con la bienvenida, una tarjeta o el menu en pantalla, el guia se anota y
+  // aparece al salir de ahi (los servos y lo demas siguen igual).
+  if (splashOn || cardOn || menuOn) overlayPersona = personaId < FACE_PALETTES_COUNT ? personaId : 0;
   else applyPersonaColors(personaId);
 
   talking = (gesture != G_REST);
@@ -1150,9 +1571,10 @@ void setup() {
   // presupuesto de tiempo.
   tft.setSPISpeed(40000000);
   tft.setRotation(3);          // Landscape: 320x240
-  // Arranca con la bienvenida (pendingSplash = 1); la cara de Crispi la
-  // pinta applyPersonaColors() cuando Python la apague.
-  consumePendingSplash();
+  // Arranca con el AVISO DE SEGURIDAD (pendingAviso = 1). Despues Python
+  // pide la bienvenida, luego el menu de guias, y al final la cara del guia
+  // que el niño haya elegido.
+  consumePendingAviso();
 
   // GFXcanvas16 pide la RAM con malloc() y no avisa si falla: si algun canvas
   // no se pudo crear, mejor saberlo por el monitor que ver media cara.
@@ -1176,14 +1598,43 @@ void setup() {
   Bridge.provide_safe("arm_step", arm_step);
   Bridge.provide_safe("splash", splash);
   Bridge.provide_safe("card", card);
+  Bridge.provide_safe("menu", menu);
+  Bridge.provide_safe("aviso", aviso);
+  Bridge.provide_safe("wifi", wifi);
+  Bridge.provide_safe("qr", qr);
+  Bridge.provide_safe("wifi_sync", wifi_sync);
 
   Serial.println("[chat-bang] sketch de la carita listo");
 }
 
 void loop() {
-  consumePendingSplash();  // primero: pueden repintar la pantalla entera
+  consumePendingAviso();   // el aviso va antes que todo lo demas
+  consumePendingSplash();  // pueden repintar la pantalla entera
+  consumePendingQr();
+  consumePendingMenu();
   consumePendingCard();
   consumePendingGesture();
+
+  // La animacion de WiFi sincronizado bloquea ~1,4 s a proposito: es un
+  // evento unico y se tiene que ver entero. Al terminar, repinta lo que hubiera.
+  if (wifiSyncPending) {
+    wifiSyncPending = false;
+    playWifiSync();
+    currentPersona = 255;
+    if (qrOn) drawQr();
+    else if (menuOn) drawMenu(menuIndex, true);
+    else applyPersonaColors(overlayPersona);
+  }
+
+  // El nivel de WiFi se repinta solo cuando cambia (es una esquina chica).
+  if (pendingWifi != NO_PENDING_WIFI) {
+    const uint8_t nivel = pendingWifi;
+    pendingWifi = NO_PENDING_WIFI;
+    if (nivel != wifiLevel) {
+      wifiLevel = nivel;
+      if (!avisoOn) drawWifiBadge((splashOn || menuOn || cardOn) ? ST77XX_BLACK : BG_COLOR);
+    }
+  }
   consumeArmStep();
 
   updateBlinkPhase();
@@ -1199,8 +1650,14 @@ void loop() {
 
   uint32_t frameStartUs = micros();
 
-  if (splashOn) {
+  if (avisoOn) {
+    renderAviso();
+  } else if (qrOn) {
+    // el QR es fijo: nada que animar
+  } else if (splashOn) {
     renderSplash();
+  } else if (menuOn) {
+    // el menu es fijo: solo se repinta cuando cambia la seleccion
   } else if (cardOn) {
     // la tarjeta es fija: no hay nada que animar
   } else if (spriteFace) {

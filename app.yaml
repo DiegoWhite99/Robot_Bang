@@ -1,9 +1,0 @@
-name: Robot bang 3
-description: "Chatbot de voz con los 5 guías de la metodología de innovación BANG (CUN): Crispi, Carmel, Cesia, Cori y Cristal. Escucha y responde por un headset USB conectado a la placa."
-ports: []
-bricks:
-- arduino:web_ui: {}
-- arduino:cloud_llm:
-    variables:
-      API_KEY: 'GCP_API_KEY' 
-icon: 🤖

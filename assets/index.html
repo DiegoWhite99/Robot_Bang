@@ -21,8 +21,14 @@
         </marquee>
 
         <div class="toolbar">
+          <button id="wifi-btn" class="btn95" type="button">📶 WIFI</button>
           <button id="bt-btn" class="btn95" type="button">🔵 BLUETOOTH</button>
           <button id="terminal-btn" class="btn95" type="button">💻 TERMINAL</button>
+        </div>
+
+        <div id="version-notice" class="version-notice">
+          <span class="version-chip" id="version-chip">v1.1.0</span>
+          <span id="version-text">Este producto está en desarrollo y seguirá recibiendo actualizaciones.</span>
         </div>
 
         <div class="content">
@@ -66,6 +72,7 @@
 
         <div class="statusbar-footer">
           <span>© 1996-2026 BANG ACADEMY</span>
+          <span id="footer-version">v1.1.0</span>
           <span class="blink">● EN LÍNEA</span>
           <span id="hit-counter">VISITAS: 0000042</span>
         </div>
@@ -85,6 +92,29 @@
           <label for="terminal-input">C:\BANG&gt;</label>
           <input id="terminal-input" type="text" spellcheck="false" autocapitalize="off" placeholder="/help" />
         </form>
+      </div>
+    </div>
+
+    <div id="wifi" class="terminal-overlay" hidden>
+      <div class="window terminal-window" role="dialog" aria-label="WiFi">
+        <div class="titlebar">
+          <span class="titlebar-text">📶 WIFI.EXE — Conectar el robot a una red</span>
+          <div class="titlebar-buttons">
+            <span id="wifi-close" class="close" role="button" title="Cerrar">✕</span>
+          </div>
+        </div>
+        <div class="bt-body">
+          <div id="wifi-status" class="bt-status">consultando...</div>
+          <div class="bt-actions">
+            <button id="wifi-scan" class="btn95" type="button">🔍 BUSCAR REDES</button>
+            <button id="wifi-refresh" class="btn95" type="button">↻ ACTUALIZAR</button>
+          </div>
+          <div class="bt-hint">
+            Sirve para <b>cambiar</b> de red (del colegio a casa, por ejemplo). Si el robot se
+            queda sin red, esta página deja de verse: habría que reconectarlo desde la placa.
+          </div>
+          <div id="wifi-list" class="bt-list"></div>
+        </div>
       </div>
     </div>
 

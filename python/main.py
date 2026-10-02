@@ -23,8 +23,10 @@
 
 import difflib
 import re
+import socket
 import threading
 import time
+from pathlib import Path
 
 from arduino.app_bricks.web_ui import WebUI
 from arduino.app_utils import App
@@ -35,6 +37,13 @@ import bt
 import gestures
 import guides
 import voice
+import wifinet
+
+# Version del producto. FUENTE UNICA: el dashboard la pide al conectarse y
+# /status la repite, asi no hay dos numeros distintos dando vueltas. El tag
+# de git (1.1.0) se pone al final, sobre el commit ya validado.
+APP_VERSION = "1.1.0"
+VERSION_NOTICE = "Este producto está en desarrollo y seguirá recibiendo actualizaciones."
 
 # HTTPS con el certificado autofirmado de certs/ (si falta, el brick lo
 # genera solo). El navegador avisa la primera vez: "Avanzado -> continuar".
@@ -82,6 +91,7 @@ def _personas_payload():
 
 
 def on_ui_connect(sid):
+    ui.send_message("version", {"version": APP_VERSION, "notice": VERSION_NOTICE}, sid)
     ui.send_message("personas", _personas_payload(), sid)
     ui.send_message("active_persona", {"key": _current_persona}, sid)
     _broadcast_bang(_current_persona, sid)
@@ -111,6 +121,14 @@ _HELP = """Comandos:
   /cara <guia>          muestra la cara de un guia en la pantalla y la hace
                         "hablar" 3 s (para probarla sin microfono)
   /bienvenida           repite la bienvenida al BANG (GIF + presentadora)
+  /menu_guias           muestra el menú de los 5 guías en la pantalla, con su
+                        tono; /menu_guias off lo cierra
+  /aviso [off|mudo]     aviso de seguridad con campanilla y voz; "mudo" lo
+                        muestra sin hablar, "off" lo quita
+  /arranque             repite la secuencia completa: aviso → BANG → menú
+  /wifi                 estado de la red y dirección del dashboard
+  /qr [off]             muestra el QR que lleva al dashboard (para el celular)
+  /wifi_sync            repite la animación de "WiFi conectado"
   /tarjeta <guia> <n>   muestra la tarjeta n (1-10) de ese guia en la
                         pantalla; /tarjeta sola la saca
   /menu                 vuelve al inicio: borra los retos de todos los guias,
@@ -157,7 +175,7 @@ def _status():
     active = brain.PERSONAS[_current_persona]["name"] if _current_persona else "ninguno"
     s = bang.session(_current_persona) if _current_persona else None
     reto = f"{bang.PHASE_LABELS[s.phase]} — {s.reto}" if s and s.reto else "sin reto"
-    return f"Desbloqueados: {unlocked}\nActivo: {active} ({reto})\nVoz: {voice.output_name()}\nMicrófono: {voice.input_name()}"
+    return f"Chat BANG v{APP_VERSION}\nDesbloqueados: {unlocked}\nActivo: {active} ({reto})\nVoz: {voice.output_name()}\nMicrófono: {voice.input_name()}"
 
 
 def _bt():
@@ -282,8 +300,49 @@ def run_command(line):
     if cmd == "tarjeta":
         return _card_cmd(arg)
     if cmd == "bienvenida":
-        threading.Thread(target=_welcome, daemon=True, name="welcome").start()
-        return "🎉 bienvenida al BANG"
+        def _bienvenida_y_menu():
+            _welcome()
+            _show_menu()
+
+        threading.Thread(target=_bienvenida_y_menu, daemon=True, name="welcome").start()
+        return "🎉 bienvenida al BANG + menú de guías"
+    if cmd == "aviso":
+        if arg.strip().lower() in ("off", "cerrar", "salir"):
+            gestures.send_aviso(False)
+            return "🛡 aviso fuera de la pantalla"
+        if arg.strip().lower() in ("mudo", "sin_voz"):
+            gestures.send_aviso(True)
+            return "🛡 aviso en pantalla, sin voz (se quita con /aviso off)"
+        threading.Thread(target=_show_aviso, daemon=True, name="aviso").start()
+        return "🛡 aviso de seguridad: campanilla + voz + GIF"
+    if cmd == "arranque":
+        threading.Thread(target=_boot_sequence, daemon=True, name="boot").start()
+        return "▶️ secuencia completa: aviso → BANG → menú"
+    if cmd == "wifi":
+        nivel = _wifi_level()
+        gestures.send_wifi(nivel)
+        st = wifinet.status()
+        red = st.get("ssid") or "?" if isinstance(st, dict) else "?"
+        return f"📶 nivel {nivel}/4 · red: {red}\nDashboard: {dashboard_url() or 'sin IP'}"
+    if cmd == "qr":
+        if arg.strip().lower() in ("off", "cerrar", "salir"):
+            gestures.send_qr()
+            return "🔳 QR fuera de la pantalla"
+        url = dashboard_url()
+        if not url:
+            return "⚠ no encuentro la IP de la placa: ¿está conectada a la red?"
+        gestures.send_qr(url)
+        return f"🔳 QR en la pantalla → {url}"
+    if cmd == "wifi_sync":
+        gestures.send_wifi_sync()
+        return "📡 animación de WiFi sincronizado"
+    if cmd == "menu_guias":
+        # Para probar el menu de la pantalla sin microfono.
+        if arg.strip().lower() in ("off", "cerrar", "salir"):
+            gestures.send_menu()
+            return "📺 menú cerrado, vuelve la cara"
+        threading.Thread(target=_show_menu, daemon=True, name="menu-guias").start()
+        return "📺 menú de guías en la pantalla (recorre los 5 con su tono)"
     if cmd == "reset":
         return _reset()
     if cmd.startswith("unlock_"):
@@ -352,6 +411,112 @@ def on_bt(sid, data):
 
 ui.on_message("bt", on_bt)
 
+# --- Vigilante de WiFi -------------------------------------------------------
+# La conversacion vive en la nube (ver INFORME-MODELOS-LOCALES.md): sin
+# internet el robot no puede responder. Las barritas de la pantalla lo avisan
+# de un vistazo, sin que nadie tenga que leer un log.
+
+_WIFI_POLL_S = 10.0
+_WIFI_PROBE = ("generativelanguage.googleapis.com", 443)
+
+
+def _wifi_level():
+    """0 = sin salida a internet; 1..4 = barras segun la calidad del enlace.
+
+    Lo que de verdad importa es si se llega al servicio, no la potencia de la
+    señal: una señal excelente sin router con internet deja al robot mudo
+    igual. Por eso primero se prueba la conexion y solo despues se afina con
+    la calidad del enlace, si el contenedor la puede leer.
+    """
+    try:
+        with socket.create_connection(_WIFI_PROBE, timeout=4):
+            pass
+    except Exception:
+        return 0
+
+    try:
+        for line in Path("/proc/net/wireless").read_text().splitlines()[2:]:
+            parts = line.split()
+            if len(parts) > 2:
+                calidad = float(parts[2].rstrip("."))  # 0..70 tipico
+                return max(1, min(4, round(calidad / 70 * 4)))
+    except Exception:
+        pass
+    return 4  # hay internet pero no se puede medir la señal (cable, o sin permiso)
+
+
+def dashboard_url():
+    """La direccion a la que apunta el QR de la pantalla.
+
+    Se resuelve sola en cada arranque: si la placa cambia de red, el QR sigue
+    llevando al sitio correcto. Se descartan las redes internas de Docker,
+    que no sirven para llegar al robot desde un telefono.
+    """
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 80))  # no manda nada: solo resuelve la ruta de salida
+            ip = s.getsockname()[0]
+        if ip and not ip.startswith(("172.", "127.")):
+            return f"https://{ip}:7000"
+    except Exception:
+        pass
+    st = wifinet.status()
+    ip = st.get("ip") if isinstance(st, dict) else ""
+    return f"https://{ip}:7000" if ip else ""
+
+
+def _wifi_watch():
+    ultimo = None
+    while True:
+        try:
+            nivel = _wifi_level()
+            if nivel != ultimo:
+                gestures.send_wifi(nivel)
+                if ultimo is not None:  # el primero no se anuncia
+                    _broadcast_debug("📶 WiFi con señal" if nivel else "📵 sin internet: no puedo responder")
+                    # De sin red a con red: se celebra en la pantalla.
+                    if nivel and not ultimo:
+                        gestures.send_wifi_sync()
+                ultimo = nivel
+        except Exception:
+            pass  # un fallo al sondear no puede tumbar el hilo del vigilante
+        time.sleep(_WIFI_POLL_S)
+
+
+threading.Thread(target=_wifi_watch, daemon=True, name="wifi-watch").start()
+
+
+# --- Panel de WiFi del dashboard ---------------------------------------------
+# La web manda {"action": "status"|"scan"|"connect"|"forget", "ssid", "password"}
+# y la respuesta vuelve como 'wifi_response'. El trabajo real lo hace
+# tools/wifi_helper.py en el host (ver wifinet.py), porque el contenedor no
+# puede hablar con NetworkManager.
+#
+# Sirve para CAMBIAR de red, no para la primera conexion: si la placa no tiene
+# red, nadie puede abrir este dashboard.
+
+_WIFI_ACTIONS = {
+    "status": lambda d: wifinet.status(),
+    "scan": lambda d: wifinet.scan(),
+    "connect": lambda d: wifinet.connect(d.get("ssid", ""), d.get("password", "")),
+    "forget": lambda d: wifinet.forget(d.get("ssid", "")),
+}
+
+
+def on_wifi(sid, data):
+    data = data if isinstance(data, dict) else {}
+    accion = data.get("action", "status")
+    result = _WIFI_ACTIONS.get(accion, _WIFI_ACTIONS["status"])(data)
+    result["action"] = accion
+    result["dashboard_url"] = dashboard_url()
+    # Si acabamos de conectar, la pantalla lo celebra.
+    if accion == "connect" and result.get("ok"):
+        gestures.send_wifi_sync()
+    return result
+
+
+ui.on_message("wifi", on_wifi)
+
 # El primer chat con Gemini cuesta ~25 s y los siguientes ~1 s, asi que lo
 # pagamos aqui, en segundo plano, mientras nadie esta preguntando todavia.
 # Lo mismo con los canales de STT/TTS de Google.
@@ -368,6 +533,21 @@ threading.Thread(target=voice.warmup, daemon=True).start()
 
 WELCOME_VOICE = "bang"
 
+# Minimo que se queda el aviso de seguridad en pantalla. Si la voz dura mas,
+# manda la voz: el aviso no se va hasta terminar de decirlo.
+AVISO_S = 9.0
+
+# Lo que el robot DICE mientras se ve el aviso. Va hablado y no solo escrito
+# porque el producto arranca en 5 años, y a esa edad todavia no se lee.
+# Cubre los tres limites del producto: que es virtual, que no pide datos, y
+# que ante un problema se acude a un adulto.
+AVISO_TEXTO = (
+    "Antes de empezar, dos cositas. Soy un robot, un personaje virtual: no soy una "
+    "persona de verdad. No me cuentes datos tuyos como tu dirección, tu teléfono o "
+    "tus contraseñas, porque no los necesito. Y si algo te preocupa, cuéntaselo a una "
+    "persona adulta en la que confíes. ¡Ahora sí, vamos a crear!"
+)
+
 
 def _welcome_text():
     names = [f"{p['name']}, {p['tagline'].lower()}" for p in brain.PERSONAS.values()]
@@ -382,7 +562,54 @@ def _welcome_text():
 _welcome_lock = threading.Lock()
 
 
+def _show_menu():
+    """Paso 4: el menu de guias. Los presenta uno a uno (con su tono) y al
+    terminar los deja TODOS IGUALES.
+
+    Lo del final importa: si uno queda resaltado parece que hay un cursor y que
+    toca pulsar algo. Aqui no se pulsa nada, se DICE el nombre, asi que el menu
+    se queda en reposo con los cinco iguales y el microfono en el titulo.
+    """
+    keys = guides.unlocked()
+    for i, key in enumerate(keys):
+        gestures.send_menu(key)
+        voice.nav_tone(subiendo=False)
+        time.sleep(0.45)
+    time.sleep(0.2)
+    gestures.send_menu_idle()  # ninguno resaltado: no hay nada que pulsar
+    _broadcast_status("🎤 di el nombre de un guía en voz alta")
+
+
+def _show_aviso():
+    """Paso 1: el aviso de seguridad, con campanilla y dicho en voz alta.
+
+    Suena una campanilla de atencion, y mientras el GIF corre el robot LEE el
+    aviso. La pantalla no pasa al siguiente paso hasta que termina de hablar
+    (con un minimo de AVISO_S por si la voz falla y no suena nada).
+    """
+    _broadcast_status("🛡 aviso de seguridad")
+    gestures.send_aviso(True)
+    ui.send_message("reply", {"persona": WELCOME_VOICE, "text": AVISO_TEXTO})
+
+    t0 = time.monotonic()
+    try:
+        voice.attention()          # campanilla: "atencion, esto importa"
+        time.sleep(0.35)
+        # Con musica de fondo: acordes suaves por debajo de la voz.
+        voice.say_with_music(WELCOME_VOICE, AVISO_TEXTO)
+    except Exception as exc:
+        _broadcast_debug(f"⚠ el aviso no se pudo decir en voz alta: {exc}")
+
+    # Si la voz fue mas corta que el minimo (o no sonó), se completa.
+    restante = AVISO_S - (time.monotonic() - t0)
+    if restante > 0:
+        time.sleep(restante)
+    gestures.send_aviso(False)
+
+
 def _welcome():
+    """Paso 2: la bienvenida de BANG (GIF + presentadora). Solo eso: quien
+    encadena los pasos es _boot_sequence()."""
     if not _welcome_lock.acquire(blocking=False):
         return  # ya hay una sonando
     text = _welcome_text()
@@ -393,10 +620,75 @@ def _welcome():
         # Con el GIF en pantalla el gesto solo mueve los brazos.
         gestures.send(gestures.HAPPY, guides.ALWAYS_UNLOCKED)
         voice.say(WELCOME_VOICE, text)
+        gestures.send_splash(False)
     finally:
         gestures.send(gestures.REST, guides.ALWAYS_UNLOCKED)
-        gestures.send_splash(False)
         _welcome_lock.release()
+
+
+# Cuanto se espera a que alguien conecte la placa a una red antes de seguir
+# igualmente (con el robot mudo, pero sin dejarlo colgado para siempre).
+NETWORK_WAIT_S = 150.0
+
+
+def _network_if_needed():
+    """Paso 3, SOLO si hace falta: sin internet no hay conversacion, asi que se
+    pide ayuda a un adulto mostrando el QR que lleva al panel de red.
+
+    Si hay internet no se muestra nada y el arranque sigue de largo.
+    """
+    if _wifi_level() > 0:
+        return True
+
+    url = dashboard_url()
+    _broadcast_status("📵 sin internet: hay que conectar el robot a una red")
+    msg = (
+        "Necesito conectarme a una red para poder conversar contigo. "
+        "Pídele a una persona adulta que apunte la cámara del celular al código "
+        "que aparece en mi pantalla y elija la red."
+    )
+    ui.send_message("reply", {"persona": WELCOME_VOICE, "text": msg})
+    if url:
+        gestures.send_qr(url)
+    voice.say(WELCOME_VOICE, msg)
+
+    fin = time.monotonic() + NETWORK_WAIT_S
+    conectado = False
+    while time.monotonic() < fin:
+        if _wifi_level() > 0:
+            conectado = True
+            break
+        time.sleep(2.0)
+
+    gestures.send_qr()  # se quita el QR de la pantalla
+    if conectado:
+        # La animacion la dispara tambien el vigilante, pero aqui se espera a
+        # que termine para que no se solape con el menu.
+        gestures.send_wifi_sync()
+        time.sleep(2.2)
+        _broadcast_status("📶 ¡conectado!")
+    else:
+        _broadcast_status("📵 sigo sin internet: puedo mostrar el menú, pero no conversar")
+    return conectado
+
+
+def _boot_sequence():
+    """El arranque completo, en este orden:
+
+        1. ADVERTENCIA   aviso de seguridad (lo primero que se ve)
+        2. BANG          bienvenida con la presentadora
+        3. RED           solo si no hay internet: QR + panel de red
+        4. MENU          los 5 guias, para elegir por voz
+        5. AGENTES       la conversacion, que la lleva loop() cuando el niño
+                         dice un nombre (ver _greet())
+
+    El sketch ya arranca mostrando el aviso sin esperar a Python (por si tarda
+    o se cae); aqui solo se le dice cuando pasar al siguiente paso.
+    """
+    _show_aviso()
+    _welcome()
+    _network_if_needed()
+    _show_menu()
 
 
 def _card_cmd(arg):
@@ -421,7 +713,12 @@ def _menu():
     _follow_up = None
     ui.send_message("active_persona", {"key": None})
     _broadcast_bang(None)
-    threading.Thread(target=_welcome, daemon=True, name="welcome").start()
+
+    def _volver_al_inicio():
+        _welcome()
+        _show_menu()  # sin esto la pantalla se quedaba en la bienvenida
+
+    threading.Thread(target=_volver_al_inicio, daemon=True, name="welcome").start()
     return "🏠 de vuelta al inicio: retos borrados, elige un guía"
 
 
@@ -431,6 +728,7 @@ def _greet(persona):
     global _current_persona, _follow_up
     p = brain.PERSONAS[persona]
     gestures.send_card()
+    gestures.send_menu()  # eligio: se cierra el menu y aparece su cara
     _current_persona = persona
     ui.send_message("active_persona", {"key": persona})
     _broadcast_bang(persona)
@@ -489,7 +787,7 @@ def loop():
 
     if not _welcomed:
         _welcomed = True
-        _welcome()
+        _boot_sequence()
 
     follow_up, _follow_up = _follow_up, None
     if follow_up:

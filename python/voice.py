@@ -778,22 +778,24 @@ def _play_synced(spk, pcm, on_audible):
         time.sleep(chunk / spk.sample_rate)
 
 
-def _play_with_mouth(spk, wav):
-    """Reproduce el WAV avisando a la boca el nivel de cada bloque.
-
-    Si el audio no es el formato esperado, se reproduce igual, pero sin
-    mover la boca.
-    """
+def _wav_to_pcm(wav, spk):
+    """PCM int16 de un WAV del TTS, o None si no viene en el formato esperado."""
     with wave.open(io.BytesIO(wav.tobytes()), "rb") as w:
         ok = (w.getsampwidth() == 2 and w.getnchannels() == 1 and w.getframerate() == spk.sample_rate and spk.format == np.int16)
         frames = w.readframes(w.getnframes())
     if not ok:
-        logger.warning("Audio del TTS en un formato inesperado: suena sin mover la boca")
-        spk.play_wav(wav)
-        return
+        return None
+    return np.frombuffer(frames, dtype="<i2").astype(np.int16)
 
-    pcm = np.frombuffer(frames, dtype="<i2").astype(np.int16)
-    levels = _mouth_levels(pcm, spk.buffer_size)
+
+def _play_pcm_with_mouth(spk, pcm, pcm_boca=None):
+    """Reproduce PCM avisando a la boca el nivel de cada bloque.
+
+    pcm_boca permite calcular la boca con un audio DISTINTO del que suena: en
+    el aviso con musica de fondo, la boca sigue solo a la voz, para que no se
+    mueva durante los tramos en que solo suena la musica.
+    """
+    levels = _mouth_levels(pcm_boca if pcm_boca is not None else pcm, spk.buffer_size)
     sent = None
 
     def report(level):
@@ -803,9 +805,99 @@ def _play_with_mouth(spk, wav):
             sent = level
 
     try:
-        _play_synced(spk, pcm, lambda i: report(levels[i]))
+        _play_synced(spk, pcm, lambda i: report(levels[min(i, len(levels) - 1)]))
     finally:
         report(0)
+
+
+def _play_with_mouth(spk, wav):
+    """Reproduce el WAV avisando a la boca el nivel de cada bloque.
+
+    Si el audio no es el formato esperado, se reproduce igual, pero sin
+    mover la boca.
+    """
+    pcm = _wav_to_pcm(wav, spk)
+    if pcm is None:
+        logger.warning("Audio del TTS en un formato inesperado: suena sin mover la boca")
+        spk.play_wav(wav)
+        return
+    _play_pcm_with_mouth(spk, pcm)
+
+
+# --- Musica de fondo del aviso de seguridad ----------------------------------
+# El parlante toca UNA sola cosa a la vez (ver _spk_lock), asi que la musica no
+# se reproduce en paralelo: se MEZCLA con la voz en el mismo PCM antes de
+# sonar. Son acordes suaves en bucle, bien por debajo de la voz.
+
+_BED_CHORDS = (
+    (261.63, 329.63, 392.00),  # Do mayor
+    (220.00, 261.63, 329.63),  # La menor
+    (174.61, 220.00, 261.63),  # Fa mayor
+    (196.00, 246.94, 293.66),  # Sol mayor
+)
+_BED_CHORD_S = 2.4   # cuanto dura cada acorde
+_BED_GAIN = 0.20     # respecto a la voz: se oye, pero no la tapa
+
+
+def _music_bed(n, sample_rate):
+    """Colchon de acordes en bucle, de n muestras."""
+    largo = max(1, int(_BED_CHORD_S * sample_rate))
+    trozos = []
+    for acorde in _BED_CHORDS:
+        t = np.arange(largo) / sample_rate
+        # Entrada y salida suaves: que no se oiga el corte entre acordes.
+        env = np.clip(np.minimum(t / 0.45, (_BED_CHORD_S - t) / 0.55), 0, 1)
+        onda = sum(np.sin(2 * np.pi * f * t) for f in acorde) / len(acorde)
+        trozos.append(onda * env)
+    bucle = np.concatenate(trozos)
+    repes = int(n / len(bucle)) + 1
+    return np.tile(bucle, repes)[:n] * 7000.0
+
+
+def say_with_music(persona, text):
+    """Como say(), pero con musica de fondo. Se usa en el aviso de seguridad.
+
+    A diferencia de say(), aqui se arma TODO el audio antes de sonar: hace
+    falta conocer la duracion total para generar el colchon musical y mezclarlo.
+    Se pierde el arranque temprano de say() (que habla con la primera frase
+    lista), pero el aviso no es una conversacion: no urge.
+    """
+    pause_listening()
+    voice_name = _VOICES.get(persona, _DEFAULT_VOICE)
+    partes = _split_sentences(text)
+    futures = [_tts_pool.submit(_synthesize, p, voice_name) for p in partes]
+    try:
+        with _spk_lock:
+            spk = _speaker()
+            pausa = np.zeros(int(0.22 * spk.sample_rate), dtype=np.int16)
+            trozos = []
+            for fut in futures:
+                pcm = _wav_to_pcm(fut.result(), spk)
+                if pcm is None:
+                    raise ValueError("el TTS devolvio un formato inesperado")
+                trozos.append(pcm)
+                trozos.append(pausa)
+            # Una colita para que la musica cierre sola y no se corte en seco.
+            trozos.append(np.zeros(int(1.6 * spk.sample_rate), dtype=np.int16))
+            voz = np.concatenate(trozos)
+
+            bed = _music_bed(len(voz), spk.sample_rate) * _BED_GAIN
+            mezcla = np.clip(voz.astype(np.int32) + bed.astype(np.int32), -32768, 32767).astype(np.int16)
+
+            # La boca sigue a la VOZ, no a la mezcla: si no, se movería con la
+            # musica aunque el robot no este hablando.
+            _play_pcm_with_mouth(spk, mezcla, pcm_boca=voz)
+    except Exception as exc:
+        logger.warning(f"No pude decir el aviso con musica ({exc}); lo digo sin musica")
+        _reset_speaker()
+        resume_listening()
+        say(persona, text)  # respaldo: al menos que se oiga el aviso
+        return
+    finally:
+        for fut in futures:
+            fut.cancel()
+    time.sleep(0.4)
+    resume_listening()
 
 
 # --- Pitido de "te escuche" (como el de Alexa) --------------------------------
@@ -819,6 +911,88 @@ def _ack_pcm(sample_rate):
         env = np.clip(np.minimum(t / 0.005, (dur - t) / 0.02), 0, 1)
         parts.append((np.sin(2 * np.pi * freq * t) * env * 6000).astype(np.int16))
     return np.concatenate(parts)
+
+
+# --- Sonidos de navegacion del menu de personajes ----------------------------
+# Cada vez que el menu de la pantalla cambia de guia resaltado suena un tono
+# corto: ascendente al bajar por la lista y descendente al subir, para que el
+# niño note el movimiento sin tener que leer.
+
+_NAV_DOWN = (523, 784)  # do -> sol : "bajando"
+_NAV_UP = (784, 523)    # sol -> do : "subiendo"
+
+
+def _nav_pcm(sample_rate, freqs):
+    """Dos notas muy cortas (~90 ms en total), suaves."""
+    parts = []
+    for freq in freqs:
+        dur = 0.045
+        t = np.arange(int(dur * sample_rate)) / sample_rate
+        env = np.clip(np.minimum(t / 0.004, (dur - t) / 0.012), 0, 1)
+        parts.append((np.sin(2 * np.pi * freq * t) * env * 5000).astype(np.int16))
+    return np.concatenate(parts)
+
+
+def nav_tone(subiendo=False):
+    """Tono de navegacion del menu, sin bloquear el turno."""
+
+    def play():
+        try:
+            with _spk_lock:
+                spk = _speaker()
+                pcm = _nav_pcm(spk.sample_rate, _NAV_UP if subiendo else _NAV_DOWN)
+                chunk = spk.buffer_size
+                for i in range(0, len(pcm), chunk):
+                    spk.play(pcm[i : i + chunk])
+        except Exception as exc:
+            logger.debug(f"No sono el tono del menu: {exc}")
+            _reset_speaker()
+
+    threading.Thread(target=play, daemon=True, name="nav-tone").start()
+
+
+# --- Sonido de atencion del aviso de seguridad -------------------------------
+# Tres notas ascendentes, mas presentes que el pitido de "te escuche": marcan
+# que empieza algo importante. Suena con el aviso de seguridad del arranque.
+
+_ATTENTION = ((660, 0.12), (880, 0.12), (1175, 0.22))
+
+
+def _attention_pcm(sample_rate):
+    parts = []
+    for freq, dur in _ATTENTION:
+        t = np.arange(int(dur * sample_rate)) / sample_rate
+        env = np.clip(np.minimum(t / 0.008, (dur - t) / 0.05), 0, 1)
+        # Un armonico suave para que no suene a pitido de microondas.
+        onda = np.sin(2 * np.pi * freq * t) + 0.25 * np.sin(4 * np.pi * freq * t)
+        parts.append((onda * env * 7000).astype(np.int16))
+    return np.concatenate(parts)
+
+
+def attention(block=True):
+    """Campanilla de atencion. Por defecto espera a que termine, para que no se
+    pise con la voz que viene detras."""
+
+    def play():
+        try:
+            with _spk_lock:
+                spk = _speaker()
+                pcm = _attention_pcm(spk.sample_rate)
+                chunk = spk.buffer_size
+                for i in range(0, len(pcm), chunk):
+                    spk.play(pcm[i : i + chunk])
+        except Exception as exc:
+            logger.debug(f"No sono la campanilla del aviso: {exc}")
+            _reset_speaker()
+
+    if block:
+        pause_listening()
+        try:
+            play()
+        finally:
+            resume_listening()
+    else:
+        threading.Thread(target=play, daemon=True, name="attention").start()
 
 
 def ack():
