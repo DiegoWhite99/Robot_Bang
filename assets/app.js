@@ -30,6 +30,13 @@ ui.on_message('reply', onReply);
 ui.on_message('debug', onDebug);
 ui.on_message('bang_state', onBangState);
 ui.on_message('version', onVersion);
+ui.on_message('llm_mode', onLlmMode);
+ui.on_message('llm_mode_response', onLlmMode);
+ui.on_message('chat_mode', onChatMode);
+ui.on_message('chat_mode_response', onChatMode);
+ui.on_message('escucha', onEscucha);
+ui.on_message('escucha_response', onEscucha);
+ui.on_message('interrupted', onInterrupted);
 
 // Version y aviso de actualizaciones: los manda Python al conectarse
 // (APP_VERSION en main.py), para que no haya dos numeros distintos entre el
@@ -45,6 +52,101 @@ function onVersion(data) {
   if (data.notice) {
     document.querySelector('#version-text').textContent = data.notice;
   }
+}
+
+// --- Cerebro: ESSENTIALS (modelo local) / PLUS (Gemini) ---------------------
+// Python manda el modo al conectarse y cada vez que cambia (python/llm_router.py,
+// se guarda en la placa). Cambiarlo es cosa de un adulto: se pide confirmar.
+const modeButtons = document.querySelectorAll('.mode-btn[data-mode]');
+const modeNote = document.querySelector('#mode-note');
+const MODE_NOTES = {
+  essentials: 'Essentials: modelo local (más lento, sin Gemini). La voz sigue usando internet.',
+  plus: 'Plus: Gemini en la nube (rápido). Si Gemini falla, ese turno lo contesta el modelo local.',
+};
+let llmMode = null;
+
+function onLlmMode(data) {
+  if (!data || !data.mode) return;
+  llmMode = data.mode;
+  modeButtons.forEach((b) => {
+    const on = b.dataset.mode === llmMode;
+    b.classList.toggle('active', on);
+    b.setAttribute('aria-pressed', on ? 'true' : 'false');
+    b.disabled = false;
+  });
+  modeNote.textContent = MODE_NOTES[llmMode] || data.label || llmMode;
+  modeNote.classList.toggle('local', llmMode === 'essentials');
+}
+
+modeButtons.forEach((btn) => {
+  btn.addEventListener('click', () => {
+    const mode = btn.dataset.mode;
+    if (mode === llmMode) return;
+    const label = mode === 'essentials' ? 'ESSENTIALS (modelo local, más lento)' : 'PLUS (Gemini en la nube)';
+    if (!confirm(`¿Cambiar el cerebro del robot a ${label}? El reto en curso se conserva.`)) return;
+    modeButtons.forEach((b) => (b.disabled = true));
+    modeNote.textContent = 'cambiando de modo...';
+    ui.send_message('llm_mode', { mode });
+  });
+});
+
+// --- Modo de conversacion: BANG o CURIOSO -----------------------------------
+// El niño lo elige POR VOZ al empezar ("BANG" / "Curioso", ver
+// main._elegir_modo()) y lo puede cambiar diciendo "modo curioso". Aqui queda
+// el mismo interruptor para el adulto; se guarda en la placa
+// (data/chat_mode.txt) y tambien se cambia con /modo_chat en la terminal.
+const chatButtons = document.querySelectorAll('.mode-btn[data-chat]');
+const chatNote = document.querySelector('#chat-mode-note');
+const CHAT_NOTES = {
+  bang: 'BANG: el guía te acompaña a convertir tu reto en ideas (fases sólida, gaseosa y líquida).',
+  curioso: 'Curioso: charla libre. Responde lo que le preguntes y obedece "ponte feliz", "ponte triste", "baila".',
+};
+let chatMode = null;
+
+function onChatMode(data) {
+  if (!data || !data.mode) return;
+  chatMode = data.mode;
+  chatButtons.forEach((b) => {
+    const on = b.dataset.chat === chatMode;
+    b.classList.toggle('active', on);
+    b.setAttribute('aria-pressed', on ? 'true' : 'false');
+    b.disabled = false;
+  });
+  chatNote.textContent = CHAT_NOTES[chatMode] || data.label || chatMode;
+  chatNote.classList.toggle('local', chatMode === 'curioso');
+}
+
+chatButtons.forEach((btn) => {
+  btn.addEventListener('click', () => {
+    const mode = btn.dataset.chat;
+    if (mode === chatMode) return;
+    chatButtons.forEach((b) => (b.disabled = true));
+    chatNote.textContent = 'cambiando de modo...';
+    ui.send_message('chat_mode', { mode });
+  });
+});
+
+// --- Escucha activa (barge-in) ----------------------------------------------
+// Es NATIVA: no se prende ni se apaga. Mientras el guía habla, la placa
+// escucha en local (Vosk) y, si el niño habla, el guía se calla. Aqui solo se
+// muestra si el reconocedor está listo (/barge dice lo mismo en la terminal).
+const escuchaNote = document.querySelector('#escucha-note');
+
+function onEscucha(data) {
+  if (!data) return;
+  const estado = data.lista
+    ? `siempre activa: si hablas, el guía se calla y te escucha (${data.minimo} palabras bastan)`
+    : `⚠ no disponible (${data.vosk}): el guía no se podrá interrumpir`;
+  escuchaNote.textContent = estado;
+  escuchaNote.classList.toggle('local', !data.lista);
+}
+
+function onInterrupted(data) {
+  if (!data) return;
+  const who = personas[data.persona] ? personas[data.persona].name : data.persona;
+  const to = personas[data.to] ? personas[data.to].name : data.to;
+  const what = data.kind === 'switch' && data.to && data.to !== data.persona ? `pasas con ${to}` : `${who} te escucha`;
+  addLine('system', `✋ interrumpiste a ${who} («${data.text || ''}»): ${what}`);
 }
 
 function onUIConnected() {
@@ -109,7 +211,8 @@ function addLine(kind, text, who) {
 function onHeard(data) {
   if (!data || !data.text) return;
   const persona = personas[data.persona];
-  addLine('user', data.text, persona ? `TÚ → ${persona.name.toUpperCase()}` : 'TÚ');
+  const tag = data.aporte ? 'TÚ (APORTE)' : 'TÚ';
+  addLine('user', data.text, persona ? `${tag} → ${persona.name.toUpperCase()}` : tag);
 }
 
 function onReply(data) {
@@ -140,6 +243,8 @@ const bangReto = document.querySelector('#bang-reto');
 const bangPregunta = document.querySelector('#bang-pregunta');
 const bangCards = document.querySelector('#bang-cards');
 const bangIdeas = document.querySelector('#bang-ideas');
+const bangAportes = document.querySelector('#bang-aportes');
+const bangInterrumpido = document.querySelector('#bang-interrumpido');
 
 function onBangState(data) {
   const phase = data && data.phase;
@@ -149,7 +254,7 @@ function onBangState(data) {
 
   if (!data || !data.reto) {
     bangReto.textContent = 'Todavía no hay reto. Di "Crispi, mi reto es...".';
-    bangPregunta.hidden = bangCards.hidden = bangIdeas.hidden = true;
+    bangPregunta.hidden = bangCards.hidden = bangIdeas.hidden = bangAportes.hidden = bangInterrumpido.hidden = true;
     return;
   }
 
@@ -177,6 +282,14 @@ function onBangState(data) {
   const ideas = data.ideas || [];
   bangIdeas.hidden = phase === 'solida' || ideas.length === 0;
   bangIdeas.textContent = `💡 Ideas: ${ideas.length} — ${ideas.join(' · ')}`;
+
+  // Lo que el niño agregó interrumpiendo al guía, y la respuesta que se cortó
+  // (la nota dura hasta el siguiente turno normal).
+  const aportes = data.aportes || [];
+  bangAportes.hidden = aportes.length === 0;
+  bangAportes.textContent = `✋ Aportes: ${aportes.join(' · ')}`;
+  bangInterrumpido.hidden = !data.interrumpido;
+  bangInterrumpido.textContent = data.interrumpido ? `⏸ [INTERRUMPIDO] el guía iba diciendo: «${data.interrumpido}»` : '';
 }
 
 // --- Terminal ------------------------------------------------------------
@@ -188,7 +301,8 @@ const terminalOut = document.querySelector('#terminal-out');
 const terminalForm = document.querySelector('#terminal-form');
 const terminalInput = document.querySelector('#terminal-input');
 const COMMANDS = [
-  '/help', '/status', '/bt', '/add_bt', '/bt_list', '/bt_connect ', '/bt_disconnect ', '/bt_audio ', '/bt_mode headset', '/bt_mode music',
+  '/help', '/status', '/modo plus', '/modo essentials', '/bt', '/add_bt', '/bt_list', '/bt_connect ', '/bt_disconnect ', '/bt_audio ', '/bt_mode headset', '/bt_mode music',
+  '/barge', '/interrumpir ', '/modo_chat bang', '/modo_chat curioso', '/elegir_modo',
   '/test_audio', '/reset', '/clear', '/menu', '/bienvenida', '/cara ', '/tarjeta ',
   '/unlock_carmel', '/unlock_cesia', '/unlock_cori', '/unlock_cristal', '/unlock_all',
   '/lock_carmel', '/lock_cesia', '/lock_cori', '/lock_cristal', '/lock_all',

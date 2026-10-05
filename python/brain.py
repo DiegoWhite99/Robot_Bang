@@ -1,9 +1,14 @@
-# Cerebro del chatbot: las personalidades BANG y la llamada al LLM en la nube.
+# Cerebro del chatbot: las personalidades BANG y la llamada al LLM.
 #
 # Vive aparte de main.py para poder probarlo sin arrancar la App entera.
+# Desde la actualizacion de los modos hay dos cerebros (ver llm_router.py): PLUS = Gemini en la
+# nube (el codigo de este archivo) y ESSENTIALS = modelo local en la placa.
+# bang.py sigue llamando a chat() igual que antes; el router decide.
 
 from arduino.app_bricks.cloud_llm import CloudLLM
 from arduino.app_utils import Logger
+
+import llm_router
 
 logger = Logger("chat-bang")
 
@@ -58,6 +63,25 @@ SPOKEN_RULES = (
 )
 
 
+def local_system(key):
+    """System prompt del modelo local: corto y FIJO por guia.
+
+    Fijo importa: llama.cpp reusa el prefijo ya leido, asi que todo lo que
+    cambia (fase, reto, pista del RAG) va en el mensaje del usuario. Corto
+    importa mas: cada 100 caracteres son ~3 s de lectura en esta placa.
+    """
+    p = PERSONAS[key]
+    yo = "una guia" if p["gender"] == "f" else "un guia"
+    return (
+        f"Eres {p['name']}, {p['tagline'].lower()}, {yo} de BANG. Eres un robot, un personaje virtual: "
+        "nunca digas que eres una persona. Hablas con un solo niño de 5 a 14 años. "
+        f"Tono: {p['voice']} "
+        "Responde en español sencillo, 1 o 2 frases cortas y como mucho una pregunta. "
+        "Sin listas, sin emojis, sin pedir datos personales. Nunca te enojes con el niño. "
+        "Siempre habla de su reto."
+    )
+
+
 def _get_llm(cache_key, model, system_prompt, temperature):
     ck = (cache_key, model)
     if ck not in _llms:
@@ -65,8 +89,8 @@ def _get_llm(cache_key, model, system_prompt, temperature):
     return _llms[ck]
 
 
-def chat(cache_key, system_prompt, text, temperature=None, memory=True):
-    """Pregunta al LLM y devuelve su respuesta (o None si ningun modelo contesta).
+def chat_gemini(cache_key, system_prompt, text, temperature=None, memory=True):
+    """Pregunta a Gemini y devuelve su respuesta (o None si ningun modelo contesta).
 
     cache_key identifica la conversacion (p. ej. ("crispi", "solida")): cada
     una guarda su propia memoria. Con memory=False es una llamada suelta
@@ -74,7 +98,8 @@ def chat(cache_key, system_prompt, text, temperature=None, memory=True):
 
     Gemini devuelve 503/429 de forma intermitente, asi que si un modelo no
     responde pasamos al siguiente en vez de reintentar el mismo: un modelo
-    alterno suele contestar en un par de segundos.
+    alterno suele contestar en un par de segundos. Sin API_KEY, CloudLLM
+    lanza ValueError al construirse: tambien cae en None.
     """
     for model in MODELS:
         try:
@@ -86,25 +111,46 @@ def chat(cache_key, system_prompt, text, temperature=None, memory=True):
     return None
 
 
+def chat(cache_key, system_prompt, text, temperature=None, memory=True, local=None, fallback=True):
+    """Pregunta al cerebro del modo activo (ver llm_router.chat()).
+
+    local = (system, texto) cortos para el modelo local; fallback=False
+    evita que, en Plus, un fallo de Gemini se pague con el modelo local.
+    Devuelve None si nadie contesta.
+    """
+    return llm_router.chat(cache_key, system_prompt, text, temperature, memory, local=local, fallback=fallback)
+
+
 FALLBACK_REPLY = "Se me cruzaron los cables un segundo. Puedes repetirlo?"
 
 
 def clear(persona):
-    """Borra la memoria de todas las conversaciones de un guia."""
+    """Borra la memoria de todas las conversaciones de un guia (las dos)."""
     for ck in list(_llms):
         key = ck[0]
         if key == persona or (isinstance(key, tuple) and key[0] == persona):
             _llms.pop(ck).clear_memory()
+    llm_router.clear(persona)
+
+
+def clear_all():
+    """Al cambiar de modo: memorias limpias en los dos cerebros."""
+    for key in PERSONAS:
+        clear(key)
 
 
 def warmup():
-    """Hace la primera llamada a Gemini mientras nadie espera.
+    """Precalienta el cerebro del modo activo mientras nadie espera.
 
-    El primer chat del proceso cuesta ~25 s (importar langchain, abrir el
-    canal y autenticar) y los siguientes bajan a ~1 s. Se usa un CloudLLM
-    de usar y tirar, fuera de la cache, para no ensuciar la memoria de
-    ningun guia con esta frase de prueba.
+    Plus: el primer chat del proceso con Gemini cuesta ~25 s (importar
+    langchain, abrir el canal y autenticar) y los siguientes bajan a ~1 s.
+    Se usa un CloudLLM de usar y tirar, fuera de la cache, para no ensuciar
+    la memoria de ningun guia con esta frase de prueba.
+    Essentials: se carga el modelo en el runner (~22 s), sin tocar Gemini.
     """
+    if llm_router.is_local():
+        llm_router.warmup_local()
+        return
     try:
         CloudLLM(model=MODELS[0], system_prompt="Responde solo: ok", timeout=TIMEOUT).chat("ok")
         logger.info("Modelo precalentado: la primera respuesta ya sera rapida")

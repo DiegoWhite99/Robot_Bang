@@ -11,3 +11,9 @@ data/
 
 #claves
 app.yaml
+# modelo Vosk de la escucha activa (lo baja tools/install_vosk_model.py)
+models/
+
+# cache de Python (se regenera sola)
+__pycache__/
+*.pyc

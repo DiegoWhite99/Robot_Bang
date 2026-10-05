@@ -9,6 +9,9 @@
 #
 # La clave se saca de https://aistudio.google.com/apikey
 #
+# arduino:llm es el modelo local del modo ESSENTIALS (ver python/llm_router.py):
+# no lleva clave, y con el declarado App Lab levanta llamacpp-models-runner.
+#
 # OJO: la otra credencial, google-credentials.json (Speech-to-Text y
 # Text-to-Speech), va suelta en la raiz de la App y tampoco se versiona.
 
@@ -20,4 +23,6 @@ bricks:
 - arduino:cloud_llm:
     variables:
       API_KEY: TU_API_KEY_AQUI
+- arduino:llm:
+    model: llamacpp:Qwen3.5-0.8B-Q4_0
 icon: 🤖

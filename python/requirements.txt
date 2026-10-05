@@ -3,3 +3,7 @@ google-cloud-texttospeech==2.37.0
 # Para el QR que lleva al dashboard (se dibuja en la pantalla TFT). Es Python
 # puro, no arrastra Pillow: solo se usa la matriz de modulos.
 qrcode==7.4.2
+# Escucha activa (barge-in): reconocimiento LOCAL con gramatica cerrada mientras
+# el guia habla, sin costo de API. El modelo (~40 MB) lo baja
+# tools/install_vosk_model.py a models/vosk-es/ (voice.py lo llama solo).
+vosk==0.3.45

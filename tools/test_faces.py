@@ -1,6 +1,6 @@
 # Prueba las 5 caras sin microfono: manda /cara <guia> por la terminal del
 # dashboard (socket.io) y muestra lo que contesta la App.
-#   docker exec robot-bang-3-main-1 /app/.cache/.venv/bin/python /app/tools/test_faces.py
+#   docker exec robot-bang-stable-main-1 /app/.cache/.venv/bin/python /app/tools/test_faces.py
 import time
 
 import socketio

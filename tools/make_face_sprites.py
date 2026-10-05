@@ -1,452 +1,610 @@
-# Convierte los frames PNG de los guias (assets/img/<guia>/) en bitmaps para
-# la pantalla TFT del MCU: genera sketch/<guia>_face.h.
+# Convierte los SVG de las caras de los guias (assets/img/<guia>/*.svg) en
+# sprites a color para la pantalla TFT del MCU: genera sketch/<guia>_face.h.
+#
+# Cada guia trae 20 dibujos a todo color (fondo de color + cara):
+#   - Cara 1..6: parpadeo (1 = abierto ... 6 = cerrado), boca en reposo.
+#   - 10 visemas (la boca de cada grupo de sonidos), ojos abiertos:
+#       a,e,i  b,m,p  c,d,g,k,n,s,t,x,y,z  ch,sh,j  F  L  O  q,w  R  u
+#   - 4 emociones: enojada, feliz, sorpresa, triste (cambian ojos Y boca).
 #
 # La TFT va por SPI a ~4 us/byte (ver sketch.ino), asi que NO se puede
-# mandar una imagen entera por frame. Por eso la cara se parte en:
-#   - base:   la pantalla completa (ojos abiertos, boca cerrada). Se manda
-#             una sola vez, al cambiar de guia.
-#   - ojos:   un sprite por ojo y por estado de parpadeo (abierto,
-#             entrecerrado, cerrado), del tamano justo de lo que cambia.
-#   - boca:   un sprite por nivel de apertura (0 = la sonrisa original).
-#             Los PNG no traen boca hablando, asi que los niveles 1..N se
-#             dibujan aqui a partir de la propia sonrisa: el labio de
-#             arriba es el trazo original y el de abajo se "descuelga"
-#             con el mismo grosor de linea, para que no desentone.
+# mandar una imagen entera por frame. Por eso la cara se parte en capas:
+#   - BASE:  la Cara 1 a pantalla completa. Se manda una sola vez, al
+#            cambiar de guia.
+#   - ARRIBA (ojos/cejas, filas < split): parpadeo + ojos de cada emocion
+#            (FRUSTRADO reutiliza los ojos entrecerrados de la Cara 3).
+#   - BOCA   (filas >= split): los 10 visemas + la boca de cada emocion
+#            (FRUSTRADO reutiliza la boca de la F).
+#   - EXTRA  (filas >= split, atado a la capa de ARRIBA): lo que una
+#            emocion cambia por debajo del split lejos de la boca
+#            (cachetes, lagrimas). Se queda toda la frase, aunque la boca
+#            vaya cambiando de visema.
+#   ARRIBA y BOCA nunca se pisan (split), asi que una fila de pantalla es
+#   la base + la capa de arriba, o la base + el extra + la boca.
 #
-# Los pixeles se guardan en 2 bits y el sketch los pinta con los colores de
-# faces_colors.h, asi que cambiar el color de la cara no exige volver a
-# correr esto. Dos modos:
-#   - una tinta (casi todos): 0 = fondo ... 3 = trazo lleno (antialiasing).
-#   - dos tintas (Carmel, que tiene el bigote verde): 0 = fondo, 1 = medio
-#     trazo, 2 = trazo (color de OJOS), 3 = segunda tinta (color de BOCA).
+# Pasos:
+#   1. Rasteriza con librsvg + cairo por ctypes (ya vienen en el
+#      contenedor; no hace falta instalar nada).
+#   2. Alinea cada dibujo con la Cara 1: algunos estan re-exportados con
+#      1-3 px de corrimiento, y sin esto se verian costuras. Se busca el
+#      corrimiento sub-pixel que deja menos pixeles distintos y se vuelve a
+#      rasterizar el vector ya corrido (sin re-muestrear el bitmap).
+#   3. Paleta de 15 colores por guia (median cut sobre los 20 dibujos), el
+#      fondo exacto es uno de ellos; el indice 15 es "transparente".
+#   4. Cada estado guarda solo lo que cambia contra la base: su rectangulo,
+#      con lo que no cambia transparente.
+#   5. Codifica cada sprite en RLE por fila (ver "Formato" abajo) y mete todo
+#      el guia en UN blob + un descriptor (pocos simbolos y relocaciones:
+#      en el modo de link dinamico del core Zephyr eso tambien ocupa flash).
+#   6. Reconstruye cada estado decodificando el blob igual que el MCU,
+#      mide el error contra el SVG y deja tools/<guia>_preview.png.
 #
-# Crispi tiene sus parametros medidos a mano (sus PNG son de otro tamano y
-# ya estaba afinado). Los demas se calculan solos a partir de los trazos:
-# los PNG de cada frame estan redibujados (cambian un poco de tamano y
-# posicion, y hasta la nariz y la boca), asi que de cada frame se toman
-# SOLO los ojos, alineados y escalados con la ceja del mismo lado, y todo
-# lo demas sale del frame de ojos abiertos.
+# Formato del RLE (lo decodifica faceDecodeRow() en sketch.ino):
+#   token = indice << 4 | (largo - 1); largo 1..15. Si los 4 bits bajos
+#   valen 15, el largo es 16 + el byte siguiente (16..271). Indice 15 =
+#   transparente (se deja lo de abajo). Cada sprite tiene una tabla de
+#   filas (uint16 little endian por fila, offset desde `data`), y las filas
+#   repetidas apuntan a los mismos bytes.
 #
-# Se corre DENTRO del contenedor de la App (ahi estan numpy, PIL y cv2):
-#   docker exec robot-bang-3-main-1 python3 /app/tools/make_face_sprites.py [guia ...]
+# Se corre DENTRO del contenedor de la App (ahi estan numpy, PIL, cv2 y
+# librsvg):
+#   docker exec robot-bang-stable-main-1 python3 /app/tools/make_face_sprites.py [guia ...]
 
+import ctypes
+import re
 import sys
 from pathlib import Path
 
 import cv2
 import numpy as np
-from PIL import Image, ImageDraw
+from PIL import Image
 
 APP = Path(__file__).resolve().parent.parent
 SCREEN_W, SCREEN_H = 320, 240
-SCREEN_MARGIN = 6  # px libres alrededor de la cara (con la boca bien abierta)
-MOUTH_FILL_ALPHA = 0.34  # interior de la boca abierta: un tinte claro del color
-MOUTH_OPEN_SCREEN = [0, 8, 14, 20, 26]  # apertura de cada nivel, px de PANTALLA
 
-# frames = (abierto, entrecerrado, cerrado). Si un guia no trae ojo
-# entrecerrado se repite el cerrado: el parpadeo queda en abierto-cerrado.
-PERSONAS = {
-    "crispi": {
-        "frames": ["crispi-01.png", "crispi-02.png", "crispi-03.png"],
-        # (crispi-04 y crispi-05 son copias de 02 y 01: la secuencia de
-        # parpadeo 1-2-3-4-5 la arma el sketch con estos 3 estados.)
-        "manual": {
-            # Escala y encuadre (en px del PNG original, 1059x786). La escala
-            # deja la cara, con la boca en su maxima apertura, entera dentro
-            # de los 240 px de alto de la pantalla.
-            "scale": 0.38,
-            "center": (528.5, 426.0),
-            # Sonrisa: tramo "parseable" por columnas (a la derecha de x=675
-            # empieza el ganchito del final, que se deja tal cual).
-            "smile_x": (378, 672),
-            "smile_y": (560, 660),
-            "stroke": 21,  # grosor del trazo medido en la nariz y la sonrisa
-            "open_px": [0, 20, 36, 52, 68],  # apertura de cada nivel, px del PNG
-            # Zona de los ojos (x0, y0, x1, y1 en px del PNG). Los PNG se
-            # exportaron por separado y su antialiasing difiere un poco en
-            # TODA la imagen (nariz, cejas): de cada frame solo se toma esta
-            # zona, y el resto sale del frame 1.
-            "eye_zone": (250, 188, 815, 420),
-        },
-    },
-    # Carmel: 01 trae otro bigote; 02 = abiertos, 03 = parpado a media asta,
-    # 05 = cerrados relajados (04 son cerrados "felices", mas arriba).
-    "carmel": {"frames": ["carmel-02.png", "carmel-03.png", "carmel-05.png"], "two_inks": True},
-    # Cesia, Cori y Cristal son el mismo dibujo en otro color, con los
-    # frames en otro orden. Sin ojo entrecerrado (03 son ojos "felices" ^^).
-    "cesia": {"frames": ["casia-04.png", "cesia-01.png", "cesia-01.png"]},
-    "cori": {"frames": ["cori-04.png", "cori-01.png", "cori-01.png"]},
-    "cristal": {"frames": ["cristal-04.png", "cristal-01.png", "cristal-01.png"]},
-}
+# Orden = PERSONA_IDS de python/gestures.py (y P_* de sketch.ino).
+GUIAS = ["crispi", "carmel", "cesia", "cori", "cristal"]
+
+# Cuadros del parpadeo que se guardan (la Cara 1 es la base). Tiene que
+# coincidir con FACE_BLINK_FRAMES / FACE_BLINK_HALF de sketch/face_sprite.h
+# (se verifica abajo). Con flash de sobra van todos: 2, 3, 4, 5, 6. Si no
+# entra, (3, 5, 6) ahorra ~30 KB.
+BLINK_FRAMES = (2, 3, 4, 5, 6)
+FRUSTRATED_EYES = 3  # los ojos de FRUSTRADO son los de la Cara 3
+
+# Visemas en el orden del Bridge "viseme" (1..10; 0 = boca de reposo).
+VISEMES = ["AEI", "BMP", "CDG", "CHJ", "F", "L", "O", "QW", "R", "U"]
+# Emociones en el orden de FACE_TOP_ANGRY.. / FACE_MOUTH_ANGRY.. de face_sprite.h.
+EMOTIONS = ["ENOJADA", "FELIZ", "SORPRESA", "TRISTE"]
+
+TRANSPARENT = 15
+PALETTE_COLORS = 15
+# Lo que se aleja del fondo menos que esto (max por canal) cuenta como fondo
+# al armar la paleta.
+BG_TOLERANCE = 6
+
+# Un pixel es "cambio" si su color se aleja de la base al menos esto (max
+# por canal, 0-255)...
+CHANGE_CORE = 40
+# ...o si toca un cambio (antialiasing del borde) y su indice de paleta es
+# otro. Lo aislado y tenue (ruido de exportacion) se queda con la base.
+CHANGE_GROW_PX = 2
+# Manchas de cambio mas chicas que esto son ruido de exportacion.
+MIN_BLOB_PX = 6
 
 
-# --- Carga -------------------------------------------------------------------
-
-
-def load_inks(persona, name, two_inks):
-    """Devuelve (tinta1, tinta2): opacidad 0..1 de cada color del dibujo."""
-    rgba = np.array(Image.open(APP / "assets/img" / persona / name).convert("RGBA")).astype(np.float32)
-    a = rgba[..., 3] / 255.0
-    if not two_inks:
-        return a, np.zeros_like(a)
-    # El verde del bigote contra el amarillo del resto: el amarillo tiene
-    # rojo alto, el verde casi nada.
-    green = (rgba[..., 1] - rgba[..., 0]) > 60
-    return a * ~green, a * green
-
-
-# --- Composicion automatica (todos menos Crispi) -----------------------------
-
-
-def components(a):
-    """Trazos separados del dibujo: lista de (bbox x0, y0, x1, y1, mascara)."""
-    m = (a > 0.5).astype(np.uint8)
-    n, lab, st, _ = cv2.connectedComponentsWithStats(m, connectivity=8)
-    out = []
-    for i in range(1, n):
-        x, y, w, h, area = st[i]
-        if area < 300:  # motas (el brillo del ojo, si quedara suelto, va con el ojo)
-            continue
-        out.append(((x, y, x + w, y + h), lab == i))
+def _files(suf, **over):
+    """Nombres de archivo de un guia: "Cara <clave><suf>.svg", salvo `over`."""
+    names = {str(n): f"Cara {n}" for n in range(1, 7)}
+    names.update(
+        AEI="Cara a,e,i", BMP="Cara b,m,p", CDG="Cara c,d,g,k,n,s,t,x,y,z",
+        CHJ="Cara ch,sh,j", F="Cara F", L="Cara L", O="Cara O", QW="Cara q,w",
+        R="Cara R", U="Cara u", ENOJADA="Cara enojada", FELIZ="Cara feliz",
+        SORPRESA="Cara sorpresa", TRISTE="Cara triste",
+    )
+    out = {k: v + suf + ".svg" for k, v in names.items()}
+    out.update(over)
     return out
 
 
-def classify(ink1, ink2):
-    """Separa los trazos de un frame en cejas (izq, der), ojos y "el resto".
+# Mapa explicito: los nombres de los SVG no son parejos entre guias.
+FILES = {
+    "crispi": _files("", CHJ="Cara ch,sh,i.svg"),  # sic: "i" en vez de "j"
+    "carmel": _files(" Carmel"),
+    "cesia": _files(" Cesia", AEI="Cara a,e,i_1.svg", U="Cara U Cesia.svg"),
+    "cori": _files(" Cori", L="CARA L Cori.svg", CHJ="Cara ch, sh,j Cori.svg"),
+    "cristal": _files(" Cristal", F="Cara f Cristal.svg", U="Cara U Cristal.svg"),
+}
 
-    Cejas = los dos trazos de mas arriba. Boca = el mas bajo. Nariz = el del
-    medio. Lo que queda (entre cejas y boca, a los costados) son los ojos,
-    con pestanas, pupila y brillo incluidos.
+
+# ---------------------------------------------------------------- rasterizado
+_rsvg = ctypes.CDLL("librsvg-2.so.2")
+_cairo = ctypes.CDLL("libcairo.so.2")
+_gobj = ctypes.CDLL("libgobject-2.0.so.0")
+
+
+class _Rect(ctypes.Structure):
+    _fields_ = [(n, ctypes.c_double) for n in ("x", "y", "width", "height")]
+
+
+_rsvg.rsvg_handle_new_from_file.restype = ctypes.c_void_p
+_rsvg.rsvg_handle_new_from_file.argtypes = [ctypes.c_char_p, ctypes.c_void_p]
+_rsvg.rsvg_handle_render_document.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(_Rect), ctypes.c_void_p]
+_gobj.g_object_unref.argtypes = [ctypes.c_void_p]
+_cairo.cairo_image_surface_create.restype = ctypes.c_void_p
+_cairo.cairo_create.restype = ctypes.c_void_p
+_cairo.cairo_create.argtypes = [ctypes.c_void_p]
+_cairo.cairo_destroy.argtypes = [ctypes.c_void_p]
+_cairo.cairo_surface_destroy.argtypes = [ctypes.c_void_p]
+_cairo.cairo_surface_flush.argtypes = [ctypes.c_void_p]
+_cairo.cairo_image_surface_get_data.restype = ctypes.POINTER(ctypes.c_uint8)
+_cairo.cairo_image_surface_get_data.argtypes = [ctypes.c_void_p]
+_cairo.cairo_image_surface_get_stride.argtypes = [ctypes.c_void_p]
+
+
+class Svg:
+    """Un SVG abierto una vez y rasterizado a 320x240 con un corrimiento."""
+
+    def __init__(self, path):
+        self.path = path
+        self.handle = _rsvg.rsvg_handle_new_from_file(str(path).encode(), None)
+        if not self.handle:
+            raise SystemExit(f"no se pudo abrir {path}")
+
+    def render(self, dx=0.0, dy=0.0):
+        # ARGB32 de cairo = BGRA premultiplicado; el fondo es opaco, asi que
+        # basta con reordenar los canales. Todo se libera: sin esto la
+        # busqueda del corrimiento (cientos de renders) se queda sin RAM.
+        surf = _cairo.cairo_image_surface_create(0, SCREEN_W, SCREEN_H)
+        cr = _cairo.cairo_create(surf)
+        _rsvg.rsvg_handle_render_document(self.handle, cr, ctypes.byref(_Rect(dx, dy, SCREEN_W, SCREEN_H)), None)
+        _cairo.cairo_surface_flush(surf)
+        stride = _cairo.cairo_image_surface_get_stride(surf)
+        raw = np.ctypeslib.as_array(_cairo.cairo_image_surface_get_data(surf), shape=(SCREEN_H * stride,))
+        rgb = raw.reshape(SCREEN_H, stride)[:, : SCREEN_W * 4].reshape(SCREEN_H, SCREEN_W, 4)[..., [2, 1, 0]].copy()
+        _cairo.cairo_destroy(cr)
+        _cairo.cairo_surface_destroy(surf)
+        return rgb
+
+    def close(self):
+        _gobj.g_object_unref(self.handle)
+
+
+def diff_count(a, b):
+    return int((np.abs(a.astype(np.int16) - b).max(-1) > CHANGE_CORE).sum())
+
+
+def align(svg, base):
+    """Corrimiento (dx, dy) que deja `svg` lo mas parecido posible a `base`.
+
+    Se minimiza la CANTIDAD de pixeles distintos (no la suma): lo que el
+    dibujo cambia a proposito (boca, ojos) cuenta mas o menos igual con
+    cualquier corrimiento, y lo que no cambia baja a ~0 cuando calza.
     """
-    h, w = ink1.shape
-    comps = components(np.maximum(ink1, ink2))
-    comps.sort(key=lambda c: c[0][1])
-    brows = sorted(comps[:2], key=lambda c: c[0][0])
-    assert brows[0][0][2] < w / 2 < brows[1][0][0], "no encontre las dos cejas"
-    ink1_only = [c for c in comps[2:] if (ink1[c[1]] > 0.5).mean() > 0.5]
-    mouth = max(ink1_only, key=lambda c: c[0][3])
-    eyes = np.zeros((h, w), dtype=bool)
-    rest = np.zeros((h, w), dtype=bool)
-    for c in comps:
-        (x0, y0, x1, y1), m = c
-        cx = (x0 + x1) / 2
-        is_eye = (
-            c is not mouth
-            and all(c is not b for b in brows)
-            and abs(cx - w / 2) > 0.1 * w  # la nariz va al medio
-            and (ink1[m] > 0.5).mean() > 0.5  # el bigote (tinta 2) no es ojo
-            and y1 < mouth[0][1]
-        )
-        (eyes if is_eye else rest)[m] = True
-    # Las mascaras se agrandan un poco para llevarse el antialiasing del borde.
-    k = np.ones((7, 7), np.uint8)
-    grow = lambda m: cv2.dilate(m.astype(np.uint8), k).astype(bool)
-    return brows, grow(eyes), grow(rest), mouth
+    best = (diff_count(svg.render(), base), 0.0, 0.0)
+    for step in (1.0, 0.5, 0.25):
+        cx, cy = best[1], best[2]
+        for dy in (-2, -1, 0, 1, 2):
+            for dx in (-2, -1, 0, 1, 2):
+                x, y = cx + dx * step, cy + dy * step
+                if (x, y) == (cx, cy):
+                    continue
+                c = diff_count(svg.render(x, y), base)
+                if c < best[0]:
+                    best = (c, x, y)
+    return best[1], best[2]
 
 
-def warp_to(layer, src_brow, dst_brow, x_range):
-    """Lleva la mitad x_range de `layer` de la ceja src a la ceja dst
-    (escala por el ancho de la ceja + traslacion de su centro)."""
-    (sx0, sy0, sx1, sy1), _ = src_brow
-    (dx0, dy0, dx1, dy1), _ = dst_brow
-    s = (dx1 - dx0) / (sx1 - sx0)
-    tx = (dx0 + dx1) / 2 - s * (sx0 + sx1) / 2
-    ty = (dy0 + dy1) / 2 - s * (sy0 + sy1) / 2
-    half = np.zeros_like(layer)
-    half[:, x_range[0] : x_range[1]] = layer[:, x_range[0] : x_range[1]]
-    M = np.float32([[s, 0, tx], [0, s, ty]])
-    return cv2.warpAffine(half, M, (layer.shape[1], layer.shape[0]), flags=cv2.INTER_LINEAR)
+# ---------------------------------------------------------------- paleta
+def to565(rgb):
+    r, g, b = (int(v) for v in rgb)
+    return ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3)
 
 
-def compose_auto(persona, cfg):
-    """Frames (tinta1, tinta2) listos: ojos de cada frame sobre la base."""
-    two = cfg.get("two_inks", False)
-    frames = [load_inks(persona, n, two) for n in cfg["frames"]]
-    base1, base2 = frames[0]
-    brows0, eyes0, rest0, mouth0 = classify(base1, base2)
-    rest1, rest2 = base1 * rest0, base2 * rest0
-    w = base1.shape[1]
+def from565(c):
+    r, g, b = (c >> 11) & 31, (c >> 5) & 63, c & 31
+    return np.array([(r << 3) | (r >> 2), (g << 2) | (g >> 4), (b << 3) | (b >> 2)], np.uint8)
+
+
+def build_palette(base, changed, bg):
+    """15 colores: el fondo exacto (indice 0) + 14 por median cut.
+
+    Se cuantiza la base + SOLO lo que cambia en cada estado: con los 20
+    cuadros enteros, la cara repetida 20 veces se come la paleta y los
+    colores chicos de la boca (lengua, dientes) se pierden. El fondo se saca
+    antes (es la mayoria de la base): si no, median cut lo parte en varias
+    cajas casi iguales que en RGB565 quedan repetidas.
+    """
+    px = np.concatenate([base.reshape(-1, 3)] + [c.reshape(-1, 3) for c in changed], axis=0)
+    px = px[np.abs(px.astype(np.int32) - bg).max(-1) > BG_TOLERANCE]
+    w = 512  # PIL quiere una imagen: se arma una tira de `w` de ancho
+    px = np.concatenate([px, np.repeat(px[:1], (-len(px)) % w, axis=0)], axis=0)
+    mont = Image.fromarray(px.reshape(-1, w, 3).astype(np.uint8))
+    bg565 = to565(bg)
+    want = PALETTE_COLORS - 1
+
+    def colors565(n):
+        # Colores distintos en RGB565 (sin el fondo), en el orden de median cut.
+        pal_img = mont.quantize(n, method=Image.Quantize.MEDIANCUT, dither=Image.Dither.NONE)
+        pal = np.array(pal_img.getpalette()[: n * 3], np.int32).reshape(-1, 3)
+        out = []
+        for c in pal:
+            v = to565(c)
+            if v != bg565 and v not in out:
+                out.append(v)
+        return out
+
+    # Si al redondear a RGB565 se repiten colores, se pide alguno mas hasta
+    # llenar los 14 lugares (sin pasarse).
+    best = colors565(want)
+    for n in range(want + 1, 4 * want):
+        c = colors565(n)
+        if len(c) > want:
+            break
+        best = c
+        if len(c) == want:
+            break
+    # El fondo exacto: los badges (WiFi, version) se pintan sobre BG y no
+    # pueden quedar de otro tono. Se cuantiza con la paleta YA pasada por
+    # RGB565: lo que se compara y se previsualiza es lo que va a mostrar la
+    # pantalla.
+    pal = np.array([from565(v) for v in [bg565] + best], np.uint8)
+    return pal, 0
+
+
+def quantize(rgb, pal):
+    d = ((rgb[:, :, None, :].astype(np.int32) - pal[None, None].astype(np.int32)) ** 2).sum(-1)
+    return d.argmin(-1).astype(np.uint8)
+
+
+# ---------------------------------------------------------------- cambios
+def change_mask(img, q, base_img, base_q):
+    """Pixeles del estado que difieren de la base de verdad (no ruido)."""
+    core = np.abs(img.astype(np.int16) - base_img).max(-1) > CHANGE_CORE
+    n, lab, stats, _ = cv2.connectedComponentsWithStats(core.astype(np.uint8), connectivity=8)
+    for i in range(1, n):
+        if stats[i, cv2.CC_STAT_AREA] < MIN_BLOB_PX:
+            core[lab == i] = False
+    k = np.ones((2 * CHANGE_GROW_PX + 1,) * 2, np.uint8)
+    near = cv2.dilate(core.astype(np.uint8), k).astype(bool)
+    return core | (near & (q != base_q))
+
+
+def bbox(mask):
+    ys, xs = np.nonzero(mask)
+    if len(xs) == 0:
+        return None
+    return int(xs.min()), int(ys.min()), int(xs.max() - xs.min() + 1), int(ys.max() - ys.min() + 1)
+
+
+# ---------------------------------------------------------------- RLE
+def rle_row(row):
+    out = bytearray()
+    i, n = 0, len(row)
+    while i < n:
+        v = int(row[i])
+        j = i
+        while j < n and row[j] == v and j - i < 271:
+            j += 1
+        run = j - i
+        if run <= 15:
+            out.append((v << 4) | (run - 1))
+        else:
+            out += bytes(((v << 4) | 15, run - 16))
+        i = j
+    return bytes(out)
+
+
+class Blob:
+    """Los bytes de un guia: tablas de filas + filas RLE (deduplicadas)."""
+
+    def __init__(self):
+        self.data = bytearray()
+        self.rows = {}  # bytes de fila -> offset (para reutilizar)
+
+    def add_sprite(self, px):
+        """Agrega un sprite (matriz de indices); devuelve (tabla, data).
+
+        Primero van las filas nuevas y despues la tabla de filas. Los
+        offsets de la tabla son de 16 bits desde `data`: 0 (absolutos, y
+        las filas se comparten entre sprites) mientras el blob no pase de
+        ~64 KB; si no, desde el comienzo de este sprite.
+        """
+        data_base = 0 if len(self.data) < 60000 else len(self.data)
+        offs = []
+        for r in (rle_row(row) for row in px):
+            o = self.rows.get(r)
+            if o is None or o < data_base:
+                o = len(self.data)
+                self.data += r
+                self.rows[r] = o
+            offs.append(o - data_base)
+        table = len(self.data)
+        for rel in offs:
+            assert 0 <= rel < 65536, "fila fuera del alcance de 16 bits"
+            self.data += bytes((rel & 0xFF, rel >> 8))
+        return table, data_base
+
+
+def decode_row(blob, table, data_base, row, w):
+    """Lo mismo que faceDecodeRow() del sketch (para verificar)."""
+    t = table + 2 * row
+    p = data_base + blob[t] + (blob[t + 1] << 8)
     out = []
-    for ink1, ink2 in frames:
-        brows, eyes, _, _ = classify(ink1, ink2)
-        e1, e2 = ink1 * eyes, ink2 * eyes
-        f1, f2 = rest1.copy(), rest2.copy()
-        for side, xr in ((0, (0, w // 2)), (1, (w // 2, w))):
-            f1 = np.maximum(f1, warp_to(e1, brows[side], brows0[side], xr))
-            f2 = np.maximum(f2, warp_to(e2, brows[side], brows0[side], xr))
-        out.append((f1, f2))
-    return out, mouth0
+    while len(out) < w:
+        tok = blob[p]
+        p += 1
+        v, n = tok >> 4, tok & 15
+        if n < 15:
+            n += 1
+        else:
+            n = 16 + blob[p]
+            p += 1
+        out += [v] * n
+    return out[:w]
 
 
-def smile_params(ink1, mouth):
-    """Tramo de la sonrisa que se puede leer columna por columna (un solo
-    trazo por columna: sin el ganchito del final) y grosor del trazo."""
-    (x0, y0, x1, y1), m = mouth
-    runs = []
-    for x in range(x0, x1):
-        col = m[y0:y1, x]
-        edges = np.flatnonzero(np.diff(np.concatenate([[0], col.astype(np.int8), [0]])))
-        n = len(edges) // 2
-        runs.append((edges[1::2] - edges[::2]).sum() if n == 1 else -1)
-    # El tramo mas largo de columnas con un solo trazo.
-    best, cur = (0, 0), None
-    for i, r in enumerate(runs + [-1]):
-        if r > 0 and cur is None:
-            cur = i
-        elif r <= 0 and cur is not None:
-            if i - cur > best[1] - best[0]:
-                best = (cur, i)
-            cur = None
-    lens = np.array(runs[best[0] : best[1]])
-    stroke = int(round(np.percentile(lens, 20)))
-    return (x0 + best[0], x0 + best[1] - 1), (y0, y1), stroke
+def compose(blob, layers, top, extra, mouth, split):
+    """Pantalla de indices como la arma el MCU (faceComposeRow()): base +
+    arriba la capa de los ojos, abajo el extra de esos ojos y la boca."""
+    scr = np.zeros((SCREEN_H, SCREEN_W), np.uint8)
+    base = layers["base"]
+    for y in range(SCREEN_H):
+        line = np.array(decode_row(blob, base[4], base[5], y, SCREEN_W), np.uint8)
+        for s in ((top,) if y < split else (extra, mouth)):
+            if s[2] and s[1] <= y < s[1] + s[3]:
+                r = np.array(decode_row(blob, s[4], s[5], y - s[1], s[2]), np.uint8)
+                seg = line[s[0] : s[0] + s[2]]
+                seg[r != TRANSPARENT] = r[r != TRANSPARENT]
+        scr[y] = line
+    return scr
 
 
-# --- Boca ----------------------------------------------------------------------
+# ---------------------------------------------------------------- principal
+def check_face_sprite_h():
+    """BLINK_FRAMES tiene que coincidir con lo que espera el sketch."""
+    txt = (APP / "sketch" / "face_sprite.h").read_text()
+    want = {
+        "FACE_BLINK_FRAMES": len(BLINK_FRAMES),
+        "FACE_BLINK_HALF": BLINK_FRAMES.index(FRUSTRATED_EYES),
+        "FACE_MOUTH_STATES": 1 + len(VISEMES) + len(EMOTIONS),
+    }
+    for name, val in want.items():
+        m = re.search(rf"\b{name}\s*=\s*(\d+)", txt)
+        if not m or int(m.group(1)) != val:
+            raise SystemExit(f"face_sprite.h: {name} deberia ser {val} (ver BLINK_FRAMES)")
 
 
-def smile_centerline(a, smile_x, smile_y, mask=None):
-    xs = np.arange(smile_x[0], smile_x[1] + 1)
-    idx = np.arange(smile_y[0], smile_y[1])
-    ys = []
-    for x in xs:
-        col = a[smile_y[0] : smile_y[1], x]
-        if mask is not None:
-            col = col * mask[smile_y[0] : smile_y[1], x]
-        ys.append(float((col * idx).sum() / col.sum()))
-    return xs, np.array(ys)
-
-
-def mouth_frame(a, open_px, smile_x, smile_y, stroke, mask=None):
-    """Frame 'ojos abiertos' con la boca abierta open_px (en px del PNG)."""
-    if open_px == 0:
-        return a
-    xs, ytop = smile_centerline(a, smile_x, smile_y, mask)
-    t = (xs - xs[0]) / (xs[-1] - xs[0])
-    ybot = ytop + open_px * np.sin(np.pi * t) ** 0.85
-
-    h, w = a.shape
-    # Se dibuja a 4x y se reduce, para que el labio nuevo tenga el mismo
-    # antialiasing que el trazo original.
-    k = 4
-    fill = Image.new("L", (w * k, h * k), 0)
-    lip = Image.new("L", (w * k, h * k), 0)
-    poly = [(x * k, y * k) for x, y in zip(xs, ytop)] + [(x * k, y * k) for x, y in zip(xs[::-1], ybot[::-1])]
-    ImageDraw.Draw(fill).polygon(poly, fill=255)
-    d = ImageDraw.Draw(lip)
-    pts = [(x * k, y * k) for x, y in zip(xs, ybot)]
-    d.line(pts, fill=255, width=stroke * k, joint="curve")
-    r = stroke * k / 2
-    for px, py in (pts[0], pts[-1]):  # puntas redondas, como el resto del dibujo
-        d.ellipse((px - r, py - r, px + r, py + r), fill=255)
-    fill = np.array(fill.resize((w, h), Image.BOX), dtype=np.float32) / 255.0
-    lip = np.array(lip.resize((w, h), Image.BOX), dtype=np.float32) / 255.0
-    return np.maximum.reduce([a, fill * MOUTH_FILL_ALPHA, lip])
-
-
-# --- Pantalla ------------------------------------------------------------------
-
-
-def to_screen(a, scale, center):
-    """Escala al tamano de la pantalla (opacidad 0..1, sin cuantizar)."""
-    h, w = a.shape
-    sw, sh = round(w * scale), round(h * scale)
-    img = Image.fromarray((np.clip(a, 0, 1) * 255).astype(np.uint8), "L").resize((sw, sh), Image.LANCZOS)
-    ox = round(center[0] * scale - SCREEN_W / 2)
-    oy = round(center[1] * scale - SCREEN_H / 2)
-    img = img.crop((ox, oy, ox + SCREEN_W, oy + SCREEN_H))
-    return np.array(img, dtype=np.float32) / 255.0
-
-
-def quantize(s1, s2, two_inks):
-    if not two_inks:
-        return np.clip(np.rint(s1 * 3), 0, 3).astype(np.uint8)
-    q = np.clip(np.rint(s1 * 2), 0, 2).astype(np.uint8)
-    q[s2 >= 0.5] = 3
-    return q
-
-
-def fit(frames_hi):
-    """Escala y centro (px del PNG) para que todo entre en la pantalla."""
-    ys, xs = np.nonzero(np.maximum.reduce([np.maximum(a, b) for a, b in frames_hi]) > 0.05)
-    x0, x1, y0, y1 = xs.min(), xs.max() + 1, ys.min(), ys.max() + 1
-    scale = min((SCREEN_W - 2 * SCREEN_MARGIN) / (x1 - x0), (SCREEN_H - 2 * SCREEN_MARGIN) / (y1 - y0))
-    return scale, ((x0 + x1) / 2, (y0 + y1) / 2)
-
-
-def diff_bbox(frames, x_range):
-    """Rectangulo minimo (x, y, w, h) que cubre todo lo que cambia entre frames."""
-    x0, x1 = x_range
-    changed = np.zeros_like(frames[0], dtype=bool)
-    for f in frames[1:]:
-        changed |= f != frames[0]
-    changed[:, :x0] = False
-    changed[:, x1:] = False
-    ys, xs = np.nonzero(changed)
-    # +1 px de margen, recortado a la pantalla.
-    bx0, by0 = max(0, xs.min() - 1), max(0, ys.min() - 1)
-    bx1, by1 = min(SCREEN_W, xs.max() + 2), min(SCREEN_H, ys.max() + 2)
-    return int(bx0), int(by0), int(bx1 - bx0), int(by1 - by0)
-
-
-def pack(q):
-    """4 pixeles por byte, el primero en los 2 bits bajos."""
-    h, w = q.shape
-    stride = (w + 3) // 4
-    padded = np.zeros((h, stride * 4), dtype=np.uint8)
-    padded[:, :w] = q
-    p = padded.reshape(h, stride, 4)
-    return (p[..., 0] | (p[..., 1] << 2) | (p[..., 2] << 4) | (p[..., 3] << 6)).astype(np.uint8).ravel()
-
-
-def c_array(name, data):
+def c_bytes(name, data, per_line=24):
     lines = [f"static const uint8_t {name}[{len(data)}] = {{"]
-    for i in range(0, len(data), 24):
-        lines.append("  " + ",".join(f"0x{b:02x}" for b in data[i : i + 24]) + ",")
+    for i in range(0, len(data), per_line):
+        lines.append("  " + ",".join(f"0x{b:02x}" for b in data[i : i + per_line]) + ",")
     lines.append("};")
-    return "\n".join(lines)
+    return lines
 
 
-# --- Armado --------------------------------------------------------------------
+def main(guia):
+    files = FILES[guia]
+    folder = APP / "assets" / "img" / guia
+    svgs = {k: Svg(folder / f) for k, f in files.items()}
+    for k, s in svgs.items():
+        if not s.path.exists():
+            raise SystemExit(f"falta {s.path}")
 
+    # 1-2. Rasterizar y alinear con la Cara 1.
+    base_rgb = svgs["1"].render()
+    base_i16 = base_rgb.astype(np.int16)
+    imgs, shifts = {"1": base_rgb}, {}
+    for k, s in svgs.items():
+        if k == "1":
+            continue
+        dx, dy = align(s, base_i16)
+        shifts[k] = (dx, dy)
+        imgs[k] = s.render(dx, dy)
+    for s in svgs.values():
+        s.close()
 
-def build_crispi(persona, cfg):
-    """El camino original de Crispi, con sus medidas a mano."""
-    p = cfg["manual"]
-    eyes_hi = [load_inks(persona, n, False)[0] for n in cfg["frames"]]
-    x0, y0, x1, y1 = p["eye_zone"]
-    for a in eyes_hi[1:]:
-        clean = eyes_hi[0].copy()
-        clean[y0:y1, x0:x1] = a[y0:y1, x0:x1]
-        a[:] = clean
-    sc = lambda a: to_screen(a, p["scale"], p["center"])
-    eyes = [quantize(sc(a), None, False) for a in eyes_hi]
-    mouths = [quantize(sc(mouth_frame(eyes_hi[0], o, p["smile_x"], p["smile_y"], p["stroke"])), None, False) for o in p["open_px"]]
-    return eyes, mouths
+    # 3. Paleta y cuantizado.
+    bg = base_rgb[0, 0].astype(np.int32)
+    changed = []
+    for k, v in imgs.items():
+        if k != "1":
+            changed.append(v[np.abs(v.astype(np.int16) - base_i16).max(-1) > CHANGE_CORE])
+    pal, bg_idx = build_palette(base_rgb, changed, bg)
+    q = {k: quantize(v, pal) for k, v in imgs.items()}
+    base_q = q["1"]
 
+    # 4. Que cambia en cada estado, y donde se cortan las capas.
+    masks = {k: change_mask(imgs[k], q[k], base_i16, base_q) for k in imgs if k != "1"}
+    blink_keys = [str(n) for n in BLINK_FRAMES]
+    blink_bottom = max(bbox(masks[k])[1] + bbox(masks[k])[3] for k in blink_keys)
+    # El split es la fila que deja afuera menos pixeles: lo del parpadeo
+    # por debajo + lo de los visemas por arriba (ruido, salvo que el dibujo
+    # mueva de verdad algo de la otra capa). Si hay varias, la del medio.
+    rows_blink = sum(masks[k].sum(1) for k in blink_keys)
+    rows_vis = sum(masks[k].sum(1) for k in VISEMES)
+    lost = [int(rows_blink[s:].sum() + rows_vis[:s].sum()) for s in range(SCREEN_H + 1)]
+    best = [s for s, v in enumerate(lost) if v == min(lost)]
+    split = best[len(best) // 2]
+    stray = {}
+    for k in blink_keys:  # parpadeo: solo arriba
+        stray[k] = int(masks[k][split:].sum())
+        masks[k][split:] = False
+    for k in VISEMES:  # visemas: solo la boca
+        stray[k] = int(masks[k][:split].sum())
+        masks[k][:split] = False
 
-def build_auto(persona, cfg):
-    two = cfg.get("two_inks", False)
-    frames_hi, mouth = compose_auto(persona, cfg)
-    base1, base2 = frames_hi[0]
-    smile_x, smile_y, stroke = smile_params(base1, mouth)
-    # La escala depende de la boca bien abierta y la apertura depende de la
-    # escala: se ajusta con la apertura maxima estimada y se verifica abajo.
-    scale, center = fit(frames_hi)
-    for _ in range(3):
-        open_px = [o / scale for o in MOUTH_OPEN_SCREEN]
-        widest = mouth_frame(base1, open_px[-1], smile_x, smile_y, stroke, mouth[1])
-        scale, center = fit(frames_hi + [(widest, base2)])
-    open_px = [o / scale for o in MOUTH_OPEN_SCREEN]
-    sc = lambda a: to_screen(a, scale, center)
-    eyes = [quantize(sc(f1), sc(f2), two) for f1, f2 in frames_hi]
-    s2 = sc(base2)
-    mouths = [quantize(sc(mouth_frame(base1, o, smile_x, smile_y, stroke, mouth[1])), s2, two) for o in open_px]
-    print(f"{persona}: escala {scale:.3f}, sonrisa x={smile_x} trazo={stroke}px")
-    return eyes, mouths
+    # Lo que una emocion cambia por debajo del split se parte en dos: la
+    # boca (las manchas que tocan la zona de los visemas) va en la capa de
+    # la boca, y el resto (cachetes, lagrimas) en un sprite "extra" atado a
+    # los ojos: asi no se prende y apaga en cada pausa mientras habla.
+    vis_box = np.zeros_like(masks[VISEMES[0]])
+    for k in VISEMES:
+        r = bbox(masks[k])
+        if r:
+            vis_box[r[1] : r[1] + r[3], r[0] : r[0] + r[2]] = True
+    for e in EMOTIONS:
+        low = masks[e].copy()
+        low[:split] = False
+        n, lab = cv2.connectedComponents(low.astype(np.uint8), connectivity=8)
+        extra = np.zeros_like(low)
+        for i in range(1, n):
+            comp = lab == i
+            if not (comp & vis_box).any():
+                extra |= comp
+        masks["X_" + e] = extra
+        masks[e] = masks[e] & ~extra
 
+    def sprite_px(k, rows, src=None):
+        m = masks[k].copy()
+        keep = np.zeros_like(m)
+        keep[rows] = True
+        m &= keep
+        r = bbox(m)
+        if r is None:
+            return None
+        x, y, w, h = r
+        px = np.where(m, q[src or k], TRANSPARENT)[y : y + h, x : x + w]
+        return r, px
 
-def ink_rgb(persona, cfg):
-    """Colores reales del PNG, para la vista previa."""
-    rgba = np.array(Image.open(APP / "assets/img" / persona / cfg["frames"][0]).convert("RGBA"))
-    solid = rgba[rgba[..., 3] > 200][:, :3].astype(np.int32)
-    green = ((solid[:, 1] - solid[:, 0]) > 60) & cfg.get("two_inks", False)
-    c1 = solid[~green].mean(0)
-    c2 = solid[green].mean(0) if green.any() else c1
-    return c1, c2
+    blob = Blob()
+    layers = {}
 
+    def add(name, k, rows, src=None):
+        sp = sprite_px(k, rows, src)
+        if sp is None:
+            layers[name] = (0, 0, 0, 0, 0, 0)
+            return
+        (x, y, w, h), px = sp
+        table, data_base = blob.add_sprite(px)
+        layers[name] = (x, y, w, h, table, data_base)
 
-def main(persona):
-    cfg = PERSONAS[persona]
-    two = cfg.get("two_inks", False)
-    eyes, mouths = (build_crispi if "manual" in cfg else build_auto)(persona, cfg)
-    # Boca y ojos comparten la base (la boca cerrada son los ojos abiertos).
-    assert (mouths[0] == eyes[0]).all()
+    table, data_base = blob.add_sprite(base_q)
+    layers["base"] = (0, 0, SCREEN_W, SCREEN_H, table, data_base)
+    top_names = ["OPEN"]
+    layers["OPEN"] = (0, 0, 0, 0, 0, 0)
+    for k in blink_keys:
+        add("B" + k, k, slice(0, split))
+        top_names.append("B" + k)
+    for e in EMOTIONS:
+        add("T_" + e, e, slice(0, split))
+        top_names.append("T_" + e)
+    layers["T_FRUSTRADO"] = layers["B%d" % FRUSTRATED_EYES]
+    top_names.append("T_FRUSTRADO")
+    # Extra de cada estado de arriba (filas >= split); solo las emociones.
+    extra_names = []
+    for n in top_names:
+        e = n[2:] if n.startswith("T_") and n[2:] in EMOTIONS else None
+        if e:
+            add("X_" + e, "X_" + e, slice(split, SCREEN_H), e)
+            extra_names.append("X_" + e)
+        else:
+            extra_names.append("NONE")
+    layers["NONE"] = (0, 0, 0, 0, 0, 0)
+    mouth_names = ["REST"]
+    layers["REST"] = (0, 0, 0, 0, 0, 0)
+    for k in VISEMES:
+        add("V_" + k, k, slice(split, SCREEN_H))
+        mouth_names.append("V_" + k)
+    for e in EMOTIONS:
+        add("M_" + e, e, slice(split, SCREEN_H))
+        mouth_names.append("M_" + e)
+    data = bytes(blob.data)
 
-    mid = SCREEN_W // 2
-    eye_l = diff_bbox(eyes, (0, mid))
-    eye_r = diff_bbox(eyes, (mid, SCREEN_W))
-    mouth = diff_bbox(mouths, (0, SCREEN_W))
-    for a, b in ((eye_l, mouth), (eye_r, mouth)):
-        assert a[1] + a[3] <= b[1], "los sprites de ojos y boca no pueden solaparse"
+    # 6. Verificacion: reconstruir cada estado desde el blob, como el MCU.
+    states = [("Cara 1", "OPEN", "REST", "1")]
+    states += [(f"Cara {k}", "B" + k, "REST", k) for k in blink_keys]
+    states += [(k, "OPEN", "V_" + k, k) for k in VISEMES]
+    states += [(e.lower(), "T_" + e, "M_" + e, e) for e in EMOTIONS]
+    states += [("frustrado", "T_FRUSTRADO", "V_F", None)]
+    # Hablando con una emocion: el visema encima de los ojos + extra.
+    states += [(e.lower() + "+O", "T_" + e, "V_O", None) for e in EMOTIONS]
+    lut = pal.astype(np.uint8)
+    tiles, report = [], []
+    for label, t, m, src in states:
+        x = layers[extra_names[top_names.index(t)]]
+        scr = compose(data, layers, layers[t], x, layers[m], split)
+        rgb = lut[scr]
+        if src is not None:
+            err = np.abs(rgb.astype(np.int16) - imgs[src]).max(-1)
+            report.append((label, float(err.mean()), float((err > 48).mean() * 100)))
+        tiles.append((label, rgb))
+    cols = 6
+    rows_n = (len(tiles) + cols - 1) // cols
+    sheet = np.full((rows_n * (SCREEN_H + 4), cols * (SCREEN_W + 4), 3), 255, np.uint8)
+    for i, (label, rgb) in enumerate(tiles):
+        r, c = divmod(i, cols)
+        sheet[r * (SCREEN_H + 4) : r * (SCREEN_H + 4) + SCREEN_H, c * (SCREEN_W + 4) : c * (SCREEN_W + 4) + SCREEN_W] = rgb
+    for i in range(cols * rows_n):  # la linea del split, para revisar el corte
+        r, c = divmod(i, cols)
+        y0, x0 = r * (SCREEN_H + 4) + split, c * (SCREEN_W + 4)
+        sheet[y0, x0 : x0 + 6] = (255, 0, 0)
+    Image.fromarray(sheet).save(APP / "tools" / f"{guia}_preview.png", optimize=True)
 
-    up = persona.upper()
+    # 5. Header.
+    up = guia.upper()
+    lut565 = [to565(c) for c in pal] + [0] * (16 - len(pal))
+    swapped = [((c & 0xFF) << 8) | (c >> 8) for c in lut565]
+    bg565 = to565(pal[bg_idx])
+
+    def layer(name):
+        x, y, w, h, t, d = layers[name]
+        return "{ %d, %d, %d, %d, %d, %d }" % (x, y, w, h, t, d)
+
     out = [
         "/*",
-        f"  GENERADO por tools/make_face_sprites.py a partir de assets/img/{persona}/.",
-        "  No editar a mano: cambiar las imagenes (o el script) y volver a generarlo.",
+        f"  Cara de {guia.capitalize()} a color: GENERADO por tools/make_face_sprites.py",
+        f"  desde los SVG de assets/img/{guia}/. No editar a mano: volver a correr la",
+        "  herramienta. Formato y capas: ver face_sprite.h.",
         "",
-        "  Pixeles de 2 bits, 4 por byte, el primero en los bits bajos.",
-        (
-            "  DOS tintas: 0 = fondo, 1 = medio trazo, 2 = trazo (color de ojos),"
-            if two
-            else "  Una tinta: 0 = fondo ... 3 = trazo lleno."
-        ),
+        f"  split = {split} (filas < split: ojos/cejas; >= split: boca)",
+        f"  blob = {len(data)} bytes, parpadeo = Cara 1 + {', '.join(blink_keys)}",
+        "*/",
+        "",
+        "#pragma once",
+        "",
+        '#include "face_sprite.h"',
+        "",
+        "// RGB565 con el byte swap ya hecho (listo para SPI); el 15 no se usa (transparente).",
+        f"static const uint16_t {up}_FACE_LUT[16] = {{ " + ", ".join(f"0x{c:04x}" for c in swapped) + " };",
+        "",
     ]
-    if two:
-        out.append("  3 = segunda tinta (color de boca). Los colores salen de faces_colors.h.")
-    else:
-        out.append("  Los colores salen de faces_colors.h.")
-    out += ["*/", "", "#pragma once", "", '#include "face_sprite.h"', ""]
-
-    sprites = {}
-    arrays = {}  # bytes -> nombre: los frames repetidos se guardan una vez
-
-    def add(var, rect, q):
-        x, y, w, h = rect
-        data = pack(q[y : y + h, x : x + w])
-        key = (w, h, data.tobytes())
-        if key not in arrays:
-            arrays[key] = var + "_PX"
-            out.append(c_array(var + "_PX", data))
-            out.append("")
-        sprites[var] = (rect, arrays[key])
-
-    add(f"{up}_BASE", (0, 0, SCREEN_W, SCREEN_H), eyes[0])
-    for i, q in enumerate(eyes):
-        add(f"{up}_EYE_L{i}", eye_l, q)
-        add(f"{up}_EYE_R{i}", eye_r, q)
-    for i, q in enumerate(mouths):
-        add(f"{up}_MOUTH{i}", mouth, q)
-
-    def sprite(var):
-        rect, arr = sprites[var]
-        return "{ %d, %d, %d, %d, %s }" % (*rect, arr)
-
-    out.append(f"static const FaceSprite {up}_BASE = {sprite(up + '_BASE')};")
-    out.append(f"static const FaceSprite {up}_EYES_L[FACE_EYE_STATES] = {{")
-    out += [f"  {sprite(f'{up}_EYE_L{i}')}," for i in range(len(eyes))]
-    out.append("};")
-    out.append(f"static const FaceSprite {up}_EYES_R[FACE_EYE_STATES] = {{")
-    out += [f"  {sprite(f'{up}_EYE_R{i}')}," for i in range(len(eyes))]
-    out.append("};")
-    out.append(f"static const FaceSprite {up}_MOUTHS[FACE_MOUTH_LEVELS] = {{")
-    out += [f"  {sprite(f'{up}_MOUTH{i}')}," for i in range(len(mouths))]
-    out.append("};")
-    out.append(
-        f"static const FaceSpriteSet {up}_SPRITES = {{ &{up}_BASE, {up}_EYES_L, {up}_EYES_R, {up}_MOUTHS, {'true' if two else 'false'} }};"
-    )
-    out.append("")
-
-    dst = APP / "sketch" / f"{persona}_face.h"
+    out += c_bytes(f"{up}_FACE_BLOB", data)
+    out += [
+        "",
+        f"static const ColorFace {up}_FACE = {{",
+        f"  {up}_FACE_BLOB, {up}_FACE_LUT, 0x{bg565:04x}, {split},",
+        f"  {layer('base')},",
+        "  {",
+    ]
+    out += [f"    {layer(n)},  // {n}" for n in top_names]
+    out += ["  },", "  {"]
+    out += [f"    {layer(x)},  // {n}" + (f" ({x})" if x != "NONE" else "") for n, x in zip(top_names, extra_names)]
+    out += ["  },", "  {"]
+    out += [f"    {layer(n)},  // {n}" for n in mouth_names]
+    out += ["  },", "};", ""]
+    dst = APP / "sketch" / f"{guia}_face.h"
     dst.write_text("\n".join(out))
-    total = sum(len(k[2]) for k in arrays)
-    print(f"{dst}: ojo izq {eye_l}, ojo der {eye_r}, boca {mouth}, {total} bytes")
 
-    # Vista previa para revisar sin flashear: fila de arriba = parpadeo,
-    # fila de abajo = niveles de boca.
-    c1, c2 = ink_rgb(persona, cfg)
-    white = np.full(3, 255.0)
-    if two:
-        lut = np.array([white, (white + c1) / 2, c1, c2])
-    else:
-        lut = np.array([white * (1 - a / 3) + c1 * a / 3 for a in range(4)])
-    rgb = lambda q: lut[q].astype(np.uint8)
-    top = np.concatenate([rgb(q) for q in eyes + [eyes[0], eyes[0]]], axis=1)
-    bot = np.concatenate([rgb(q) for q in mouths], axis=1)
-    Image.fromarray(np.concatenate([top, bot], axis=0)).save(APP / "tools" / f"{persona}_preview.png")
+    worst = max(report, key=lambda r: r[2])
+    mean = sum(r[1] for r in report) / len(report)
+    print(f"{dst.name}: blob {len(data)} B, split {split}, parpadeo hasta y={blink_bottom}, "
+          f"error medio {mean:.2f}/255, peor {worst[0]} {worst[2]:.2f}% px > 48")
+    big = {k: v for k, v in stray.items() if v}
+    if big:
+        print(f"  descartado fuera de su capa (px): {big}")
+    moved = {k: v for k, v in shifts.items() if v != (0.0, 0.0)}
+    print(f"  corrimientos: {moved}")
+    sizes = {n: layers[n][2] * layers[n][3] for n in top_names + extra_names + mouth_names if layers[n][2]}
+    print(f"  rects (px): {sizes}")
+    return len(data), report
 
 
 if __name__ == "__main__":
-    for p in sys.argv[1:] or PERSONAS:
-        main(p)
+    check_face_sprite_h()
+    total = 0
+    for g in sys.argv[1:] or GUIAS:
+        if g not in FILES:
+            raise SystemExit(f"guia desconocido: {g} (validos: {', '.join(GUIAS)})")
+        total += main(g)[0]
+    print(f"total {total} bytes")

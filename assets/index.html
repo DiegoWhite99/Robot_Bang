@@ -31,6 +31,35 @@
           <span id="version-text">Este producto está en desarrollo y seguirá recibiendo actualizaciones.</span>
         </div>
 
+        <!-- Cerebro del robot (python/llm_router.py). Lo marca Python al
+             conectarse ('llm_mode'); lo de aqui es solo el respaldo. -->
+        <div id="mode-switch" class="mode-switch" role="group" aria-label="Cerebro del robot">
+          <span class="mode-title">🧠 CEREBRO:</span>
+          <div class="mode-buttons">
+            <button id="mode-essentials" class="btn95 mode-btn" type="button" data-mode="essentials" aria-pressed="false">💾 ESSENTIALS</button>
+            <button id="mode-plus" class="btn95 mode-btn" type="button" data-mode="plus" aria-pressed="false">☁️ PLUS</button>
+          </div>
+          <div id="mode-note" class="mode-note">consultando el modo...</div>
+        </div>
+
+        <!-- Modo de conversacion (python/curioso.py). El niño lo elige por voz
+             al empezar ("BANG" o "Curioso"); aqui se puede cambiar a mano. -->
+        <div id="chat-mode-switch" class="mode-switch" role="group" aria-label="Modo de conversación">
+          <span class="mode-title">🎛 MODO:</span>
+          <div class="mode-buttons">
+            <button class="btn95 mode-btn" type="button" data-chat="bang" aria-pressed="false">🚀 BANG</button>
+            <button class="btn95 mode-btn" type="button" data-chat="curioso" aria-pressed="false">💬 CURIOSO</button>
+          </div>
+          <div id="chat-mode-note" class="mode-note">consultando el modo...</div>
+        </div>
+
+        <!-- Escucha activa (python/voice.py, BargeIn): es NATIVA y no se
+             apaga. Aqui solo se ve si el reconocedor local esta listo. -->
+        <div id="escucha-box" class="mode-switch" role="group" aria-label="Escucha activa">
+          <span class="mode-title">✋ INTERRUMPIR:</span>
+          <div id="escucha-note" class="mode-note">consultando...</div>
+        </div>
+
         <div class="content">
           <fieldset class="panel-inset personas">
             <legend>👾 Los 5 guías</legend>
@@ -50,7 +79,9 @@
             <div id="bang-pregunta" class="bang-line pregunta" hidden></div>
             <div id="bang-cards" class="cards" hidden></div>
             <div id="bang-ideas" class="bang-line" hidden></div>
-            <div class="bang-help">Por voz: "saca una tarjeta" · "siguiente fase" · "nuevo reto"</div>
+            <div id="bang-aportes" class="bang-line" hidden></div>
+            <div id="bang-interrumpido" class="bang-line" hidden></div>
+            <div class="bang-help">Por voz: "saca una tarjeta" · "siguiente fase" · "nuevo reto" · mientras habla: "¡Cori, se me ocurrió algo!" · "pásame con Cesia"</div>
           </fieldset>
 
           <fieldset class="panel-inset chat-area">

@@ -7,23 +7,35 @@
 
   Python avisa con Bridge.notify("face_gesture", <valor>), donde <valor> es
   el gesto y el personaje empaquetados en un solo entero:
-    valor = personaId * 4 + gesto
+    valor = personaId * 16 + gesto      (GESTURE_COUNT, igual en gestures.py)
 
-  Gesto (0-3):
-    0 REST      boca cerrada, parpadeo normal, servos en reposo (90°, sueltos)
-    1 TALK      boca se mueve + servos en vaiven, como si hablara
-    2 HAPPY     boca se mueve + cejas se levantan + servos barren amplio x2
-    3 SURPRISE  boca se mueve + cejas se levantan + servos dan un respingo
+  Gesto (0-15). Los 7 primeros tienen cara propia; los de 1.1.0 solo mueven
+  los brazos y toman prestada una cara que ya existe (el flash esta al 89 %):
+    0 REST        cara neutra, parpadeo normal, servos en reposo (90°, sueltos)
+    1 TALK        cara neutra + boca con visemas + servos en vaiven
+    2 HAPPY       Cara feliz
+    3 SURPRISE    Cara sorpresa
+    4 ANGRY       Cara enojada (un "grrr" jugueton contra el problema)
+    5 FRUSTRATED  ojos entrecerrados (Cara 3) + boca de la F ("uff")
+    6 SAD         Cara triste
+    7 WAVE        saluda: un brazo arriba moviendose de lado a lado  (cara feliz)
+    8 CLAP        aplaude: los dos brazos arriba y abajo, rapido      (cara feliz)
+    9 THINK       piensa: un brazo arriba, quieto                     (ojos del "uff")
+   10 YES         asiente: dos cabezadas cortas                       (cara feliz)
+   11 NO          niega: los brazos en espejo                         (cara neutra)
+   12 DANCE       baila: espejo amplio, sin la cancioncita            (cara feliz)
+   13 HUG         abraza: los dos brazos suben despacio y se quedan   (cara feliz)
+   14 SLEEP       dormido: brazos caidos, respiracion lenta           (cara triste)
+   15 STRETCH     se estira: hasta arriba, se queda y baja (bostezo)  (cara feliz)
+  La emocion manda en los ojos/cejas toda la frase; la boca hace visemas
+  mientras suena la voz y vuelve a la boca de la emocion en las pausas.
+  REST vuelve a la cara neutra.
 
-  Personaje: cada uno tiene su propia paleta (fondo, ojos, cejas, boca),
-  definida en faces_colors.h — ver paletteFor(). Para cambiar los colores
-  de un guia, edita ese archivo; no hace falta tocar este.
-
-  Cara dibujada: los guias que tienen PNG en assets/img/<guia>/ (hoy los
-  5) no usan la cara geometrica sino esos dibujos, convertidos a
-  sprites por tools/make_face_sprites.py (-> <guia>_face.h). El parpadeo
-  repite la secuencia de los PNG (abierto, entrecerrado, cerrado,
-  entrecerrado, abierto) y la boca se abre segun el volumen real de la voz.
+  Cara: los 20 SVG de cada guia (assets/img/<guia>/) convertidos a sprites
+  a color por tools/make_face_sprites.py (-> <guia>_face.h, formato en
+  face_sprite.h). La base (Cara 1) se pinta entera solo al cambiar de guia;
+  despues solo viaja por SPI lo que cambia (ver facePlanDiff()). El
+  parpadeo recorre la Cara 1..6 (ida y vuelta).
 
   Baile de celebracion (de Diome-chan): al pasar de fase BANG, Python toca
   una cancioncita y en cada nota manda Bridge.notify("arm_step", n); el
@@ -42,8 +54,10 @@
   vuelve la cara. Misma regla de los gestos que con la bienvenida.
 
   Boca sincronizada con la voz: mientras suena el TTS, Python manda
-  Bridge.notify("mouth_level", 0..4) con el volumen de lo que esta sonando
-  (ver python/voice.py). Vale para las dos caras, la dibujada y la geometrica.
+  Bridge.notify("viseme", 0..10) con la forma de boca de lo que esta sonando
+  (0 = reposo/pausa, 1..10 = visemas, ver face_sprite.h). El viejo
+  Bridge.notify("mouth_level", 0..4) (solo volumen) sigue andando: 0 ->
+  reposo, 1-2 -> c,d,g..., 3 -> a,e,i, 4 -> O.
 
   Pantalla TFT GMT028-05 (driver ST7789, 240x320, SPI). Conexion (header
   JDIGITAL del UNO Q):
@@ -85,15 +99,13 @@
   core y no se puede habilitar desde el sketch. Y writePixel() (un pixel
   suelto) cuesta 13 llamadas al driver — nunca usarlo.
 
-  Redibujado parcial: cada parte movil de la cara (cada ojo, cada ceja, la
-  boca) tiene su propio framebuffer chico en RAM, y solo se vuelve a mandar
-  por SPI la que realmente cambio. Hablando sin parpadear, por ejemplo, solo
-  viaja la boca.
+  Redibujado parcial: la cara se arma fila por fila en RAM (base + la capa
+  que toca) y solo se vuelven a mandar por SPI los pedazos de filas que
+  cambiaron. Hablando sin parpadear, por ejemplo, solo viaja la boca.
 */
 
 #include "Arduino_RouterBridge.h"
 #include "faces_colors.h"
-#include "face_bands.h"
 #include "face_sprite.h"
 #include "crispi_face.h"
 #include "carmel_face.h"
@@ -192,39 +204,32 @@ class RegionCanvas : public GFXcanvas16 {
     Adafruit_ST7789 &_tft;
 };
 
-// --- Geometria: todo derivado de SCREEN_W/SCREEN_H, nunca literales sueltos ---
-// Medidas pensadas para que cada parte movil ocupe la region mas chica posible:
-// lo que se dibuja es lo que viaja por SPI en cada frame.
-// EYE_R chico a proposito: el radio de la esquina se suma al alto de las
-// bandas que hay que reenviar al parpadear (ver bandsFor()), y a ~4 us/byte
-// cada fila extra cuesta tiempo de frame.
-const int16_t EYE_W = 64, EYE_H = 64, EYE_R = 6, EYE_SPACE = 40;
-const int16_t FACE_CY = SCREEN_H / 2;                               // 120
-const int16_t EYE_CY = FACE_CY - 10;                                // 110
-const int16_t EYE_L_CX = SCREEN_W / 2 - EYE_SPACE / 2 - EYE_W / 2;  // 108
-const int16_t EYE_R_CX = SCREEN_W / 2 + EYE_SPACE / 2 + EYE_W / 2;  // 212
-const int16_t BROW_H = 14, BROW_GAP = 8;
-const int16_t BROW_W = EYE_W - 12;                                  // 52
-const int16_t EYE_MIN_H = 6; // alto del ojo completamente cerrado (parpadeo)
-
-const int16_t MOUTH_CX = SCREEN_W / 2;             // 160
-const int16_t MOUTH_CY = FACE_CY + EYE_H / 2 + 45; // 197, debajo de los ojos
-const int16_t MOUTH_W = 120;
-
 const unsigned long FRAME_MS = 33; // 30 fps
 
-// --- Paleta RGB565: cambia por personaje, asi que ya no son const ---
-uint16_t BG_COLOR    = ST77XX_BLACK;
-uint16_t EYE_COLOR   = tft.color565(30, 100, 255);  // azul (por defecto, antes del primer gesto)
-uint16_t BROW_COLOR  = tft.color565(30, 100, 255);
-uint16_t MOUTH_COLOR = tft.color565(30, 100, 255);
+// Fondo de la pantalla: el del guia en pantalla (sale de su SVG, ver
+// ColorFace::bg). Lo usan los badges de WiFi y version.
+uint16_t BG_COLOR = ST77XX_BLACK;
 
 // --- Gestos recibidos desde Python. Deben coincidir con python/gestures.py ---
 const uint8_t G_REST = 0;
 const uint8_t G_TALK = 1;
 const uint8_t G_HAPPY = 2;
 const uint8_t G_SURPRISE = 3;
-const uint8_t GESTURE_COUNT = 4; // para desempaquetar el valor combinado
+const uint8_t G_ANGRY = 4;
+const uint8_t G_FRUSTRATED = 5;
+const uint8_t G_SAD = 6;
+const uint8_t G_WAVE = 7;        // saluda con un brazo
+const uint8_t G_CLAP = 8;        // aplaude
+const uint8_t G_THINK = 9;       // un brazo arriba, quieto: "dejame pensarlo"
+const uint8_t G_YES = 10;        // asiente
+const uint8_t G_NO = 11;         // niega (brazos en espejo)
+const uint8_t G_DANCE = 12;      // baile propio, sin la cancioncita
+const uint8_t G_HUG = 13;        // abrazo
+const uint8_t G_SLEEP = 14;      // dormido: brazos caidos, respiracion lenta
+const uint8_t G_STRETCH = 15;    // se estira (bostezo)
+// Para desempaquetar el valor combinado (persona * GESTURE_COUNT + gesto).
+// DEBE coincidir con _GESTURE_COUNT de python/gestures.py.
+const uint8_t GESTURE_COUNT = 16;
 
 // --- Personajes. Deben coincidir con PERSONA_IDS de python/gestures.py ---
 const uint8_t P_CRISPI = 0;
@@ -233,164 +238,240 @@ const uint8_t P_CESIA = 2;
 const uint8_t P_CORI = 3;
 const uint8_t P_CRISTAL = 4;
 
-uint8_t currentPersona = 255; // invalido a proposito: fuerza la 1ra paleta
+uint8_t currentPersona = 255; // invalido a proposito: fuerza la 1ra cara
 
-struct Palette {
-  uint16_t bg;    // fondo de pantalla
-  uint16_t eye;   // ojos
-  uint16_t brow;  // cejas
-  uint16_t mouth; // boca
+// Las caras de los guias, en el orden de P_* (cada <GUIA>_FACE viene armada
+// en su <guia>_face.h).
+const ColorFace *const FACES[FACE_COUNT] = {
+  &CRISPI_FACE, &CARMEL_FACE, &CESIA_FACE, &CORI_FACE, &CRISTAL_FACE,
 };
 
-// Colores por personaje: se editan en faces_colors.h, no aqui.
-Palette paletteFor(uint8_t personaId) {
-  if (personaId >= FACE_PALETTES_COUNT) personaId = 0; // por si llega un id invalido
-  const FaceColors &c = FACE_PALETTES[personaId];
-  return {
-    tft.color565(c.bgR, c.bgG, c.bgB),
-    tft.color565(c.eyeR, c.eyeG, c.eyeB),
-    tft.color565(c.browR, c.browG, c.browB),
-    tft.color565(c.mouthR, c.mouthG, c.mouthB),
-  };
-}
-
 bool talking = false; // true entre un gesto != REST y el siguiente REST
+uint8_t faceGesture = G_REST; // la emocion que manda en la cara (ver faceTopRest())
 
-// --- Cara dibujada (sprites de los PNG). nullptr = cara geometrica ---
-// (los <GUIA>_SPRITES vienen armados en cada <guia>_face.h)
-const FaceSpriteSet *spriteSetFor(uint8_t personaId) {
-  switch (personaId) {
-    case P_CRISPI:  return &CRISPI_SPRITES;
-    case P_CARMEL:  return &CARMEL_SPRITES;
-    case P_CESIA:   return &CESIA_SPRITES;
-    case P_CORI:    return &CORI_SPRITES;
-    case P_CRISTAL: return &CRISTAL_SPRITES;
-    default:        return nullptr; // sin PNG: cara geometrica
-  }
-}
+// --- Cara en pantalla. nullptr = todavia no se pinto ninguna ---
+const ColorFace *face = nullptr;
+uint8_t drawnTop = FACE_TOP_OPEN;     // estado de la capa de arriba en pantalla
+uint8_t drawnMouth = FACE_MOUTH_REST; // estado de la boca en pantalla
+unsigned long topDrawnMs = 0;         // cuando se termino de dibujar el estado de arriba
+uint8_t eyesWaitFrames = 0;           // frames seguidos que los ojos no entraron
 
-const FaceSpriteSet *spriteFace = nullptr;
-uint16_t spriteLut[4];            // 2 bits -> color de pantalla, ya con el byte swap
-uint8_t drawnEyeState = FACE_EYE_OPEN;
-uint8_t drawnMouthLevel = 0;
-unsigned long eyeDrawnMs = 0;     // cuando se termino de dibujar el estado actual
-uint8_t eyesWaitFrames = 0;       // frames seguidos que los ojos no entraron
+// Una fila de pantalla en indices de paleta (4 bits), para armar la cara
+// antes de mandarla: la de ahora y la de antes, para comparar.
+uint8_t faceLine[SCREEN_W];
+uint8_t faceLineOld[SCREEN_W];
 
-// Parpadeo de la cara dibujada: la misma secuencia de los PNG (02, 03, 04;
-// el 01 y el 05 son los ojos abiertos de reposo). Cada paso se sostiene su
-// tiempo DESDE QUE TERMINA DE DIBUJARSE, asi ningun frame se saltea aunque
-// el SPI se atrase (un paso de ojos cuesta 2-3 frames de bus).
-const uint8_t SPRITE_BLINK_SEQ[] = { FACE_EYE_HALF, FACE_EYE_CLOSED, FACE_EYE_HALF };
-const unsigned long SPRITE_BLINK_HOLD_MS[] = { 40, 90, 40 };
-const int8_t SPRITE_BLINK_STEPS = sizeof(SPRITE_BLINK_SEQ);
-int8_t spriteBlinkStep = -1;      // -1 = ojos abiertos, sin parpadeo en curso
+// Parpadeo: Cara 2..6 de ida y 5, 3 de vuelta (indices de cuadro de
+// parpadeo, 0 = Cara 2). Cerrar rapido y abrir un poco mas suave, como
+// un parpadeo de verdad. Cada paso se sostiene su tiempo DESDE QUE TERMINA
+// DE DIBUJARSE, asi ningun cuadro se saltea aunque el SPI se atrase.
+static_assert(FACE_BLINK_FRAMES == 5, "BLINK_SEQ supone la Cara 2..6");
+const uint8_t BLINK_SEQ[] = { 0, 1, 2, 3, 4, 3, 1 };
+const unsigned long BLINK_HOLD_MS[] = { 0, 0, 0, 0, 60, 0, 0 };
+const int8_t BLINK_STEPS = sizeof(BLINK_SEQ);
+int8_t blinkStep = -1;            // -1 = sin parpadeo en curso
 
 // --- Parpadeo automatico (de vez en cuando, un poco mas seguido al hablar) ---
-enum BlinkPhase : uint8_t { PHASE_OPEN, PHASE_CLOSING, PHASE_CLOSED, PHASE_OPENING };
-// Parpadeo mas largo que el original (90 ms): reparte el mismo recorrido en
-// mas frames, asi cada frame mueve menos filas. Y 170/190 ms es igual o mas
-// natural que 90 ms para un parpadeo humano.
-const unsigned long BLINK_CLOSE_MS = 170, BLINK_HOLD_MS = 60, BLINK_OPEN_MS = 190;
 const unsigned long BLINK_IDLE_MIN_MS = 7000, BLINK_IDLE_MAX_MS = 14000;
 const unsigned long BLINK_TALK_MIN_MS = 5000, BLINK_TALK_MAX_MS = 9000;
-
-BlinkPhase blinkPhase = PHASE_OPEN;
-unsigned long blinkPhaseStartMs = 0;
 unsigned long nextAutoBlinkMs = 0;
 unsigned long lastFrame = 0;
 
-// --- Cejas: pequeno levantamiento al recibir HAPPY/SURPRISE ---
-const unsigned long BROW_PULSE_MS = 400;
-const int16_t BROW_PULSE_LIFT_PX = 6;
-unsigned long browPulseUntil = 0;
+// --- Boca: visema que manda Python (Bridge "viseme" o "mouth_level") ---
+// 0 = reposo/pausa, 1..10 = visemas (FACE_VIS_*). Lo escribe el hilo del
+// Bridge (1 byte, atomico) y lo lee loop(), igual que pendingEncoded.
+volatile uint8_t mouthViseme = FACE_MOUTH_REST;
 
-// --- Boca: se abre segun el volumen de la voz (nivel que manda Python) ---
-const int16_t MOUTH_REST_H     = 8;   // cerrada/neutra en reposo
-const int16_t MOUTH_MIN_TALK_H = 14;  // abierta con el nivel 1
-const int16_t MOUTH_MAX_TALK_H = 48;  // abierta con el nivel maximo
-const float MOUTH_LERP_ALPHA = 0.22f; // suavizado: mas bajo = menos filas por frame
-const int16_t MOUTH_R = 4;            // radio chico, por lo mismo que EYE_R
-
-float mouthCurrentH = MOUTH_REST_H;
-int16_t mouthTargetH = MOUTH_REST_H;
-
-// Ultimo nivel recibido por Bridge.notify("mouth_level", ...): 0 = cerrada,
-// FACE_MOUTH_LEVELS - 1 = lo mas abierta. Lo escribe el hilo del Bridge
-// (1 byte, atomico) y lo lee loop(), igual que pendingEncoded.
-volatile uint8_t mouthLevel = 0;
-
-// --- Servos: 2 SG90 sincronizados, se mueven junto con la boca ---
+// --- Servos: 2 SG90 (los brazos), se mueven segun el gesto ---
+//
+// Todo se piensa en "lift" (cuanto suben los brazos, en grados) y no en
+// angulos: lift 0 = reposo (90°), lift > 0 = brazos ARRIBA, lift < 0 = brazos
+// ABAJO. writeArms(lift) lo convierte a angulo para cada servo:
+//   angulo_servo = 90 + ARMn_DIR * lift   (y despues se limita a ARM_MIN..ARM_MAX)
+//
+// CALIBRAR EN EL ROBOT (nadie sabe todavia hacia que lado sube cada brazo):
+//   1. Hacer que el guia diga algo alegre (gesto HAPPY): los brazos van a
+//      lift +65 y se quedan arriba mientras habla.
+//   2. Si un brazo sube y el otro BAJA: los servos estan montados en espejo
+//      (lo normal). Cambiar el signo del que baja (casi seguro ARM2_DIR = -1).
+//   3. Si los DOS bajan: cambiar el signo de los dos.
+//   4. Si algun brazo pega contra el cuerpo o la carcasa, achicar ARM_MIN /
+//      ARM_MAX (son angulos de servo, no lift).
+//   Recompilar y flashear (arduino-app-cli app restart) despues de cambiarlo.
+//
+// Por que +1 / +1 por defecto: asi el robot se mueve IGUAL que antes en lo
+// que ya se veia. Hasta ahora TALK escribia el mismo angulo en los dos servos
+// (80/100) y el baile los ponia espejados (90-swing / 90+swing); con los dos
+// DIR en +1, TALK (lift ±10) y el baile (lift -swing / +swing) dan
+// exactamente esos mismos angulos. Ojo: esos dos movimientos no pueden ser
+// "simetricos" a la vez en el robot real, uno de los dos ya se veia
+// asimetrico. Al calibrar (paso 2), TALK y los gestos quedan simetricos y el
+// baile pasa a mover un brazo arriba y el otro abajo.
 const uint8_t SERVO1_PIN = 5;
 const uint8_t SERVO2_PIN = 6;
 Servo servo1, servo2;
 
-const int SERVO_REST_ANGLE   = 90;
-const int SERVO_TALK_MIN     = 80;
-const int SERVO_TALK_MAX     = 100;
-const int SERVO_HAPPY_MIN    = 45;
-const int SERVO_HAPPY_MAX    = 145;
-const int SERVO_SURPRISE_ANGLE = 160;
+const int SERVO_REST_ANGLE = 90;
+const int8_t ARM1_DIR = +1;   // servo 1 (D5): +1 si angulo mayor = brazo arriba, -1 si no
+const int8_t ARM2_DIR = +1;   // servo 2 (D6): idem (en espejo seria -1)
+const int ARM_MIN = 20;       // angulo minimo permitido (lejos del tope mecanico del SG90)
+const int ARM_MAX = 160;      // angulo maximo permitido
 
-const unsigned long SERVO_TALK_STEP_MS     = 150; // medio ciclo del vaiven al hablar
-const unsigned long SERVO_HAPPY_LEG_MS     = 180; // duracion de cada tramo del barrido HAPPY
-const uint8_t        SERVO_HAPPY_LEGS      = 4;    // 45->145->45->145 = barrido amplio x2
-const unsigned long SERVO_SURPRISE_HOLD_MS = 200; // cuanto se sostiene el respingo
-const unsigned long SERVO_REST_SETTLE_MS   = 350; // tiempo para llegar a 90 antes de soltar (detach)
+// Movimiento de cada gesto (lift en grados, tiempos en ms). Todo con millis():
+// loop() corre cada ~25-33 ms y a veces se traba ~0,6 s (repintado entero de
+// la pantalla), asi que los pasos rapidos son de >= 50 ms y despues de una
+// trabada se sigue desde donde se esta, sin escribir de golpe los pasos que
+// se perdieron.
+const unsigned long SERVO_WRITE_MS       = 20;  // entre escrituras de una rampa (la señal del SG90 es de 50 Hz)
+const unsigned long SERVO_REST_SETTLE_MS = 350; // tiempo para llegar a 90 antes de soltar (detach)
+const unsigned long SERVO_RESUME_MS      = 250; // rampa para volver a la pose del gesto despues del baile
 
-enum ServoPhase : uint8_t { SERVO_PHASE_TALK, SERVO_PHASE_HAPPY, SERVO_PHASE_SURPRISE };
-ServoPhase servoPhase = SERVO_PHASE_TALK;
-unsigned long servoPhaseStepUntil = 0; // fin del tramo actual de HAPPY/SURPRISE
-uint8_t servoHappyLeg = 0;             // que tramo del barrido HAPPY va
+// HAPPY (feliz): manos arriba
+const int SERVO_HAPPY_LIFT = 65;
+const unsigned long SERVO_HAPPY_RAMP_MS = 250;
+// SURPRISE: respingo arriba, baja un poco y tiembla
+const int SERVO_SURPRISE_JUMP = 70;
+const unsigned long SERVO_SURPRISE_JUMP_MS = 100;
+const unsigned long SERVO_SURPRISE_HOLD_MS = 200;
+const int SERVO_SURPRISE_LIFT = 45;
+const unsigned long SERVO_SURPRISE_LOWER_MS = 300;
+const int SERVO_SURPRISE_SHAKE = 5;             // temblor de ±5° ...
+const unsigned long SERVO_SURPRISE_SHAKE_STEP_MS = 60; // ... cada 60 ms ...
+const unsigned long SERVO_SURPRISE_SHAKE_MS = 800;     // ... durante 800 ms
+// ANGRY (enojada, "grrr" jugueton): arriba/abajo rapido y erratico, corto y
+// de amplitud moderada (los dos SG90 frenando y arrancando a la vez piden
+// picos de corriente: mas amplitud = riesgo de brownout de la placa)
+const int SERVO_ANGRY_MIN_AMP = 10;
+const int SERVO_ANGRY_MAX_AMP = 25;             // nunca mas de ±30
+const uint8_t SERVO_ANGRY_MIN_STEPS = 10;
+const uint8_t SERVO_ANGRY_MAX_STEPS = 14;
+const unsigned long SERVO_ANGRY_MIN_STEP_MS = 50;
+const unsigned long SERVO_ANGRY_MAX_STEP_MS = 90;
+const unsigned long SERVO_ANGRY_MAX_MS = 1200;  // tope total del "grrr"
+// FRUSTRATED ("uff"): sube lento, baja hasta la mitad, pausa ("corte medio")
+// y termina de bajar; dos veces
+const int SERVO_FRUS_TOP = 40;
+const int SERVO_FRUS_MID = 20;
+const unsigned long SERVO_FRUS_UP_MS = 600;
+const unsigned long SERVO_FRUS_DOWN_MS = 300;
+const unsigned long SERVO_FRUS_PAUSE_MS = 400;
+const unsigned long SERVO_FRUS_END_PAUSE_MS = 150;
+const uint8_t SERVO_FRUS_CYCLES = 2;
+// SAD (triste): los brazos caen despacio por debajo del reposo
+const int SERVO_SAD_LIFT = -25;
+const unsigned long SERVO_SAD_RAMP_MS = 700;
 
-bool servoTalkHigh = false;            // hacia que extremo va el vaiven (TALK)
-unsigned long servoNextStepMs = 0;
+// --- Gestos agregados en 1.1.0 ------------------------------------------------
+// Todos reusan la misma mecanica (entrada por pasos + vaiven sostenido) y
+// ninguno dibuja caras nuevas: solo mueven los brazos (y toman prestada una
+// cara que ya existe, ver faceTopFor()).
+//
+// Los que van en ESPEJO (un brazo sube mientras el otro baja) usan
+// armMovePair(); los simetricos, armMove(). Nada pasa de ±70 de lift: los dos
+// SG90 arrancando juntos con mucha amplitud piden picos de corriente (ver la
+// nota de ANGRY).
+
+// WAVE (saludar): un brazo arriba que se mueve de lado a lado, el otro quieto
+const int SERVO_WAVE_LIFT = 65;
+const int SERVO_WAVE_SWING = 18;
+const unsigned long SERVO_WAVE_UP_MS = 250;
+const unsigned long SERVO_WAVE_STEP_MS = 170;
+const uint8_t SERVO_WAVE_SWINGS = 4;
+// CLAP (aplaudir): los dos brazos suben y bajan juntos, rapido y corto
+const int SERVO_CLAP_HIGH = 45;
+const int SERVO_CLAP_LOW = 12;
+const unsigned long SERVO_CLAP_STEP_MS = 130;
+const uint8_t SERVO_CLAP_CLAPS = 6;
+// THINK (pensar): un brazo sube despacio y se queda; el otro, quieto
+const int SERVO_THINK_LIFT = 55;
+const unsigned long SERVO_THINK_UP_MS = 700;
+// YES (asentir): los dos brazos asienten dos veces, cortito
+const int SERVO_YES_HIGH = 28;
+const int SERVO_YES_LOW = 0;
+const unsigned long SERVO_YES_STEP_MS = 190;
+const uint8_t SERVO_YES_NODS = 2;
+// NO (negar): en espejo, como una cabeza que dice que no
+const int SERVO_NO_SWING = 25;
+const unsigned long SERVO_NO_STEP_MS = 230;
+const uint8_t SERVO_NO_SWINGS = 3;
+// DANCE (bailar): el baile propio, sin la cancioncita (esa va por arm_step)
+const int SERVO_DANCE_SWING = 45;
+const unsigned long SERVO_DANCE_STEP_MS = 210;
+const uint8_t SERVO_DANCE_SWINGS = 6;
+// HUG (abrazar): los dos brazos suben despacio y se quedan arriba, juntos
+const int SERVO_HUG_LIFT = 50;
+const unsigned long SERVO_HUG_UP_MS = 600;
+const unsigned long SERVO_HUG_HOLD_MS = 300;
+// SLEEP (dormir): brazos caidos, mas abajo que SAD, y muy despacio
+const int SERVO_SLEEP_LIFT = -30;
+const unsigned long SERVO_SLEEP_DOWN_MS = 1200;
+// STRETCH (estirarse): los dos brazos hasta arriba, se quedan y bajan
+const int SERVO_STRETCH_TOP = 75;
+const int SERVO_STRETCH_END = 10;
+const unsigned long SERVO_STRETCH_UP_MS = 800;
+const unsigned long SERVO_STRETCH_HOLD_MS = 600;
+const unsigned long SERVO_STRETCH_DOWN_MS = 700;
+
+// Sostenido mientras habla (despues de la entrada del gesto): vaiven de
+// ±amp alrededor de la pose del gesto. TALK es el vaiven de siempre (80/100,
+// cada 150 ms, a saltos); los demas van con rampa suave.
+//
+// center2 deja la pose asimetrica (saludar y pensar dejan un brazo abajo);
+// mirror hace que el segundo brazo vaya al reves que el primero (negar,
+// bailar), que es lo que da la sensacion de "no" y de baile.
+struct ServoSway { int8_t center; uint8_t amp; uint16_t stepMs; bool smooth; int8_t center2; bool mirror; };
+const ServoSway SERVO_SWAY_TALK       = {   0, 10, 150, false,   0, false };
+const ServoSway SERVO_SWAY_HAPPY      = {  65,  6, 180, true,   65, false };
+const ServoSway SERVO_SWAY_SURPRISE   = {  45,  4, 220, true,   45, false };
+const ServoSway SERVO_SWAY_ANGRY      = {   0,  8, 170, true,    0, false };
+const ServoSway SERVO_SWAY_FRUSTRATED = {   0,  8, 400, true,    0, false };
+const ServoSway SERVO_SWAY_SAD        = { -25,  5, 450, true,  -25, false };
+const ServoSway SERVO_SWAY_WAVE       = {  60,  8, 250, true,    0, false };
+const ServoSway SERVO_SWAY_CLAP       = {  30, 12, 200, true,   30, false };
+const ServoSway SERVO_SWAY_THINK      = {  55,  3, 600, true,    0, false };
+const ServoSway SERVO_SWAY_YES        = {  10,  6, 220, true,   10, false };
+const ServoSway SERVO_SWAY_NO         = {   0, 12, 260, true,    0, true  };
+const ServoSway SERVO_SWAY_DANCE      = {   0, 35, 220, true,    0, true  };
+const ServoSway SERVO_SWAY_HUG        = {  50,  4, 500, true,   50, false };
+const ServoSway SERVO_SWAY_SLEEP      = { -30,  3, 900, true,  -30, false };
+const ServoSway SERVO_SWAY_STRETCH    = {  10,  5, 400, true,   10, false };
+
+// REST = brazos en 90 y sueltos; INTRO = la entrada propia del gesto (pasos);
+// SUSTAIN = el vaiven mientras sigue hablando.
+enum ServoPhase : uint8_t { SERVO_PHASE_REST, SERVO_PHASE_INTRO, SERVO_PHASE_SUSTAIN };
+ServoPhase servoPhase = SERVO_PHASE_REST;
+uint8_t servoGesture = G_REST;          // el gesto que estan haciendo los brazos
+uint8_t servoStep = 0;                  // que paso de la entrada va
+uint8_t servoStepCount = 0;             // ANGRY: cuantos pasos tiene este "grrr"
+unsigned long servoStepUntil = 0;       // cuando toca el proximo paso
+unsigned long servoIntroEndMs = 0;      // ANGRY/SURPRISE: fin del tramo rapido
+int8_t servoAngrySign = 1;              // ANGRY: alterna arriba/abajo
+bool servoSwayHigh = false;             // hacia que extremo va el vaiven
+
+// Rampa en curso: cada brazo va de su lift actual a rampTo en rampDur ms. Se
+// calcula por tiempo, asi que despues de una trabada salta a donde ya
+// deberia estar (una sola escritura, sin rafaga).
+bool rampActive = false;
+int rampFrom1 = 0, rampFrom2 = 0, rampTo1 = 0, rampTo2 = 0;
+unsigned long rampStart = 0, rampDur = 0;
+int armLift1 = 0, armLift2 = 0;         // ultimo lift escrito en cada brazo
+unsigned long servoLastWriteMs = 0;
 
 // Baile (arm_step): cada nota alterna entre dos poses espejadas alrededor de
 // 90°, como Diome-chan alternaba 30/100 y 0/130 en sus dos brazos. Mientras
-// dura, updateServos() no toca los servos.
+// dura, updateServos() no toca los servos; al terminar, vuelve a la pose
+// del gesto que estaba (o a reposo si ya no habla).
 const int DANCE_SWING_SMALL = 30;
 const int DANCE_SWING_BIG = 60;
 const unsigned long DANCE_HOLD_MS = 450; // sin notas nuevas en este tiempo, se termina el baile
 const uint8_t NO_PENDING_STEP = 0xFF;
 volatile uint8_t pendingArmStep = NO_PENDING_STEP;
 unsigned long danceUntil = 0;
+bool servoDancing = false;              // para retomar el gesto al terminar el baile
 
 bool servosAttached = false;
 bool servoRestSettling = false;        // esperando llegar a 90 antes de soltar
 unsigned long servoRestSettleUntil = 0;
-
-// --- Regiones de pantalla para el redibujado parcial ---
-// Una region por parte movil, cada una del tamano justo de lo que dibuja: los
-// ojos no arrastran la banda de cejas (que no se mueve al parpadear) ni el
-// hueco entre los dos ojos.
-const int16_t REGION_MARGIN = 4;
-
-const int16_t EYE_REGION_W = EYE_W + 2 * REGION_MARGIN;             // 72
-const int16_t EYE_REGION_H = EYE_H + 2 * REGION_MARGIN;             // 72
-const int16_t EYE_REGION_Y = EYE_CY - EYE_H / 2 - REGION_MARGIN;    // 74
-const int16_t EYE_L_REGION_X = EYE_L_CX - EYE_W / 2 - REGION_MARGIN; // 72
-const int16_t EYE_R_REGION_X = EYE_R_CX - EYE_W / 2 - REGION_MARGIN; // 176
-
-// La ceja se mueve entre "levantada" (lift maximo) y "en reposo" (lift 0): la
-// region cubre justo ese recorrido.
-const int16_t BROW_TOP_LIFTED  = EYE_CY - EYE_H / 2 - BROW_GAP - BROW_H - BROW_PULSE_LIFT_PX; // 50
-const int16_t BROW_BOTTOM_REST = EYE_CY - EYE_H / 2 - BROW_GAP;                               // 70
-const int16_t BROW_REGION_W = BROW_W + 2 * REGION_MARGIN;                       // 60
-const int16_t BROW_REGION_H = (BROW_BOTTOM_REST - BROW_TOP_LIFTED) + 2 * REGION_MARGIN; // 28
-const int16_t BROW_REGION_Y = BROW_TOP_LIFTED - REGION_MARGIN;                  // 46
-const int16_t BROW_L_REGION_X = EYE_L_CX - BROW_W / 2 - REGION_MARGIN;          // 78
-const int16_t BROW_R_REGION_X = EYE_R_CX - BROW_W / 2 - REGION_MARGIN;          // 182
-
-const int16_t MOUTH_REGION_X = MOUTH_CX - MOUTH_W / 2 - REGION_MARGIN;          // 96
-const int16_t MOUTH_REGION_Y = MOUTH_CY - MOUTH_MAX_TALK_H / 2 - REGION_MARGIN; // 169
-const int16_t MOUTH_REGION_W = MOUTH_W + 2 * REGION_MARGIN;                     // 128
-const int16_t MOUTH_REGION_H = MOUTH_MAX_TALK_H + 2 * REGION_MARGIN;            // 56
-
-RegionCanvas eyeLCanvas(EYE_REGION_W, EYE_REGION_H, EYE_L_REGION_X, EYE_REGION_Y, tft);
-RegionCanvas eyeRCanvas(EYE_REGION_W, EYE_REGION_H, EYE_R_REGION_X, EYE_REGION_Y, tft);
-RegionCanvas browLCanvas(BROW_REGION_W, BROW_REGION_H, BROW_L_REGION_X, BROW_REGION_Y, tft);
-RegionCanvas browRCanvas(BROW_REGION_W, BROW_REGION_H, BROW_R_REGION_X, BROW_REGION_Y, tft);
-RegionCanvas mouthCanvas(MOUTH_REGION_W, MOUTH_REGION_H, MOUTH_REGION_X, MOUTH_REGION_Y, tft);
 
 // --- Aviso de version, abajo a la derecha -----------------------------------
 // Se compone en RAM y se manda con el camino rapido de una sola llamada al
@@ -425,7 +506,8 @@ void drawVersionBadge() {
 // La esquina superior derecha esta libre: los ojos llegan hasta y=146 y las
 // cejas empiezan en y=46, asi que no pisa nada de la cara.
 const int16_t WIFI_W = 34, WIFI_H = 16;
-RegionCanvas wifiCanvas(WIFI_W, WIFI_H, SCREEN_W - WIFI_W - 3, 3, tft);
+const int16_t WIFI_X = SCREEN_W - WIFI_W - 3, WIFI_Y = 3;
+RegionCanvas wifiCanvas(WIFI_W, WIFI_H, WIFI_X, WIFI_Y, tft);
 
 const uint8_t NO_PENDING_WIFI = 0xFF;
 volatile uint8_t pendingWifi = NO_PENDING_WIFI;
@@ -596,23 +678,12 @@ volatile uint8_t pendingMenu = NO_PENDING_MENU;
 bool menuOn = false;
 uint8_t menuIndex = 0;
 
-// Ultimo valor efectivamente dibujado: si no cambio, nos ahorramos el
-// redibujado + envio de esa region (arranca en -1 para forzar el primer
-// dibujo).
-int16_t lastDrawnEyeH = -1;
-int16_t lastDrawnBrowLift = -1;
-int16_t lastDrawnMouthH = -1;
-
 // Presupuesto de pixeles por frame. A ~4 us/byte, 3200 px = ~25 ms, que entra
 // en los 33 ms del frame. Si dos partes quieren actualizarse en el mismo frame
 // y no alcanza, una espera al siguiente: asi el frame NUNCA se pasa y los
 // 30 fps son estables POR CONSTRUCCION (se degrada la suavidad, no el fps).
 const uint32_t FRAME_PX_BUDGET = 3200;
 uint32_t framePxLeft = 0;
-// Arranca en true: el primer frame tiene que dibujar la cara completa, y eso
-// no entra en el presupuesto (region entera de cada parte). Un frame lento al
-// arrancar y en cada cambio de personaje, nada mas.
-bool forceFullRedraw = true;
 
 
 // --- Aviso de seguridad (LA PRIMERA pantalla), ver renderAviso() -------------
@@ -646,7 +717,7 @@ volatile uint8_t pendingCard = NO_PENDING_CARD;
 bool cardOn = false;
 
 // --- Gesto pendiente desde el Bridge (ver face_gesture()) ---
-const uint8_t NO_PENDING = 0xFF; // los validos son 0..19 (5 personajes * 4 gestos)
+const uint8_t NO_PENDING = 0xFF; // los validos son 0..39 (5 personajes * 8 gestos)
 volatile uint8_t pendingEncoded = NO_PENDING;
 
 // --- Medicion de rendimiento: se lee con `arduino-app-cli monitor` ---
@@ -655,87 +726,38 @@ unsigned long statsWindowStart = 0;
 uint16_t statsFrames = 0;
 uint32_t statsWorstFrameUs = 0;
 
-// Pone la paleta del personaje que esta hablando. Si es el mismo de antes no
-// hace nada, para no repintar la pantalla completa en cada frase.
-// OJO: toca el SPI (fillScreen), asi que solo puede llamarse desde loop().
+void facePushRects(const SpanRect *rects, uint8_t n, bool clipBadges); // mas abajo, con el dibujo
+
+// Pone la cara del personaje que esta hablando. Si es el mismo de antes no
+// hace nada: la pantalla completa (~0,6 s de bus) solo se repinta al cambiar
+// de guia o al volver de otra pantalla (que deja currentPersona = 255). Los
+// cambios de emocion NO pasan por aca: van por el redibujado parcial.
+// OJO: toca el SPI, asi que solo puede llamarse desde loop().
 void applyPersonaColors(uint8_t personaId) {
+  if (personaId >= FACE_COUNT) personaId = 0; // por si llega un id invalido
   if (personaId == currentPersona) return;
   currentPersona = personaId;
 
-  Palette p = paletteFor(personaId);
-  BG_COLOR = p.bg;
-  EYE_COLOR = p.eye;
-  BROW_COLOR = p.brow;
-  MOUTH_COLOR = p.mouth;
-
-  spriteFace = spriteSetFor(personaId);
-  if (spriteFace) {
-    // La base es la pantalla entera (fondo + cara con ojos abiertos y boca
-    // cerrada): reemplaza al fillScreen, un solo frame lento (~0,6 s).
-    buildSpriteLut(BG_COLOR, EYE_COLOR, MOUTH_COLOR, spriteFace->twoInks);
-    const FaceSprite &base = *spriteFace->base;
-    pushSpriteRect(base, 0, 0, base.w, base.h);
-    drawVersionBadge();  // la cara acaba de repintar la pantalla entera
-    drawWifiBadge(BG_COLOR);
-    drawnEyeState = FACE_EYE_OPEN;
-    drawnMouthLevel = 0;
-    spriteBlinkStep = -1;
-    eyesWaitFrames = 0;
-    return;
-  }
-
-  tft.fillScreen(BG_COLOR); // fondo completo, una sola vez por cambio de personaje
-  drawVersionBadge();
+  face = FACES[personaId];
+  BG_COLOR = face->bg;
+  // Base pelada (ojos abiertos, boca de reposo); la emocion que corresponda
+  // entra despues por el redibujado parcial, como cualquier cambio.
+  drawnTop = FACE_TOP_OPEN;
+  drawnMouth = FACE_MOUTH_REST;
+  blinkStep = -1;
+  eyesWaitFrames = 0;
+  const SpanRect full = { 0, 0, SCREEN_W, SCREEN_H };
+  facePushRects(&full, 1, false);
+  drawVersionBadge();  // la cara acaba de repintar la pantalla entera
   drawWifiBadge(BG_COLOR);
-
-  // El redibujado parcial solo se dispara cuando el valor dibujado cambia;
-  // forzamos eso para que ojos, cejas y boca tomen los colores nuevos ya.
-  lastDrawnEyeH = -1;
-  lastDrawnBrowLift = -1;
-  lastDrawnMouthH = -1;
-  forceFullRedraw = true; // este frame se pasa del presupuesto a proposito
 }
 
 void triggerBlink() {
-  if (blinkPhase == PHASE_OPEN) {
-    blinkPhase = PHASE_CLOSING;
-    blinkPhaseStartMs = millis();
-  }
-  // La cara dibujada tiene su propia secuencia (ver SPRITE_BLINK_SEQ); la
-  // fase de arriba sigue corriendo igual, porque marca cada cuanto parpadear.
-  if (spriteBlinkStep < 0) spriteBlinkStep = 0;
-}
-
-void updateBlinkPhase() {
-  if (blinkPhase == PHASE_OPEN) return;
-  unsigned long elapsed = millis() - blinkPhaseStartMs;
-  if (blinkPhase == PHASE_CLOSING && elapsed >= BLINK_CLOSE_MS) {
-    blinkPhase = PHASE_CLOSED;
-    blinkPhaseStartMs = millis();
-  } else if (blinkPhase == PHASE_CLOSED && elapsed >= BLINK_HOLD_MS) {
-    blinkPhase = PHASE_OPENING;
-    blinkPhaseStartMs = millis();
-  } else if (blinkPhase == PHASE_OPENING && elapsed >= BLINK_OPEN_MS) {
-    blinkPhase = PHASE_OPEN;
-  }
-}
-
-int16_t currentEyeHeight() {
-  unsigned long e = millis() - blinkPhaseStartMs;
-  switch (blinkPhase) {
-    case PHASE_CLOSING:
-      return EYE_H - (int16_t)(min(1.0f, (float)e / BLINK_CLOSE_MS) * (EYE_H - EYE_MIN_H));
-    case PHASE_CLOSED:
-      return EYE_MIN_H;
-    case PHASE_OPENING:
-      return EYE_MIN_H + (int16_t)(min(1.0f, (float)e / BLINK_OPEN_MS) * (EYE_H - EYE_MIN_H));
-    default: // PHASE_OPEN
-      return EYE_H;
-  }
+  if (blinkStep < 0) blinkStep = 0;
 }
 
 void updateAutoBlink() {
-  if (blinkPhase == PHASE_OPEN && millis() >= nextAutoBlinkMs) {
+  if (millis() >= nextAutoBlinkMs) {
     triggerBlink();
     nextAutoBlinkMs = millis() + (talking
       ? random(BLINK_TALK_MIN_MS, BLINK_TALK_MAX_MS)
@@ -743,91 +765,339 @@ void updateAutoBlink() {
   }
 }
 
-// Nivel de boca que toca mostrar: el que manda Python, solo mientras habla.
-uint8_t currentMouthLevel() {
-  if (!talking) return 0;
-  const uint8_t level = mouthLevel;
-  return level < FACE_MOUTH_LEVELS ? level : FACE_MOUTH_LEVELS - 1;
-}
-
-// Boca de la cara geometrica: el alto sigue el volumen de la voz (nivel 0 =
-// cerrada, en los silencios entre palabras tambien); en reposo vuelve
-// suavemente a casi cerrada.
-void updateMouthTalk() {
-  const uint8_t level = currentMouthLevel();
-  if (level == 0) {
-    mouthTargetH = MOUTH_REST_H;
-  } else {
-    mouthTargetH = MOUTH_MIN_TALK_H +
-      (int16_t)((MOUTH_MAX_TALK_H - MOUTH_MIN_TALK_H) * (level - 1) / (FACE_MOUTH_LEVELS - 2));
+// Ojos/cejas de la emocion actual (los de "reposo" mientras dura la frase).
+uint8_t faceTopRest() {
+  switch (faceGesture) {
+    case G_HAPPY:      return FACE_TOP_HAPPY;
+    case G_SURPRISE:   return FACE_TOP_SURPRISE;
+    case G_ANGRY:      return FACE_TOP_ANGRY;
+    case G_SAD:        return FACE_TOP_SAD;
+    case G_FRUSTRATED: return FACE_TOP_FRUSTRATED;
+    // Gestos de 1.1.0: sin cara propia, toman prestada la que mejor les pega.
+    case G_WAVE:
+    case G_CLAP:
+    case G_YES:
+    case G_DANCE:
+    case G_HUG:
+    case G_STRETCH:    return FACE_TOP_HAPPY;
+    case G_THINK:      return FACE_TOP_FRUSTRATED;  // los ojos del "mmm"
+    case G_SLEEP:      return FACE_TOP_SAD;         // ojos caidos
+    default:           return FACE_TOP_OPEN;      // REST, TALK
   }
-  mouthCurrentH += (mouthTargetH - mouthCurrentH) * MOUTH_LERP_ALPHA;
 }
 
-// Escribe el mismo angulo en los 2 servos (siempre sincronizados). Los
-// vuelve a enganchar (attach) si estaban sueltos por un REST anterior.
-void writeServos(int angle) {
+// Boca de la emocion: la que se ve antes/despues de hablar y en las pausas.
+uint8_t faceMouthRest() {
+  switch (faceGesture) {
+    case G_HAPPY:      return FACE_MOUTH_HAPPY;
+    case G_SURPRISE:   return FACE_MOUTH_SURPRISE;
+    case G_ANGRY:      return FACE_MOUTH_ANGRY;
+    case G_SAD:        return FACE_MOUTH_SAD;
+    case G_FRUSTRATED: return FACE_VIS_F;         // el "uff" es la boca de la F
+    case G_WAVE:
+    case G_CLAP:
+    case G_YES:
+    case G_DANCE:
+    case G_HUG:
+    case G_STRETCH:    return FACE_MOUTH_HAPPY;
+    case G_SLEEP:      return FACE_MOUTH_SAD;
+    // G_THINK se queda con la boca neutra: asi los visemas se le notan igual
+    default:           return FACE_MOUTH_REST;
+  }
+}
+
+// Que tiene que mostrar la capa de arriba ahora. El parpadeo avanza solo
+// cuando el paso actual ya se dibujo y cumplio su tiempo. Las emociones con
+// ojos propios (feliz, enojada, sorpresa, triste) no parpadean; FRUSTRADO
+// (Cara 3) si, pero solo con los cuadros mas cerrados que los suyos.
+uint8_t faceTopTarget() {
+  const uint8_t rest = faceTopRest();
+  if (rest != FACE_TOP_OPEN && rest != FACE_TOP_FRUSTRATED) {
+    blinkStep = -1;
+    return rest;
+  }
+  const uint8_t minFrame = (rest == FACE_TOP_FRUSTRATED) ? FACE_BLINK_HALF + 1 : 0;
+  if (blinkStep >= 0 &&
+      drawnTop == FACE_TOP_BLINK + BLINK_SEQ[blinkStep] &&
+      millis() - topDrawnMs >= BLINK_HOLD_MS[blinkStep]) {
+    blinkStep++;
+  }
+  while (blinkStep >= 0 && blinkStep < BLINK_STEPS && BLINK_SEQ[blinkStep] < minFrame) blinkStep++;
+  if (blinkStep >= BLINK_STEPS) blinkStep = -1;
+  return blinkStep < 0 ? rest : FACE_TOP_BLINK + BLINK_SEQ[blinkStep];
+}
+
+// Que tiene que mostrar la boca: el visema mientras suena la voz; en las
+// pausas (visema 0) y sin hablar, la boca de la emocion.
+uint8_t faceMouthTarget() {
+  if (talking) {
+    const uint8_t v = mouthViseme;
+    if (v != FACE_MOUTH_REST && v < FACE_VISEMES) return v;
+  }
+  return faceMouthRest();
+}
+
+// Los dos servos a angulos crudos (sin DIR). Los vuelve a enganchar (attach)
+// si estaban sueltos por un REST anterior.
+void writeServoPair(int angle1, int angle2) {
   if (!servosAttached) {
     servo1.attach(SERVO1_PIN);
     servo2.attach(SERVO2_PIN);
     servosAttached = true;
   }
-  servo1.write(angle);
-  servo2.write(angle);
-}
-
-// Los dos servos a angulos distintos (el baile los mueve espejados).
-void writeServoPair(int angle1, int angle2) {
-  writeServos(angle1); // engancha si hacia falta
+  servo1.write(angle1);
   servo2.write(angle2);
 }
 
-// Un paso del baile, ya en el hilo de loop() (dueño de los servos).
+// El mismo angulo crudo en los 2 servos (90 = reposo, igual con cualquier DIR).
+void writeServos(int angle) {
+  writeServoPair(angle, angle);
+}
+
+// Cada brazo con su propio lift (> 0 = arriba), ya calibrado con ARMn_DIR y
+// limitado a ARM_MIN..ARM_MAX. Recuerda lo escrito para que las rampas
+// arranquen desde donde esta cada brazo.
+void writeArmPair(int lift1, int lift2) {
+  armLift1 = lift1;
+  armLift2 = lift2;
+  servoLastWriteMs = millis();
+  writeServoPair(constrain(SERVO_REST_ANGLE + ARM1_DIR * lift1, ARM_MIN, ARM_MAX),
+                 constrain(SERVO_REST_ANGLE + ARM2_DIR * lift2, ARM_MIN, ARM_MAX));
+}
+
+// Los dos brazos al mismo lift (lo normal: brazos simetricos).
+void writeArms(int lift) {
+  writeArmPair(lift, lift);
+}
+
+// Lleva los brazos a `lift` en durMs (0 = de un salto) y deja el proximo
+// paso para cuando termine la rampa + holdMs. El tiempo se cuenta desde
+// AHORA, no desde el paso anterior: si loop() se trabo, la secuencia se
+// atrasa un poco en vez de escribir varios pasos de golpe.
+void armMovePair(int lift1, int lift2, unsigned long durMs, unsigned long holdMs) {
+  const unsigned long now = millis();
+  if (durMs == 0) {
+    rampActive = false;
+    writeArmPair(lift1, lift2);
+  } else {
+    rampActive = true;
+    rampFrom1 = armLift1;
+    rampFrom2 = armLift2;
+    rampTo1 = lift1;
+    rampTo2 = lift2;
+    rampStart = now;
+    rampDur = durMs;
+  }
+  servoStepUntil = now + durMs + holdMs;
+}
+
+// Lo mismo con los dos brazos al mismo lift (lo normal).
+void armMove(int lift, unsigned long durMs, unsigned long holdMs) {
+  armMovePair(lift, lift, durMs, holdMs);
+}
+
+// Avanza la rampa en curso (como mucho una escritura cada SERVO_WRITE_MS).
+void updateArmRamp(unsigned long now) {
+  if (!rampActive || now - servoLastWriteMs < SERVO_WRITE_MS) return;
+  const unsigned long t = now - rampStart;
+  if (t >= rampDur) {
+    rampActive = false;
+    writeArmPair(rampTo1, rampTo2);
+    return;
+  }
+  const int l1 = rampFrom1 + (int)((long)(rampTo1 - rampFrom1) * (long)t / (long)rampDur);
+  const int l2 = rampFrom2 + (int)((long)(rampTo2 - rampFrom2) * (long)t / (long)rampDur);
+  if (l1 != armLift1 || l2 != armLift2) writeArmPair(l1, l2);
+}
+
+// El vaiven que sostiene cada gesto mientras habla.
+const ServoSway &servoSwayFor(uint8_t gesture) {
+  switch (gesture) {
+    case G_HAPPY:      return SERVO_SWAY_HAPPY;
+    case G_SURPRISE:   return SERVO_SWAY_SURPRISE;
+    case G_ANGRY:      return SERVO_SWAY_ANGRY;
+    case G_FRUSTRATED: return SERVO_SWAY_FRUSTRATED;
+    case G_SAD:        return SERVO_SWAY_SAD;
+    case G_WAVE:       return SERVO_SWAY_WAVE;
+    case G_CLAP:       return SERVO_SWAY_CLAP;
+    case G_THINK:      return SERVO_SWAY_THINK;
+    case G_YES:        return SERVO_SWAY_YES;
+    case G_NO:         return SERVO_SWAY_NO;
+    case G_DANCE:      return SERVO_SWAY_DANCE;
+    case G_HUG:        return SERVO_SWAY_HUG;
+    case G_SLEEP:      return SERVO_SWAY_SLEEP;
+    case G_STRETCH:    return SERVO_SWAY_STRETCH;
+    default:           return SERVO_SWAY_TALK;
+  }
+}
+
+// Un paso de la entrada del gesto. Devuelve false cuando la entrada termino
+// (y entonces sigue el vaiven sostenido).
+bool servoIntroStep(unsigned long now) {
+  const uint8_t step = servoStep++;
+  switch (servoGesture) {
+    case G_HAPPY: // manos arriba
+      if (step == 0) { armMove(SERVO_HAPPY_LIFT, SERVO_HAPPY_RAMP_MS, 0); return true; }
+      return false;
+
+    case G_SURPRISE: // respingo, baja un poco y tiembla
+      if (step == 0) {
+        armMove(SERVO_SURPRISE_JUMP, SERVO_SURPRISE_JUMP_MS, SERVO_SURPRISE_HOLD_MS);
+        return true;
+      }
+      if (step == 1) {
+        armMove(SERVO_SURPRISE_LIFT, SERVO_SURPRISE_LOWER_MS, 0);
+        servoIntroEndMs = now + SERVO_SURPRISE_LOWER_MS + SERVO_SURPRISE_SHAKE_MS;
+        return true;
+      }
+      if ((long)(now - servoIntroEndMs) >= 0 || step > 40) return false;
+      armMove(SERVO_SURPRISE_LIFT + ((step % 2) ? SERVO_SURPRISE_SHAKE : -SERVO_SURPRISE_SHAKE),
+              0, SERVO_SURPRISE_SHAKE_STEP_MS);
+      return true;
+
+    case G_ANGRY: { // "grrr": saltos arriba/abajo de tamaño y tiempo al azar
+      if (step == 0) {
+        servoStepCount = random(SERVO_ANGRY_MIN_STEPS, SERVO_ANGRY_MAX_STEPS + 1);
+        servoIntroEndMs = now + SERVO_ANGRY_MAX_MS;
+        servoAngrySign = (random(2) == 0) ? 1 : -1;
+      }
+      if (step >= servoStepCount || (long)(now - servoIntroEndMs) >= 0) return false;
+      servoAngrySign = -servoAngrySign;
+      const int amp = random(SERVO_ANGRY_MIN_AMP, SERVO_ANGRY_MAX_AMP + 1);
+      armMove(servoAngrySign * amp, 0,
+              random(SERVO_ANGRY_MIN_STEP_MS, SERVO_ANGRY_MAX_STEP_MS + 1));
+      return true;
+    }
+
+    case G_FRUSTRATED: { // "uff": sube lento, corte en la mitad, baja; x2
+      if (step >= SERVO_FRUS_CYCLES * 3) return false;
+      switch (step % 3) {
+        case 0:  armMove(SERVO_FRUS_TOP, SERVO_FRUS_UP_MS, 0); break;
+        case 1:  armMove(SERVO_FRUS_MID, SERVO_FRUS_DOWN_MS, SERVO_FRUS_PAUSE_MS); break;
+        default: armMove(0, SERVO_FRUS_DOWN_MS, SERVO_FRUS_END_PAUSE_MS); break;
+      }
+      return true;
+    }
+
+    case G_SAD: // brazos caidos, despacio
+      if (step == 0) { armMove(SERVO_SAD_LIFT, SERVO_SAD_RAMP_MS, 0); return true; }
+      return false;
+
+    case G_WAVE: // saludar: un brazo arriba que se mueve de lado a lado
+      if (step == 0) {
+        armMovePair(SERVO_WAVE_LIFT, 0, SERVO_WAVE_UP_MS, 0);
+        return true;
+      }
+      if (step > SERVO_WAVE_SWINGS) return false;
+      armMovePair(SERVO_WAVE_LIFT - ((step % 2) ? SERVO_WAVE_SWING : 0), 0,
+                  SERVO_WAVE_STEP_MS, 0);
+      return true;
+
+    case G_CLAP: // aplaudir: arriba y abajo juntos, rapido
+      if (step >= SERVO_CLAP_CLAPS * 2) return false;
+      armMove((step % 2) ? SERVO_CLAP_LOW : SERVO_CLAP_HIGH, 0, SERVO_CLAP_STEP_MS);
+      return true;
+
+    case G_THINK: // pensar: un brazo sube despacio y se queda quieto
+      if (step == 0) {
+        armMovePair(SERVO_THINK_LIFT, 0, SERVO_THINK_UP_MS, 0);
+        return true;
+      }
+      return false;
+
+    case G_YES: // asentir: dos cabezadas cortas
+      if (step >= SERVO_YES_NODS * 2) return false;
+      armMove((step % 2) ? SERVO_YES_LOW : SERVO_YES_HIGH, 0, SERVO_YES_STEP_MS);
+      return true;
+
+    case G_NO: // negar: los brazos en espejo, como una cabeza que dice que no
+      if (step >= SERVO_NO_SWINGS * 2) return false;
+      armMovePair((step % 2) ? -SERVO_NO_SWING : SERVO_NO_SWING,
+                  (step % 2) ? SERVO_NO_SWING : -SERVO_NO_SWING, 0, SERVO_NO_STEP_MS);
+      return true;
+
+    case G_DANCE: // bailar: espejo amplio, como el baile de la cancioncita
+      if (step >= SERVO_DANCE_SWINGS * 2) return false;
+      armMovePair((step % 2) ? -SERVO_DANCE_SWING : SERVO_DANCE_SWING,
+                  (step % 2) ? SERVO_DANCE_SWING : -SERVO_DANCE_SWING,
+                  0, SERVO_DANCE_STEP_MS);
+      return true;
+
+    case G_HUG: // abrazar: los dos brazos suben despacio y se quedan
+      if (step == 0) { armMove(SERVO_HUG_LIFT, SERVO_HUG_UP_MS, SERVO_HUG_HOLD_MS); return true; }
+      return false;
+
+    case G_SLEEP: // dormir: brazos caidos del todo, muy despacio
+      if (step == 0) { armMove(SERVO_SLEEP_LIFT, SERVO_SLEEP_DOWN_MS, 0); return true; }
+      return false;
+
+    case G_STRETCH: // estirarse: hasta arriba, se queda y baja (bostezo)
+      if (step == 0) {
+        armMove(SERVO_STRETCH_TOP, SERVO_STRETCH_UP_MS, SERVO_STRETCH_HOLD_MS);
+        return true;
+      }
+      if (step == 1) { armMove(SERVO_STRETCH_END, SERVO_STRETCH_DOWN_MS, 0); return true; }
+      return false;
+
+    default: // TALK no tiene entrada: directo al vaiven
+      return false;
+  }
+}
+
+// Un paso del baile, ya en el hilo de loop() (dueño de los servos). En lift:
+// brazo 1 a -swing y brazo 2 a +swing (con los DIR en +1 son los mismos
+// angulos espejados de siempre, 90-swing / 90+swing).
 void consumeArmStep() {
   const uint8_t step = pendingArmStep;
   if (step == NO_PENDING_STEP) return;
   pendingArmStep = NO_PENDING_STEP;
 
   const int swing = (step % 2 == 0) ? DANCE_SWING_SMALL : DANCE_SWING_BIG;
-  writeServoPair(SERVO_REST_ANGLE - swing, SERVO_REST_ANGLE + swing);
+  rampActive = false;
+  writeArmPair(-swing, swing);
   danceUntil = millis() + DANCE_HOLD_MS;
+  servoDancing = true;
   servoRestSettling = false; // al terminar, updateServos() vuelve a reposo solo
 }
 
-// Arranca el barrido amplio de HAPPY o el respingo de SURPRISE. Se llama una
-// sola vez, al consumir el gesto (ver consumePendingGesture()); despues de su
-// tiempo corto, updateServos() vuelve sola a la fase TALK.
+// Arranca el movimiento del gesto. Se llama una vez por gesto consumido (ver
+// consumePendingGesture()); el resto lo hace updateServos() en cada loop().
+// Si llega el MISMO gesto mientras ya lo esta haciendo, sigue sin cortarlo.
 void startServoFlourish(uint8_t gesture) {
-  servoRestSettling = false; // por si veniamos de REST, cancelar el soltado
-  if (gesture == G_HAPPY) {
-    servoPhase = SERVO_PHASE_HAPPY;
-    servoHappyLeg = 0;
-    servoPhaseStepUntil = millis() + SERVO_HAPPY_LEG_MS;
-    writeServos(SERVO_HAPPY_MIN);
-  } else if (gesture == G_SURPRISE) {
-    servoPhase = SERVO_PHASE_SURPRISE;
-    servoPhaseStepUntil = millis() + SERVO_SURPRISE_HOLD_MS;
-    writeServos(SERVO_SURPRISE_ANGLE);
+  if (gesture == G_REST) {
+    // updateServos() los lleva a 90 y los suelta (ve talking == false)
+    servoGesture = G_REST;
+    servoPhase = SERVO_PHASE_REST;
+    rampActive = false;
+    return;
   }
-  // TALK no necesita flourish: updateServos() ya hace el vaiven mientras
-  // talking == true.
+  servoRestSettling = false; // por si veniamos de REST, cancelar el soltado
+  if (gesture == servoGesture && servoPhase != SERVO_PHASE_REST) return;
+
+  servoGesture = gesture;
+  servoStep = 0;
+  servoStepUntil = millis(); // el primer paso sale en este mismo loop()
+  servoPhase = SERVO_PHASE_INTRO;
 }
 
 // Mueve los servos segun la fase actual. Se llama en cada loop(), igual que
-// updateMouthTalk(): nada de delay(), todo temporizado con millis().
+// updateAutoBlink(): nada de delay(), todo temporizado con millis().
 void updateServos() {
   unsigned long now = millis();
-  if (now < danceUntil) return; // bailando: los mueve consumeArmStep()
+  if ((long)(now - danceUntil) < 0) return; // bailando: los mueve consumeArmStep()
 
   if (!talking) {
     // REST: volver a 90 y, tras un rato de sobra para llegar, soltar el
     // servo (detach) para que no zumbe en reposo — igual que describia el
     // README original ("vuelve a 90° y se suelta, no zumba").
-    if (servoPhase != SERVO_PHASE_TALK) {
-      servoPhase = SERVO_PHASE_TALK; // corta cualquier flourish en curso
+    servoDancing = false;
+    if (servoPhase != SERVO_PHASE_REST) {
+      servoPhase = SERVO_PHASE_REST; // corta cualquier gesto en curso
+      servoGesture = G_REST;
+      rampActive = false;
     }
     if (!servoRestSettling && servosAttached) {
-      writeServos(SERVO_REST_ANGLE);
+      writeArms(0);
       servoRestSettling = true;
       servoRestSettleUntil = now + SERVO_REST_SETTLE_MS;
     }
@@ -840,219 +1110,285 @@ void updateServos() {
     return;
   }
 
-  switch (servoPhase) {
-    case SERVO_PHASE_HAPPY:
-      if (now >= servoPhaseStepUntil) {
-        servoHappyLeg++;
-        if (servoHappyLeg >= SERVO_HAPPY_LEGS) {
-          servoPhase = SERVO_PHASE_TALK; // barrido terminado, sigue el vaiven normal
-        } else {
-          writeServos((servoHappyLeg % 2 == 0) ? SERVO_HAPPY_MIN : SERVO_HAPPY_MAX);
-          servoPhaseStepUntil = now + SERVO_HAPPY_LEG_MS;
-        }
-      }
-      break;
+  const ServoSway &sway = servoSwayFor(servoGesture);
 
-    case SERVO_PHASE_SURPRISE:
-      if (now >= servoPhaseStepUntil) {
-        servoPhase = SERVO_PHASE_TALK; // respingo terminado, sigue el vaiven normal
-      }
-      break;
-
-    case SERVO_PHASE_TALK:
-      if (now >= servoNextStepMs) {
-        servoTalkHigh = !servoTalkHigh;
-        writeServos(servoTalkHigh ? SERVO_TALK_MAX : SERVO_TALK_MIN);
-        servoNextStepMs = now + SERVO_TALK_STEP_MS;
-      }
-      break;
+  if (servoDancing || servoPhase == SERVO_PHASE_REST) {
+    // Termino el baile (o habla sin gesto previo): sin rehacer la entrada,
+    // volver suave a la pose del gesto y seguir con su vaiven.
+    servoDancing = false;
+    servoPhase = SERVO_PHASE_SUSTAIN;
+    armMovePair(sway.center, sway.center2, SERVO_RESUME_MS, 0);
   }
+
+  updateArmRamp(now);
+  if ((long)(now - servoStepUntil) < 0) return;
+
+  if (servoPhase == SERVO_PHASE_INTRO) {
+    if (servoIntroStep(now)) return;
+    servoPhase = SERVO_PHASE_SUSTAIN; // entrada terminada: sigue el vaiven
+  }
+
+  // SUSTAIN: vaiven de ±amp alrededor de la pose del gesto (en espejo, el
+  // segundo brazo va al reves: "no", baile)
+  servoSwayHigh = !servoSwayHigh;
+  const int delta = servoSwayHigh ? sway.amp : -(int)sway.amp;
+  const int target1 = sway.center + delta;
+  const int target2 = sway.center2 + (sway.mirror ? -delta : delta);
+  if (sway.smooth) armMovePair(target1, target2, sway.stepMs, 0);
+  else armMovePair(target1, target2, 0, sway.stepMs);
 }
 
-// --- Dibujo: componer en RAM (barato) y mandar SOLO las filas que cambiaron ---
+// --- Dibujo de la cara: armar en RAM (barato) y mandar SOLO lo que cambia ---
 //
 // Medido en esta placa: el driver SPI cuesta ~4 us por byte (una ISR por byte,
-// el bus va al 5% de su capacidad). O sea ~253 KB/s reales: un flush de region
-// completa de la boca (7.168 px) son 57 ms, casi dos frames. Por eso NO se
-// puede mandar la region entera en cada frame.
+// el bus va al 5% de su capacidad). O sea ~253 KB/s reales: la pantalla
+// entera son ~0,6 s y un ojo o una boca completos, 1-3 frames. Por eso NO se
+// puede mandar la cara entera en cada frame.
 //
-// Las partes de la cara crecen y encogen centradas, asi que entre un frame y
-// el siguiente solo cambian dos bandas de filas: una arriba y otra abajo del
-// borde. Se manda solo eso, y lo que sale por pantalla es identico.
-
-
-ChangeBands bandsFor(int16_t H, int16_t hOld, int16_t hNew, int16_t r) {
-  ChangeBands b;
-  if (hOld < 0) { // primera vez / cambio de personaje: toda la region
-    b.topY = 0; b.topH = H; b.botY = 0; b.botH = 0;
-    return b;
-  }
-
-  const int16_t t0 = (H - hOld) / 2, t1 = (H - hNew) / 2;
-  const int16_t d0 = t0 + hOld,      d1 = t1 + hNew;
-
-  // +-1 de holgura para no cortar bordes por redondeo de la division entera.
-  int16_t topFrom = max((int16_t)0, (int16_t)(min(t0, t1) - 1));
-  int16_t topTo   = min(H, (int16_t)(max(t0, t1) + r + 1));
-  int16_t botFrom = max((int16_t)0, (int16_t)(min(d0, d1) - r - 1));
-  int16_t botTo   = min(H, (int16_t)(max(d0, d1) + 1));
-
-  if (botFrom <= topTo) { // se solapan: una sola banda
-    b.topY = topFrom; b.topH = botTo - topFrom; b.botY = 0; b.botH = 0;
-  } else {
-    b.topY = topFrom; b.topH = topTo - topFrom;
-    b.botY = botFrom; b.botH = botTo - botFrom;
-  }
-  return b;
-}
-
-void flushBands(RegionCanvas &c, const ChangeBands &b) {
-  if (b.topH > 0) c.flushRect(0, b.topY, c.width(), b.topH);
-  if (b.botH > 0) c.flushRect(0, b.botY, c.width(), b.botH);
-}
-
-void composeEye(RegionCanvas &canvas, int16_t eyeH) {
-  canvas.fillScreen(BG_COLOR);
-  // Centrado en su region: la region tiene el ancho/alto del ojo + margen.
-  canvas.fillRoundRect(REGION_MARGIN, (EYE_REGION_H - eyeH) / 2,
-                       EYE_W, eyeH, min(EYE_R, (int16_t)(eyeH / 2)), EYE_COLOR);
-}
-
-void composeBrow(RegionCanvas &canvas, int16_t browLift) {
-  canvas.fillScreen(BG_COLOR);
-  // La ceja "en reposo" (lift 0) queda abajo de su region; al levantarse sube.
-  int16_t y = REGION_MARGIN + (BROW_PULSE_LIFT_PX - browLift);
-  canvas.fillRoundRect(REGION_MARGIN, y, BROW_W, BROW_H, BROW_H / 2, BROW_COLOR);
-}
-
-void composeMouth(int16_t mouthH) {
-  mouthCanvas.fillScreen(BG_COLOR);
-  if (mouthH >= 2) {
-    mouthCanvas.fillRoundRect(REGION_MARGIN, (MOUTH_REGION_H - mouthH) / 2,
-                              MOUTH_W, mouthH,
-                              min((int16_t)(mouthH / 2), MOUTH_R), MOUTH_COLOR);
-  }
-}
-
-// --- Cara dibujada: sprites de 2 bits de los PNG (ver face_sprite.h) ---
-//
-// Mismo problema de bus que la cara geometrica, peor: un ojo dibujado son
-// ~7.400 px, mas de dos frames de SPI. Por eso de un sprite al siguiente
-// (ojo abierto -> entrecerrado, boca nivel 1 -> 3...) se manda solo lo que
-// cambia: se comparan los dos sprites fila por fila y las filas que difieren
-// se agrupan en pocos rectangulos (planSpriteDiff()).
+// La cara son capas (ver face_sprite.h): la base y, encima, o la capa de
+// arriba (filas < split) o la de la boca (filas >= split). Para pasar una
+// capa de un estado a otro se arman las filas del rectangulo que cubre a
+// los dos estados, con el estado viejo y con el nuevo, se comparan, y los
+// pedazos de fila que difieren se juntan en pocos rectangulos
+// (facePlanDiff()). Solo eso viaja por SPI.
 
 // Cada rectangulo cuesta ademas su setAddrWindow() (~11 bytes de comando, de
 // a uno por vez): en pixeles equivale a unos 32. Con eso se decide si
 // conviene juntar dos filas en un mismo rectangulo o mandarlas por separado.
 const uint32_t WINDOW_COST_PX = 32;
 const uint8_t MAX_DIFF_RECTS = 24;
-SpanRect diffRectsA[MAX_DIFF_RECTS], diffRectsB[MAX_DIFF_RECTS];
+SpanRect diffRects[MAX_DIFF_RECTS], diffRectsAlt[MAX_DIFF_RECTS];
 
-// Mezcla fondo -> trazo en los niveles de opacidad de los sprites. Con dos
-// tintas (ver FaceSpriteSet::twoInks) son 3 niveles de `ink` y el ultimo
-// valor es `ink2` lleno.
-void buildSpriteLut(uint16_t bg, uint16_t ink, uint16_t ink2, bool twoInks) {
-  const uint8_t br = (bg >> 11) & 0x1F, bgc = (bg >> 5) & 0x3F, bb = bg & 0x1F;
-  const uint8_t ir = (ink >> 11) & 0x1F, ig = (ink >> 5) & 0x3F, ib = ink & 0x1F;
-  const uint8_t steps = twoInks ? 2 : 3;
-  for (uint8_t a = 0; a <= steps; a++) {
-    const uint16_t r = (br * (steps - a) + ir * a) / steps;
-    const uint16_t g = (bgc * (steps - a) + ig * a) / steps;
-    const uint16_t b = (bb * (steps - a) + ib * a) / steps;
-    spriteLut[a] = __builtin_bswap16((uint16_t)((r << 11) | (g << 5) | b));
+// Decodifica la fila `row` del sprite `s` sobre `line` (fila de pantalla
+// entera), dejando sin tocar lo transparente. Formato en face_sprite.h.
+void faceDecodeRow(const FaceLayer &s, int16_t row, uint8_t *line) {
+  const uint8_t *t = face->blob + s.rows + 2u * (uint32_t)row;
+  const uint8_t *p = face->blob + s.data + (uint32_t)(t[0] | (t[1] << 8));
+  uint8_t *dst = line + s.x;
+  int16_t left = s.w;
+  while (left > 0) {
+    const uint8_t tok = *p++;
+    const uint8_t idx = tok >> 4;
+    int16_t n = tok & 0x0F;
+    n = (n < 15) ? n + 1 : 16 + *p++;
+    if (n > left) n = left;
+    if (idx != FACE_TRANSPARENT) memset(dst, idx, n);
+    dst += n;
+    left -= n;
   }
-  if (twoInks) spriteLut[3] = __builtin_bswap16(ink2);
 }
 
-// Manda un sub-rectangulo de un sprite (coordenadas locales). Mismo camino
-// rapido que RegionCanvas::flushRect(): se arma en spiScratch (nunca se le
-// pasa otro buffer a SPI.transfer(), que lo sobrescribe) y va de a chunks.
-void pushSpriteRect(const FaceSprite &s, int16_t rx, int16_t ry, int16_t rw, int16_t rh) {
-  if (rw <= 0 || rh <= 0) return;
-  const int16_t rowsPerChunk = (int16_t)(SCRATCH_PX / (uint32_t)rw);
-  if (rowsPerChunk < 1) return; // no deberia pasar: rw <= SCREEN_W
+// Pinta en `line` la fila `y` del sprite `s`, si la fila es suya.
+void faceDecodeIfIn(const FaceLayer &s, int16_t y, uint8_t *line) {
+  if (s.w > 0 && y >= s.y && y < s.y + s.h) faceDecodeRow(s, y - s.y, line);
+}
+
+// Arma la fila `y` de pantalla: la base y encima la capa que toca (arriba:
+// los ojos; abajo: el extra de esos ojos y la boca).
+void faceComposeRow(int16_t y, uint8_t top, uint8_t mouth, uint8_t *line) {
+  faceDecodeRow(face->base, y, line);
+  if (y < face->split) {
+    faceDecodeIfIn(face->top[top], y, line);
+  } else {
+    faceDecodeIfIn(face->extra[top], y, line);
+    faceDecodeIfIn(face->mouth[mouth], y, line);
+  }
+}
+
+// Los badges (version abajo a la derecha, WiFi arriba a la derecha) se
+// pintan encima de la cara: lo que cambie debajo de ellos no se manda, y si
+// un rectangulo igual los pisa, se repintan (ver facePushRects()).
+bool inBadge(int16_t x, int16_t y) {
+  return (x >= VER_X && x < VER_X + VER_W && y >= VER_Y && y < VER_Y + VER_H) ||
+         (x >= WIFI_X && x < WIFI_X + WIFI_W && y >= WIFI_Y && y < WIFI_Y + WIFI_H);
+}
+
+bool rectsTouch(const SpanRect &r, int16_t x, int16_t y, int16_t w, int16_t h) {
+  return r.x < x + w && x < r.x + r.w && r.y < y + h && y < r.y + r.h;
+}
+
+// Un rectangulo de pantalla que pisaria un badge (version o WiFi).
+bool rectHitsBadge(int16_t x0, int16_t y0, int16_t x1, int16_t y1) {
+  const SpanRect r = { x0, y0, (int16_t)(x1 - x0 + 1), (int16_t)(y1 - y0 + 1) };
+  return rectsTouch(r, VER_X, VER_Y, VER_W, VER_H) || rectsTouch(r, WIFI_X, WIFI_Y, WIFI_W, WIFI_H);
+}
+
+// Arma, para las columnas [cx0, cx1) y las filas [uy0, uy1), los
+// rectangulos que llevan la pantalla de la cara (topA, mouthA) a la
+// (topB, mouthB), y los agrega a `out` desde `n` (hasta `maxN`). Suma a
+// `cost` los pixeles a mandar, overhead de ventana incluido. Devuelve el
+// nuevo `n`.
+uint8_t facePlanCols(uint8_t topA, uint8_t mouthA, uint8_t topB, uint8_t mouthB, int16_t cx0, int16_t cx1,
+                     int16_t uy0, int16_t uy1, SpanRect *out, uint8_t n, uint8_t maxN, uint32_t &cost) {
+  const uint8_t first = n; // solo se junta con rectangulos de esta pasada
+  for (int16_t y = uy0; y < uy1; y++) {
+    faceComposeRow(y, topA, mouthA, faceLineOld);
+    faceComposeRow(y, topB, mouthB, faceLine);
+
+    int16_t x0 = -1, x1 = -1;
+    for (int16_t x = cx0; x < cx1; x++) {
+      if (faceLine[x] != faceLineOld[x] && !inBadge(x, y)) {
+        if (x0 < 0) x0 = x;
+        x1 = x;
+      }
+    }
+    if (x0 < 0) continue; // fila identica
+    const int16_t rowW = x1 - x0 + 1;
+
+    if (n > first) {
+      SpanRect &g = out[n - 1];
+      if (g.y + g.h == y) { // fila contigua: juntarla si sale mas barato
+        const int16_t gx0 = min(g.x, x0), gx1 = max((int16_t)(g.x + g.w - 1), x1);
+        const uint32_t merged = (uint32_t)(gx1 - gx0 + 1) * (g.h + 1);
+        const uint32_t apart = (uint32_t)g.w * g.h + rowW + WINDOW_COST_PX;
+        // Si el rectangulo juntado pisaria un badge, va aparte: lo de
+        // debajo del badge no se manda (y el badge no parpadea).
+        const bool hitsBadge = rectHitsBadge(gx0, g.y, gx1, y);
+        if ((merged <= apart && !hitsBadge) || n == maxN) {
+          cost += merged - (uint32_t)g.w * g.h;
+          g.x = gx0; g.w = gx1 - gx0 + 1; g.h++;
+          continue;
+        }
+      } else if (n == maxN) { // sin lugar: estirar el ultimo
+        const int16_t gx0 = min(g.x, x0), gx1 = max((int16_t)(g.x + g.w - 1), x1);
+        cost -= (uint32_t)g.w * g.h;
+        g.x = gx0; g.w = gx1 - gx0 + 1; g.h = y - g.y + 1;
+        cost += (uint32_t)g.w * g.h;
+        continue;
+      }
+    }
+    out[n++] = { x0, y, rowW, 1 };
+    cost += rowW + WINDOW_COST_PX;
+  }
+  return n;
+}
+
+// Arma los rectangulos (de pantalla) que llevan una capa del estado `from`
+// al `to`, con la otra capa como este. Devuelve cuantos son y deja en `cost`
+// los pixeles a mandar, overhead de ventana incluido.
+//
+// Se prueba tambien cortando al medio de la pantalla: en el parpadeo cada
+// fila cambia en los DOS ojos, y una sola franja por fila arrastraria todo
+// el hueco entre ellos (el doble de pixeles). Queda la opcion mas barata.
+// Agranda [ux0, ux1) x [uy0, uy1) para que cubra el sprite `s` (si tiene algo).
+void growBox(const FaceLayer &s, int16_t &ux0, int16_t &uy0, int16_t &ux1, int16_t &uy1) {
+  if (s.w == 0) return;
+  ux0 = min(ux0, s.x); uy0 = min(uy0, s.y);
+  ux1 = max(ux1, (int16_t)(s.x + s.w)); uy1 = max(uy1, (int16_t)(s.y + s.h));
+}
+
+uint8_t facePlanDiff(bool topLayer, uint8_t from, uint8_t to, SpanRect *out, uint32_t &cost) {
+  // La otra capa queda como esta dibujada.
+  const uint8_t topA = topLayer ? from : drawnTop, topB = topLayer ? to : drawnTop;
+  const uint8_t mouthA = topLayer ? drawnMouth : from, mouthB = topLayer ? drawnMouth : to;
+  cost = 0;
+
+  // El rectangulo que cubre a los dos estados (uno puede ser "igual a la
+  // base"). Los ojos arrastran su extra (cachetes, lagrimas, debajo del split).
+  int16_t ux0 = SCREEN_W, uy0 = SCREEN_H, ux1 = 0, uy1 = 0;
+  if (topLayer) {
+    growBox(face->top[from], ux0, uy0, ux1, uy1);
+    growBox(face->top[to], ux0, uy0, ux1, uy1);
+    growBox(face->extra[from], ux0, uy0, ux1, uy1);
+    growBox(face->extra[to], ux0, uy0, ux1, uy1);
+  } else {
+    growBox(face->mouth[from], ux0, uy0, ux1, uy1);
+    growBox(face->mouth[to], ux0, uy0, ux1, uy1);
+  }
+  if (ux1 <= ux0) return 0;
+
+  uint8_t n = facePlanCols(topA, mouthA, topB, mouthB, ux0, ux1, uy0, uy1, out, 0, MAX_DIFF_RECTS, cost);
+  const int16_t mid = SCREEN_W / 2;
+  if (ux0 < mid && ux1 > mid) {
+    uint32_t costSplit = 0;
+    uint8_t m = facePlanCols(topA, mouthA, topB, mouthB, ux0, mid, uy0, uy1, diffRectsAlt, 0, MAX_DIFF_RECTS / 2, costSplit);
+    m = facePlanCols(topA, mouthA, topB, mouthB, mid, ux1, uy0, uy1, diffRectsAlt, m, MAX_DIFF_RECTS, costSplit);
+    if (costSplit < cost) {
+      memcpy(out, diffRectsAlt, m * sizeof(SpanRect));
+      n = m;
+      cost = costSplit;
+    }
+  }
+  return n;
+}
+
+// Manda rectangulos de pantalla con la cara en el estado dibujado
+// (drawnTop, drawnMouth). Mismo camino rapido que RegionCanvas::flushRect():
+// se arma en spiScratch (nunca se le pasa otro buffer a SPI.transfer(), que
+// lo sobrescribe) y va de a chunks de filas enteras del rectangulo.
+//
+// `clipBadges`: no mandar lo que cae debajo de los badges (los cambios
+// parciales); si no (pantalla entera), se manda todo y se repintan.
+void facePushRect(const SpanRect &r);
+void facePushClipped(const SpanRect &r, uint8_t badge);
+
+void facePushRects(const SpanRect *rects, uint8_t n, bool clipBadges) {
+  bool verHit = false, wifiHit = false;
+  for (uint8_t i = 0; i < n; i++) {
+    const SpanRect &r = rects[i];
+    if (r.w <= 0 || r.h <= 0) continue;
+    if (clipBadges) {
+      facePushClipped(r, 0);
+      continue;
+    }
+    facePushRect(r);
+    verHit |= rectsTouch(r, VER_X, VER_Y, VER_W, VER_H);
+    wifiHit |= rectsTouch(r, WIFI_X, WIFI_Y, WIFI_W, WIFI_H);
+  }
+  if (verHit) drawVersionBadge();
+  if (wifiHit) drawWifiBadge(BG_COLOR);
+}
+
+// Manda `r` menos lo que pisa los badges desde el numero `badge` (0 =
+// version, 1 = WiFi, 2 = ninguno mas): lo que sobra de cada lado del badge
+// va en pedazos aparte.
+void facePushClipped(const SpanRect &r, uint8_t badge) {
+  if (r.w <= 0 || r.h <= 0) return;
+  if (badge >= 2) {
+    facePushRect(r);
+    return;
+  }
+  const int16_t bx = badge ? WIFI_X : VER_X, by = badge ? WIFI_Y : VER_Y;
+  const int16_t bw = badge ? WIFI_W : VER_W, bh = badge ? WIFI_H : VER_H;
+  if (!rectsTouch(r, bx, by, bw, bh)) {
+    facePushClipped(r, badge + 1);
+    return;
+  }
+  const int16_t y0 = max(r.y, by), y1 = min((int16_t)(r.y + r.h), (int16_t)(by + bh));
+  const int16_t rx1 = r.x + r.w, bx1 = bx + bw;
+  facePushClipped({ r.x, r.y, r.w, (int16_t)(y0 - r.y) }, badge + 1);                    // arriba
+  facePushClipped({ r.x, y0, (int16_t)(bx - r.x), (int16_t)(y1 - y0) }, badge + 1);       // izquierda
+  facePushClipped({ bx1, y0, (int16_t)(rx1 - bx1), (int16_t)(y1 - y0) }, badge + 1);      // derecha
+  facePushClipped({ r.x, y1, r.w, (int16_t)(r.y + r.h - y1) }, badge + 1);                // abajo
+}
+
+void facePushRect(const SpanRect &r) {
+  const int16_t rowsPerChunk = (int16_t)(SCRATCH_PX / (uint32_t)r.w);
+  if (rowsPerChunk < 1) return; // no deberia pasar: r.w <= SCREEN_W
 
   tft.startWrite();
-  tft.setAddrWindow(s.x + rx, s.y + ry, rw, rh);
-
-  for (int16_t row = 0; row < rh; ) {
-    const int16_t rows = min((int16_t)(rh - row), rowsPerChunk);
+  tft.setAddrWindow(r.x, r.y, r.w, r.h);
+  for (int16_t row = 0; row < r.h; ) {
+    const int16_t rows = min((int16_t)(r.h - row), rowsPerChunk);
     uint16_t *dst = spiScratch;
 
     uint32_t t0 = micros();
-    for (int16_t r = 0; r < rows; r++) {
-      for (int16_t c = 0; c < rw; c++) {
-        *dst++ = spriteLut[s.at(rx + c, ry + row + r)];
-      }
+    for (int16_t k = 0; k < rows; k++) {
+      faceComposeRow(r.y + row + k, drawnTop, drawnMouth, faceLine);
+      const uint8_t *src = faceLine + r.x;
+      for (int16_t c = 0; c < r.w; c++) *dst++ = face->lut[src[c]];
     }
     uint32_t t1 = micros();
 
-    SPI.transfer(spiScratch, (size_t)rows * (size_t)rw * 2);
+    SPI.transfer(spiScratch, (size_t)rows * (size_t)r.w * 2);
     uint32_t t2 = micros();
 
     statsCopyUs += t1 - t0;
     statsSpiUs += t2 - t1;
     row += rows;
   }
-
   tft.endWrite();
-  statsPixels += (uint32_t)rw * rh;
-}
-
-// Arma los rectangulos que llevan la pantalla del sprite `from` al `to`
-// (mismo rectangulo de pantalla, distintos pixeles). Devuelve cuantos son y
-// deja en `cost` los pixeles a mandar, overhead de ventana incluido.
-uint8_t planSpriteDiff(const FaceSprite &from, const FaceSprite &to, SpanRect *out, uint32_t &cost) {
-  const uint16_t stride = (to.w + 3) / 4;
-  uint8_t n = 0;
-  cost = 0;
-
-  for (int16_t row = 0; row < to.h; row++) {
-    const uint8_t *ra = from.px + (uint32_t)row * stride;
-    const uint8_t *rb = to.px + (uint32_t)row * stride;
-    int16_t b0 = -1, b1 = -1;
-    for (uint16_t i = 0; i < stride; i++) {
-      if (ra[i] != rb[i]) {
-        if (b0 < 0) b0 = i;
-        b1 = i;
-      }
-    }
-    if (b0 < 0) continue; // fila identica
-
-    // Granularidad de byte (4 px): mas simple y el sobrante es minimo.
-    const int16_t x0 = b0 * 4, x1 = min((int16_t)(to.w - 1), (int16_t)(b1 * 4 + 3));
-    const int16_t rowW = x1 - x0 + 1;
-
-    if (n > 0) {
-      SpanRect &g = out[n - 1];
-      if (g.y + g.h == row) { // fila contigua: juntarla si sale mas barato
-        const int16_t ux0 = min(g.x, x0), ux1 = max((int16_t)(g.x + g.w - 1), x1);
-        const uint32_t merged = (uint32_t)(ux1 - ux0 + 1) * (g.h + 1);
-        const uint32_t apart = (uint32_t)g.w * g.h + rowW + WINDOW_COST_PX;
-        if (merged <= apart || n == MAX_DIFF_RECTS) {
-          cost += merged - (uint32_t)g.w * g.h;
-          g.x = ux0; g.w = ux1 - ux0 + 1; g.h++;
-          continue;
-        }
-      } else if (n == MAX_DIFF_RECTS) { // sin lugar: estirar el ultimo
-        const int16_t ux0 = min(g.x, x0), ux1 = max((int16_t)(g.x + g.w - 1), x1);
-        cost -= (uint32_t)g.w * g.h;
-        g.x = ux0; g.w = ux1 - ux0 + 1; g.h = row - g.y + 1;
-        cost += (uint32_t)g.w * g.h;
-        continue;
-      }
-    }
-    out[n++] = { x0, row, rowW, 1 };
-    cost += rowW + WINDOW_COST_PX;
-  }
-  return n;
-}
-
-void pushSpriteRects(const FaceSprite &s, const SpanRect *rects, uint8_t n) {
-  for (uint8_t i = 0; i < n; i++) {
-    pushSpriteRect(s, rects[i].x, rects[i].y, rects[i].w, rects[i].h);
-  }
+  statsPixels += (uint32_t)r.w * r.h;
 }
 
 // Descuenta del presupuesto del frame (sin pasarse de 0 cuando se forzo).
@@ -1060,65 +1396,38 @@ void spendFramePx(uint32_t cost) {
   framePxLeft = cost < framePxLeft ? framePxLeft - cost : 0;
 }
 
-// Lleva la boca al nivel pedido. `force`: mandarla aunque no entre en el
-// presupuesto (solo si en este frame no salio nada todavia, para que nunca
-// quede trabada). Devuelve true si mando algo.
-bool stepSpriteMouth(uint8_t level, bool force) {
-  if (level == drawnMouthLevel) return false;
-  const FaceSprite &from = spriteFace->mouths[drawnMouthLevel];
-  const FaceSprite &to = spriteFace->mouths[level];
+// Lleva una capa (la de arriba o la boca) al estado `to`. `force`: mandarla
+// aunque no entre en el presupuesto (solo si en este frame no salio nada
+// todavia, para que nunca quede trabada). Devuelve true si mando algo.
+bool faceStepLayer(bool topLayer, uint8_t to, bool force) {
+  uint8_t &drawn = topLayer ? drawnTop : drawnMouth;
+  if (to == drawn) return false;
   uint32_t cost;
-  const uint8_t n = planSpriteDiff(from, to, diffRectsA, cost);
+  const uint8_t n = facePlanDiff(topLayer, drawn, to, diffRects, cost);
   if (cost > framePxLeft && !force) return false;
   spendFramePx(cost);
-  pushSpriteRects(to, diffRectsA, n);
-  drawnMouthLevel = level;
+  drawn = to; // antes de mandar: facePushRects() arma el estado dibujado
+  facePushRects(diffRects, n, true);
+  if (topLayer) topDrawnMs = millis();
   return true;
-}
-
-// Los dos ojos se mandan juntos o ninguno, para que no queden desparejos.
-bool stepSpriteEyes(uint8_t state, bool force) {
-  if (state == drawnEyeState) return false;
-  uint32_t costL, costR;
-  const uint8_t nL = planSpriteDiff(spriteFace->eyesL[drawnEyeState], spriteFace->eyesL[state], diffRectsA, costL);
-  const uint8_t nR = planSpriteDiff(spriteFace->eyesR[drawnEyeState], spriteFace->eyesR[state], diffRectsB, costR);
-  if (costL + costR > framePxLeft && !force) return false;
-  spendFramePx(costL + costR);
-  pushSpriteRects(spriteFace->eyesL[state], diffRectsA, nL);
-  pushSpriteRects(spriteFace->eyesR[state], diffRectsB, nR);
-  drawnEyeState = state;
-  eyeDrawnMs = millis();
-  return true;
-}
-
-// Avanza el parpadeo de la cara dibujada: el siguiente paso de la secuencia
-// arranca cuando el actual ya se dibujo y cumplio su tiempo.
-uint8_t spriteEyeTarget() {
-  if (spriteBlinkStep >= 0 &&
-      drawnEyeState == SPRITE_BLINK_SEQ[spriteBlinkStep] &&
-      millis() - eyeDrawnMs >= SPRITE_BLINK_HOLD_MS[spriteBlinkStep]) {
-    spriteBlinkStep++;
-    if (spriteBlinkStep >= SPRITE_BLINK_STEPS) spriteBlinkStep = -1;
-  }
-  return spriteBlinkStep < 0 ? FACE_EYE_OPEN : SPRITE_BLINK_SEQ[spriteBlinkStep];
 }
 
 // Si los ojos esperan tantos frames seguidos, pasan antes que la boca: con
 // la boca cambiando casi en cada frame al hablar, si no, nunca entrarian.
 const uint8_t EYES_MAX_WAIT_FRAMES = 2;
 
-void renderSpriteFace() {
-  const uint8_t eyeTarget = spriteEyeTarget();
-  const uint8_t mouthTarget = currentMouthLevel();
+void renderFace() {
+  const uint8_t topTarget = faceTopTarget();
+  const uint8_t mouthTarget = faceMouthTarget();
   bool sent = false;
 
   // Presupuesto del frame: si lo primero ya lo gasta entero, lo segundo
   // espera. Nada se pierde, solo se atrasa (se dibuja el ultimo estado pedido).
   const bool eyesFirst = eyesWaitFrames >= EYES_MAX_WAIT_FRAMES;
-  if (!eyesFirst) sent = stepSpriteMouth(mouthTarget, true);
+  if (!eyesFirst) sent = faceStepLayer(false, mouthTarget, true);
 
-  if (eyeTarget != drawnEyeState) {
-    if (stepSpriteEyes(eyeTarget, !sent)) {
+  if (topTarget != drawnTop) {
+    if (faceStepLayer(true, topTarget, !sent)) {
       sent = true;
       eyesWaitFrames = 0;
     } else {
@@ -1126,11 +1435,11 @@ void renderSpriteFace() {
     }
   }
 
-  if (eyesFirst) stepSpriteMouth(mouthTarget, !sent);
+  if (eyesFirst) faceStepLayer(false, mouthTarget, !sent);
 }
 
 // Manda un rectangulo de una imagen paletizada (indices de 8 bits, w*h
-// seguidos) con el camino rapido de pushSpriteRect(). Lo usan la bienvenida y
+// seguidos) con el camino rapido de facePushRects(). Lo usan la bienvenida y
 // el aviso de seguridad, que comparten formato pero no paleta.
 void pushPalRect(const uint8_t *src, const uint16_t *pal, int16_t x, int16_t y, int16_t w, int16_t h) {
   if (w <= 0 || h <= 0) return;
@@ -1193,8 +1502,10 @@ void renderAviso() {
 // Prende/apaga el aviso, ya en el hilo de loop() (dueño del SPI).
 void consumePendingAviso() {
   uint8_t want = pendingAviso;
+  bool porTiempo = false;
   if (want == NO_PENDING_AVISO && avisoOn && millis() - avisoStartMs >= AVISO_MAX_MS) {
-    want = 0;  // Python no lo apago: se sigue adelante igual
+    want = 0;          // Python no lo apago: se sigue adelante igual
+    porTiempo = true;  // solo en ESTE caso se pinta la cara de respaldo
   }
   if (want == NO_PENDING_AVISO) return;
   pendingAviso = NO_PENDING_AVISO;
@@ -1206,7 +1517,13 @@ void consumePendingAviso() {
   } else if (!want && avisoOn) {
     avisoOn = false;
     // No se repinta nada aqui: lo que venga despues (bienvenida o menu) pinta
-    // la pantalla entera por su cuenta.
+    // la pantalla entera por su cuenta. Salvo si vencio por tiempo: Python no
+    // contesta y no va a llegar nada, asi que se deja la cara (y no el ultimo
+    // cuadro del aviso congelado), como hace la bienvenida.
+    if (porTiempo && !splashOn && !menuOn && !qrOn && !cardOn) {
+      currentPersona = 255;  // el aviso tapo la cara: repintarla entera
+      applyPersonaColors(overlayPersona);
+    }
   }
 }
 
@@ -1249,7 +1566,7 @@ void consumePendingSplash() {
   pendingSplash = NO_PENDING_SPLASH;
 
   if (want && !splashOn) {
-    if (currentPersona < FACE_PALETTES_COUNT) overlayPersona = currentPersona;
+    if (currentPersona < FACE_COUNT) overlayPersona = currentPersona;
     cardOn = false; // la bienvenida la tapa; al apagarse vuelve la cara
     showSplash();
   } else if (want && splashOn) {
@@ -1419,7 +1736,7 @@ void consumePendingMenu() {
 
   if (want < MENU_COUNT || want == MENU_NO_SEL) {
     if (splashOn) return;  // la bienvenida manda mientras esta en pantalla
-    if (!menuOn && currentPersona < FACE_PALETTES_COUNT) overlayPersona = currentPersona;
+    if (!menuOn && currentPersona < FACE_COUNT) overlayPersona = currentPersona;
     drawMenu(want, !menuOn);
   } else if (menuOn) {
     menuOn = false;
@@ -1443,7 +1760,7 @@ void consumePendingQr() {
   qrSize = qrSizePending;
   if (qrSize > 0) {
     if (splashOn || avisoOn) return;  // el aviso y la bienvenida mandan
-    if (!qrOn && currentPersona < FACE_PALETTES_COUNT) overlayPersona = currentPersona;
+    if (!qrOn && currentPersona < FACE_COUNT) overlayPersona = currentPersona;
     qrOn = true;
     drawQr();
   } else if (qrOn) {
@@ -1461,7 +1778,7 @@ void consumePendingCard() {
 
   if (want < CARD_COUNT) {
     if (splashOn) return; // con la bienvenida en pantalla no se tapa
-    if (!cardOn && currentPersona < FACE_PALETTES_COUNT) overlayPersona = currentPersona;
+    if (!cardOn && currentPersona < FACE_COUNT) overlayPersona = currentPersona;
     drawCard(want);
     cardOn = true;
   } else if (cardOn) {
@@ -1498,10 +1815,18 @@ void face_gesture(uint8_t encoded) {
   pendingEncoded = encoded; // escritura atomica de 1 byte; gana el ultimo gesto
 }
 
-// Llamada desde Python con Bridge.notify("mouth_level", 0..4) mientras suena
-// la voz. Misma regla que face_gesture(): solo anota el byte, loop() dibuja.
+// Llamada desde Python con Bridge.notify("viseme", 0..10) mientras suena la
+// voz (solo cuando cambia). Misma regla que face_gesture(): solo anota el
+// byte, loop() dibuja.
+void viseme(uint8_t v) {
+  mouthViseme = v < FACE_VISEMES ? v : FACE_MOUTH_REST;
+}
+
+// Lo de antes de los visemas: Bridge.notify("mouth_level", 0..4) con el
+// volumen. Se sigue aceptando (respaldo): el volumen elige una boca.
 void mouth_level(uint8_t level) {
-  mouthLevel = level;
+  static const uint8_t LEVEL_VISEME[] = { FACE_MOUTH_REST, FACE_VIS_CDG, FACE_VIS_CDG, FACE_VIS_AEI, FACE_VIS_O };
+  mouthViseme = LEVEL_VISEME[level < 4 ? level : 4];
 }
 
 // Llamada desde Python con Bridge.notify("arm_step", n), una por nota de la
@@ -1517,20 +1842,22 @@ void consumePendingGesture() {
   if (encoded == NO_PENDING) return;
   pendingEncoded = NO_PENDING;
 
-  const uint8_t personaId = encoded / GESTURE_COUNT;
-  const uint8_t gesture = encoded % GESTURE_COUNT;
+  uint8_t personaId = encoded / GESTURE_COUNT;
+  uint8_t gesture = encoded % GESTURE_COUNT;
+  if (personaId >= FACE_COUNT) personaId = 0; // id invalido: el guia por defecto
+  if (gesture > G_SAD) gesture = G_TALK;      // reservado: como TALK
 
-  // Con la bienvenida, una tarjeta o el menu en pantalla, el guia se anota y
-  // aparece al salir de ahi (los servos y lo demas siguen igual).
-  if (splashOn || cardOn || menuOn) overlayPersona = personaId < FACE_PALETTES_COUNT ? personaId : 0;
+  // Con el aviso, la bienvenida, una tarjeta, el menu o el QR en pantalla, el
+  // guia se anota y aparece al salir de ahi (los servos y lo demas siguen
+  // igual). applyPersonaColors() no repinta nada si el guia es el mismo: un
+  // cambio de emocion solo cambia lo que la cara apunta (faceGesture), y
+  // renderFace() lo lleva a pantalla con el redibujado parcial.
+  if (avisoOn || splashOn || cardOn || menuOn || qrOn) overlayPersona = personaId;
   else applyPersonaColors(personaId);
 
   talking = (gesture != G_REST);
-  if (!talking) mouthLevel = 0; // por si el ultimo "mouth_level" no fue 0
-  if (gesture == G_HAPPY || gesture == G_SURPRISE) {
-    triggerBlink();
-    browPulseUntil = millis() + BROW_PULSE_MS;
-  }
+  faceGesture = gesture;
+  if (!talking) mouthViseme = FACE_MOUTH_REST; // por si el ultimo visema no fue 0
   startServoFlourish(gesture);
 }
 
@@ -1577,10 +1904,9 @@ void setup() {
   consumePendingAviso();
 
   // GFXcanvas16 pide la RAM con malloc() y no avisa si falla: si algun canvas
-  // no se pudo crear, mejor saberlo por el monitor que ver media cara.
-  if (!eyeLCanvas.ready() || !eyeRCanvas.ready() || !browLCanvas.ready() ||
-      !browRCanvas.ready() || !mouthCanvas.ready()) {
-    Serial.println("[chat-bang] ERROR: no alcanzo la RAM para los canvas de la cara");
+  // no se pudo crear, mejor saberlo por el monitor que ver media pantalla.
+  if (!verCanvas.ready() || !wifiCanvas.ready() || !menuCanvas.ready()) {
+    Serial.println("[chat-bang] ERROR: no alcanzo la RAM para los canvas");
   }
 
   nextAutoBlinkMs = millis() + random(BLINK_IDLE_MIN_MS, BLINK_IDLE_MAX_MS);
@@ -1595,6 +1921,7 @@ void setup() {
   Bridge.begin();
   Bridge.provide_safe("face_gesture", face_gesture);
   Bridge.provide_safe("mouth_level", mouth_level);
+  Bridge.provide_safe("viseme", viseme);
   Bridge.provide_safe("arm_step", arm_step);
   Bridge.provide_safe("splash", splash);
   Bridge.provide_safe("card", card);
@@ -1619,6 +1946,9 @@ void loop() {
   // evento unico y se tiene que ver entero. Al terminar, repinta lo que hubiera.
   if (wifiSyncPending) {
     wifiSyncPending = false;
+    // El guia que esta en pantalla (overlayPersona solo se actualiza al
+    // abrir otra pantalla encima de la cara).
+    if (currentPersona < FACE_COUNT) overlayPersona = currentPersona;
     playWifiSync();
     currentPersona = 255;
     if (qrOn) drawQr();
@@ -1637,9 +1967,7 @@ void loop() {
   }
   consumeArmStep();
 
-  updateBlinkPhase();
   updateAutoBlink();
-  updateMouthTalk();
   updateServos();
 
   unsigned long now = millis();
@@ -1660,68 +1988,16 @@ void loop() {
     // el menu es fijo: solo se repinta cuando cambia la seleccion
   } else if (cardOn) {
     // la tarjeta es fija: no hay nada que animar
-  } else if (spriteFace) {
+  } else if (face && currentPersona < FACE_COUNT) {
     framePxLeft = FRAME_PX_BUDGET;
-    renderSpriteFace();
-  } else {
-    renderGeometricFace();
+    renderFace();
   }
+  // Si no, no hay cara valida en pantalla (recien salio la bienvenida y se
+  // espera el menu, por ejemplo): nada que animar hasta el proximo gesto.
 
   uint32_t frameUs = micros() - frameStartUs;
   if (frameUs > statsWorstFrameUs) statsWorstFrameUs = frameUs;
   statsFrames++;
 
   reportStats();
-}
-
-// La cara de siempre (rectangulos redondeados), para los guias sin PNG.
-void renderGeometricFace() {
-  // Presupuesto del frame. Lo que no entra no se pierde: la parte queda
-  // "sucia" (no se actualiza su lastDrawn*) y se manda en el frame siguiente.
-  framePxLeft = forceFullRedraw ? 0xFFFFFFFFu : FRAME_PX_BUDGET;
-
-  // La boca va primero: es la que se mueve todo el tiempo mientras habla, y
-  // es la que mas se nota si se atrasa.
-  int16_t mouthH = (int16_t)(mouthCurrentH + 0.5f);
-  if (mouthH != lastDrawnMouthH) {
-    ChangeBands b = bandsFor(MOUTH_REGION_H, lastDrawnMouthH, mouthH, MOUTH_R);
-    if (b.px(MOUTH_REGION_W) <= framePxLeft) {
-      framePxLeft -= b.px(MOUTH_REGION_W);
-      composeMouth(mouthH);
-      flushBands(mouthCanvas, b);
-      lastDrawnMouthH = mouthH;
-    }
-  }
-
-  // Los dos ojos se mandan juntos o ninguno, para que no queden desparejos.
-  int16_t eyeH = currentEyeHeight();
-  if (eyeH != lastDrawnEyeH) {
-    ChangeBands b = bandsFor(EYE_REGION_H, lastDrawnEyeH, eyeH, EYE_R);
-    const uint32_t cost = 2u * b.px(EYE_REGION_W);
-    if (cost <= framePxLeft) {
-      framePxLeft -= cost;
-      composeEye(eyeLCanvas, eyeH);
-      composeEye(eyeRCanvas, eyeH);
-      flushBands(eyeLCanvas, b);
-      flushBands(eyeRCanvas, b);
-      lastDrawnEyeH = eyeH;
-    }
-  }
-
-  // Las cejas cambian solo en el pulso de HAPPY/SURPRISE (2 veces por frase),
-  // asi que se manda la region entera; una por frame si no entran las dos.
-  int16_t browLift = (millis() < browPulseUntil) ? BROW_PULSE_LIFT_PX : 0;
-  if (browLift != lastDrawnBrowLift) {
-    const uint32_t one = (uint32_t)BROW_REGION_W * BROW_REGION_H;
-    if (2u * one <= framePxLeft) {
-      framePxLeft -= 2u * one;
-      composeBrow(browLCanvas, browLift);
-      composeBrow(browRCanvas, browLift);
-      browLCanvas.flush();
-      browRCanvas.flush();
-      lastDrawnBrowLift = browLift;
-    }
-  }
-
-  forceFullRedraw = false;
 }

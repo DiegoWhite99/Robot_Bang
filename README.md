@@ -7,30 +7,66 @@ hub USB-C alimentado — no hace falta ningún celular. Mientras responde, una
 carita animada en pantalla TFT mueve ojos y boca, y 2 microservos gesticulan
 sincronizados con ella.
 
+> **Versión 1.1.0** (2026-10-05): conversación fluida de verdad. La
+> **interrupción es nativa**: si el niño habla mientras el guía habla, el
+> guía se calla y escucha, sin palabras mágicas y sin interruptor que apagar.
+> Y el niño elige al empezar entre dos **modos de conversación**: **BANG**
+> (el guía acompaña su reto por las fases) y **CURIOSO** (charla libre, como
+> un asistente de voz: responde lo que le pregunten y obedece "ponte feliz",
+> "baila"), siempre con la personalidad de los guías. Además, **9 gestos
+> nuevos de brazos**: saludar, aplaudir, pensar, asentir, negar, bailar,
+> abrazar, dormir y estirarse. Ver `CHANGELOG.md`; el detalle técnico y el
+> checklist de pruebas en el robot están en `DOCUMENTACION.md` (§9.4, §10.6,
+> §12 y §20).
+
 ## Cómo funciona
 
 - **Backend** (`python/`): todo el turno de voz vive en la placa.
   - `voice.py` — oídos y boca: escucha por streaming con **Google Cloud
     Speech-to-Text** y habla con **Google Cloud Text-to-Speech** (una voz
     Chirp3-HD distinta por guía), con `espeak` como respaldo si Google TTS
-    falla. Usa el microfono/parlante USB vía `arduino.app_peripherals`.
-  - `brain.py` — personalidades y llamada al LLM (`arduino:cloud_llm`).
+    falla. Mueve la boca con **visemas** sacados del texto. Mientras el guía
+    habla escucha **localmente con Vosk**: si el niño dice cualquier cosa, el
+    guía se calla y escucha (interrupción nativa), y detecta los pedidos de
+    cambio de guía. Usa el micrófono/parlante USB vía
+    `arduino.app_peripherals`.
+  - `brain.py` — personalidades y llamada al LLM. Dos cerebros, elegibles
+    desde el dashboard (ver [Modos ESSENTIALS / PLUS](#modos-essentials--plus)):
+    **PLUS** = Gemini en la nube (`arduino:cloud_llm`) y **ESSENTIALS** =
+    modelo local en la placa (`arduino:llm`), que decide `llm_router.py`.
+  - `rag.py` + `knowledge/` — lo que el modelo local "sabe" de BANG y de
+    cada guía (búsqueda BM25, sin dependencias).
+  - `guardrails.py` — respuestas fijas de seguridad (¿eres un robot?, datos
+    privados, peligro, malestar) en los dos modos, y limpieza de la salida
+    del modelo local.
   - `bang.py` — la **metodología BANG** (traída de `bang-lite-ai`, repo
     PROYECTOS-IA-CUN-2026): el guía actúa como facilitador y acompaña tu reto
     por las fases **sólida** (formular la pregunta problema), **gaseosa**
     (ideas, con 3 tarjetas del mazo del guía) y **líquida** (prototipo y
     validación), sin darte soluciones y con máximo 2 preguntas por turno.
-  - `gestures.py` — detecta la emoción del texto y avisa al sketch.
+  - `curioso.py` — el **modo Curioso**: charla libre con la personalidad del
+    guía y órdenes cortas ("ponte feliz", "baila"), que se resuelven en la
+    placa sin llamar al modelo.
+  - `gestures.py` — detecta la emoción del texto (**16 gestos**: reposo,
+    hablar, feliz, sorpresa, enojo, frustración, triste, saludar, aplaudir,
+    pensar, asentir, negar, bailar, abrazar, dormir y estirarse) y avisa al
+    sketch, junto con los visemas.
   - `main.py` — el bucle completo: escuchar → preguntar al LLM → hablar →
     mover la carita; y difunde todo a la web para mostrarlo.
-- **Sketch** (`sketch/sketch.ino`): según el gesto que llega por el Router
-  Bridge, anima la carita en la pantalla TFT (colores por personaje en
-  `sketch/faces_colors.h`) y mueve los 2 microservos al mismo tiempo.
+- **Sketch** (`sketch/sketch.ino`): según el gesto y el visema que llegan por
+  el Router Bridge, anima la carita a color en la pantalla TFT (los SVG de
+  `assets/img/<guia>/`, convertidos por `tools/make_face_sprites.py`; para
+  regenerarlas:
+  `docker exec robot-bang-stable-main-1 python3 /app/tools/make_face_sprites.py`
+  y revisar `tools/<guia>_preview.png`) y mueve los 2 microservos al mismo
+  tiempo.
 - **Interfaz** (`assets/`): dashboard por **HTTPS local**
   (`https://<IP-DE-LA-PLACA>:7000`, certificado autofirmado de `certs/`: la
   primera vez el navegador avisa → "Avanzado" → continuar). Muestra los
   guías (los bloqueados con 🔒), lo que el robot escucha y responde, el panel
-  **Reto BANG** y un botón **💻 TERMINAL** con comandos.
+  **Reto BANG** (con los aportes y la marca de interrumpido), los selectores
+  **🧠 CEREBRO** y **🎛 MODO (BANG / CURIOSO)**, el estado de la escucha
+  activa y un botón **💻 TERMINAL** con comandos.
 
 ## Terminal del dashboard
 
@@ -43,18 +79,106 @@ la terminal (botón 💻 TERMINAL, o la tecla `` ` ``); el estado se guarda en
 | `/unlock_carmel`, `/unlock_cesia`, `/unlock_cori`, `/unlock_cristal` | desbloquea ese guía |
 | `/unlock_all` · `/lock_all` | todos · solo Crispi |
 | `/lock_<guia>` | vuelve a bloquearlo (Crispi no se bloquea) |
-| `/status` | guías desbloqueados, guía activo y por dónde sale el audio |
+| `/status` | cerebro, guías desbloqueados, guía activo y por dónde sale el audio |
+| `/modo plus` · `/modo essentials` | Gemini en la nube · modelo local en la placa |
+| `/modo_chat bang` · `/modo_chat curioso` | modo de conversación: acompañar un reto · charla libre |
+| `/elegir_modo` | vuelve a preguntarle al niño por voz qué modo quiere |
+| `/barge` | estado de la escucha activa (es nativa: no se apaga) |
+| `/interrumpir <texto>` | simula una interrupción para probar sin niño (`/interrumpir cori se me ocurrió algo`) |
 | `/bt` | estado de la bocina Bluetooth |
 | `/add_bt` | busca equipos Bluetooth (10 s) y los lista numerados |
 | `/bt_list` | lista los equipos conocidos, sin buscar |
 | `/bt_connect <n>` · `/bt_disconnect <n>` | conecta (o empareja) · desconecta el equipo `n` de la lista |
 | `/bt_mode headset` · `/bt_mode music` | mic **y** voz por la bocina (calidad llamada) · solo voz, alta calidad (mic USB) |
 | `/test_audio` | pitido de prueba |
+| `/cara <guia>` | muestra la cara de un guía y la hace "hablar" 3 s |
 | `/reset` | borra el reto en curso |
 | `/help` · `/clear` | ayuda · limpiar |
 
 Tolera errores de tipeo (`/unlock_carmerl` → Carmel). Tab autocompleta y
-↑/↓ recorre el historial.
+↑/↓ recorre el historial. `/help` lista el resto (`/menu`, `/menu_guias`,
+`/aviso`, `/arranque`, `/wifi`, `/qr`, `/tarjeta`, `/bienvenida`...); la
+tabla completa está en `DOCUMENTACION.md` §15.
+
+## Modos ESSENTIALS / PLUS
+
+Arriba del dashboard está el selector **🧠 CEREBRO: 💾 ESSENTIALS / ☁️ PLUS**
+(pide confirmar; también `/modo` en la terminal). El modo se guarda en la
+placa (`data/llm_mode.txt`).
+
+- **PLUS** (por defecto): Gemini en la nube, rápido (~1-3 s). Si Gemini
+  falla (sin `API_KEY`, sin cuota, 503), ese turno lo contesta el modelo
+  local automáticamente y se avisa en el panel de diagnóstico.
+- **ESSENTIALS**: el modelo local `llamacpp:Qwen3.5-0.8B-Q4_0`, sin Gemini.
+  Es más lento (del orden de 10-20 s por turno) y más simple: una sola
+  llamada por turno, prompts cortos con una pista sacada de `knowledge/`, y
+  la fase sólida, las tarjetas y el resumen de ideas los resuelve Python con
+  plantillas. Mientras piensa, el guía dice una frase corta ("déjame
+  pensarlo un momento..."). **La voz sigue usando internet** (Speech-to-Text
+  y Text-to-Speech de Google).
+- Al interrumpir para aportar una idea, ESSENTIALS contesta con una
+  plantilla ("¡Listo, agregado!...", sin modelo) y PLUS con una sola llamada
+  a Gemini. El saludo al cambiar de guía es plantilla en los dos.
+- El modelo local corre en un contenedor aparte (`llamacpp-models-runner`),
+  reserva hasta ~2,5 GB de RAM y queda encendido también en PLUS.
+- Para editar lo que sabe el modelo local: `knowledge/` (ver su `README.md`
+  y `DOCUMENTACION.md` §9.2). Los guardarraíles de seguridad están en
+  `python/guardrails.py` (`DOCUMENTACION.md` §9.3).
+
+## Modos de conversación: BANG y Curioso
+
+Al empezar, el robot pregunta en voz alta **"¿BANG o Curioso?"** y el niño
+contesta hablando:
+
+- **BANG** — el guía lo acompaña a convertir su reto en ideas, por las fases
+  sólida, gaseosa y líquida, con tarjetas y aportes. Es el de siempre.
+- **CURIOSO** — charla libre, como un asistente de voz, pero con la
+  personalidad del guía: responde lo que le pregunten ("¿por qué llueve?") y
+  obedece órdenes cortas — **"ponte feliz"**, "ponte triste", "ponte
+  enojado", "sorpréndete", "ponte normal", **"baila"**, "canta",
+  **"salúdame"**, "aplaude", "piensa", "di que sí", "di que no", "muévete",
+  **"abrázame"**, "duérmete", "estírate". Las órdenes cambian la cara y los
+  brazos **al instante**, sin pasar por el modelo.
+
+Se puede cambiar cuando se quiera diciendo **"modo curioso"** o **"modo
+bang"**, con el selector **🎛 MODO** del dashboard o con `/modo_chat`. El
+reto en curso **no se borra** al cambiar: sigue ahí al volver a BANG. Los
+guardarraíles de seguridad son los mismos en los dos modos.
+
+## Escucha activa: el guía se calla cuando hablas
+
+Es **nativa**: no se prende ni se apaga. Mientras un guía habla, el robot
+escucha **en la placa** con Vosk (sin costo de API):
+
+- **Si el niño habla, el guía se calla y escucha**, diga lo que diga y sin
+  contestarle encima. Tarda ~1 s (lo que Vosk necesita para entender dos
+  palabras que no sean eco del propio robot).
+- **"¡Cori, se me ocurrió algo!"**, "espera", "un momento", "tengo una idea"
+  o solo el nombre → además dice **"¡Dime!"** y guarda la idea en el reto
+  (panel **Reto BANG → ✋ Aportes**; en la fase gaseosa cuenta como idea). Si
+  al final no aporta nada ("no, nada"), no se guarda nada.
+- **"pásame con Cesia"** mientras habla otro guía → cambia de guía directo.
+- Se puede interrumpir **siempre**, también la respuesta a un aporte y la
+  pregunta de qué modo quiere (antes se dejaba de escuchar a partir de la
+  segunda interrupción seguida).
+- Con la **bocina Bluetooth** como salida hace falta una palabra más para
+  cortar (hay mucho más eco) y la voz tarda un poco más en callarse (~200 ms
+  o más). `/barge` dice cuántas palabras hacen falta ahora mismo.
+- El modelo de Vosk (`vosk-model-small-es-0.42`, ~40 MB) se baja solo a
+  `models/vosk-es/` (no versionado) con `tools/install_vosk_model.py`. Si
+  falta, el robot sigue funcionando **pero ya no se puede interrumpir**: lo
+  avisa en el log, en el dashboard y en `/status`.
+
+## Cambiar de guía
+
+Di **"quiero hablar con Cori"**, "pásame con/a Cristal", "cámbiame a Crispi",
+"ahora con Carmel", "que hable Cesia", "llama a Cori" o "habla con Cristal",
+en un turno normal o mientras otro guía habla. El nuevo guía aparece en
+pantalla, saluda ("¡Hola, soy Cori! Cesia me contó tu reto: «...»") y
+**sigue tu reto donde iba**: misma fase, pregunta, ideas y aportes (en la
+gaseosa trae sus propias tarjetas). "Por favor" o "gracias" después del
+nombre no cuentan como turno. Si el guía pedido está bloqueado, el que ya
+estaba te avisa y sigue contigo.
 
 ## Bocina Bluetooth
 
@@ -110,16 +234,18 @@ La bocina `RF-66678` ya está emparejada: basta con prenderla.
 
 **Dos credenciales**, ambas de Google, para dos cosas distintas:
 
-1. **`API_KEY` de Gemini** (para `arduino:cloud_llm`, el modelo de lenguaje).
-   Sale de <https://aistudio.google.com/apikey>. Se declara en
-   `app.yaml` → `bricks: arduino:cloud_llm: variables: API_KEY: ...`.
+1. **`API_KEY` de Gemini** (para `arduino:cloud_llm`, el modelo de lenguaje
+   del modo PLUS). Sale de <https://aistudio.google.com/apikey> y se pone
+   desde **App Lab → Bricks → Cloud LLM → `API_KEY`** (Brick Configuration).
+   **`app.yaml` no se versiona** (`.gitignore`): el repositorio trae
+   `app.yaml.example`; en una placa nueva, `cp app.yaml.example app.yaml` y
+   poner la clave desde App Lab. Nunca pegarla en el código ni en un commit.
+   El modo ESSENTIALS no la necesita: usa `arduino:llm` con
+   `model: llamacpp:Qwen3.5-0.8B-Q4_0`, también declarado en `app.yaml`.
 
-   > ⚠️ **Pendiente:** hoy está en texto plano en `app.yaml` (igual que en
-   > `robot-bang` y `robot-bang-2`) porque no encontramos forma de fijar
-   > variables de Brick Configuration desde la terminal — solo desde la GUI
-   > de **App Lab**. Si abres App Lab, muévela a Brick Configuration ahí y
-   > bórrala de `app.yaml`. Como estuvo expuesta, conviene además **rotarla**
-   > en el mismo enlace de arriba.
+   > ⚠️ Nunca subas `app.yaml` con la clave. Si una clave llega a un commit
+   > publicado, **rótala** en el mismo enlace de arriba. (Revisado el
+   > 2026-10-02: el historial actual de GitHub no contiene ninguna.)
 
 2. **`google-credentials.json`** (service account de Google Cloud, para
    Speech-to-Text y Text-to-Speech). Va suelto en la **raíz de esta App**
@@ -133,20 +259,27 @@ La bocina `RF-66678` ya está emparejada: basta con prenderla.
 
 1. Conecta el headset USB al hub alimentado, y el hub a la placa.
 2. Arranca la App desde Arduino App Lab (o `arduino-app-cli app start`).
-3. Di **"Crispi"** en voz alta cerca del micrófono, seguido de tu reto (o
+3. Contesta la pregunta del arranque: **"BANG"** (acompañar un reto) o
+   **"Curioso"** (charlar libre). Si prefieres, di directamente el nombre de
+   un guía y se queda el modo que estuviera.
+4. Di **"Crispi"** en voz alta cerca del micrófono, seguido de tu reto (o
    **"Robot, ..."**). Los demás guías responden solo si están desbloqueados
    (ver Terminal).
-4. El robot responde hablando por el headset, mientras la carita TFT y los
+5. El robot responde hablando por el headset, mientras la carita TFT y los
    servos gesticulan. Durante los 7 s siguientes le puedes contestar sin
-   repetir su nombre; después, otra vez con "Crispi" (o "robot").
-5. Comandos de voz durante el reto:
+   repetir su nombre; después, otra vez con "Crispi" (o "robot"). **Mientras
+   habla puedes hablarle sin más: se calla y te escucha**, y también puedes
+   pedir otro guía ("pásame con Cori") o cambiar de modo ("modo curioso").
+6. Comandos de voz durante el reto (modo BANG):
    - **"saca una tarjeta"** — en la fase gaseosa, voltea una de las 3
      tarjetas de la ronda y el guía te ayuda a aplicarla.
    - **"siguiente fase"** — pasa de fase sin esperar a que el guía la cierre.
    - **"nuevo reto"** — empieza de cero.
    Al pasar de fase, el robot celebra con una cancioncita y un baile de
    brazos (idea del tutorial de Diome-chan).
-6. Abre `https://<IP-DE-LA-PLACA>:7000` en cualquier navegador de la misma
+7. En **modo Curioso**, en vez de los comandos del reto: pregúntale lo que
+   quieras y pídele cosas ("ponte feliz", "ponte triste", "baila").
+8. Abre `https://<IP-DE-LA-PLACA>:7000` en cualquier navegador de la misma
    red para ver el dashboard y usar la terminal.
 
 ## Conexión de los 2 microservos SG90
@@ -206,18 +339,39 @@ sin problema alimentándose a 5 V.
 
 ## Gestos
 
-| Gesto | Cuándo | Movimiento |
-|---|---|---|
-| `TALK` | siempre que el guía habla | vaivén corto (80°-100°) en bucle |
-| `HAPPY` | felicidad / entusiasmo | barrido amplio (45°-145°) ×2, luego habla |
-| `SURPRISE` | sorpresa | respingo seco a 160°, luego habla |
-| `REST` | termina la voz | vuelve a 90° y se suelta (no zumba) |
+| Gesto | Cuándo (por el texto de la respuesta) | Cara | Brazos |
+|---|---|---|---|
+| `TALK` | siempre que el guía habla | neutra + visemas | vaivén corto (80°-100°) |
+| `HAPPY` | "genial", "excelente", "qué bueno"... (y al pasar de fase) | feliz | manos arriba |
+| `SURPRISE` | "wow", "increíble", "no me lo esperaba"... | sorpresa | arriba, bajan un poco y vibran |
+| `ANGRY` | un "grrr" juguetón **contra el problema** | enojada | arriba/abajo rápido y errático (~1,2 s) |
+| `FRUSTRATED` | "uff", "qué difícil", "me cuesta"... | ojos entrecerrados + boca "F" | sube lento, baja a la mitad, pausa, baja |
+| `SAD` | "lo siento", "qué pena", "triste"... | triste | brazos caídos |
+| `REST` | termina la voz | neutra, parpadea | vuelve a 90° y se suelta (no zumba) |
 
-La emoción se detecta del texto de la respuesta (signos de exclamación y
-palabras clave), sin pedirle nada extra al modelo. La carita en pantalla y
-los 2 servos se mueven exactamente mientras el robot habla: como ahora
-Python controla el parlante, sabe con precisión cuándo empieza y termina la
-voz (antes dependía de que el navegador avisara).
+La emoción se detecta del texto (palabras clave y signos de exclamación),
+sin pedirle nada extra al modelo. El enojo nunca va contra el niño: se anula
+si cerca aparece "tú", un verbo en segunda persona o una pregunta, y sale
+como mucho una vez cada 4 respuestas. La carita y los servos se mueven
+exactamente mientras el robot habla, porque Python controla el parlante.
+
+**Calibrar los brazos** (hay que hacerlo una vez en cada robot): en
+`sketch/sketch.ino`, bloque de servos, `ARM1_DIR` / `ARM2_DIR` (+1 o -1:
+si con HAPPY un brazo baja, cambiarle el signo; casi seguro `ARM2_DIR = -1`)
+y `ARM_MIN` / `ARM_MAX` (topes en grados, si un brazo pega contra el
+cuerpo). Luego `arduino-app-cli app restart`. Paso a paso en
+`DOCUMENTACION.md` §13.4.
+
+## Pruebas
+
+- Sin hardware, en cualquier momento:
+  `docker exec robot-bang-stable-main-1 /app/.cache/.venv/bin/python /app/tools/test_barge_in.py`
+  (agregar `--vosk` para probar el reconocedor real) y
+  `docker exec -w /app/python robot-bang-stable-main-1 /app/.cache/.venv/bin/python gestures.py`.
+  Deben terminar en `todo bien`.
+- En el robot, después de `arduino-app-cli app restart`: el checklist de
+  `DOCUMENTACION.md` §20 (caras, servos, ESSENTIALS, escucha activa, cambio
+  de guía, seguridad). Las limitaciones conocidas están en §18.5.
 
 ## Voces por guía
 

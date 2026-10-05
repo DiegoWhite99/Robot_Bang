@@ -547,3 +547,52 @@ legend {
   color: #555;
   font-style: italic;
 }
+
+/* --- Selector de cerebro: ESSENTIALS (local) / PLUS (Gemini) --- */
+
+.mode-switch {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 8px 8px 0;
+  padding: 6px;
+  background: #d4d0c8;
+  border: 2px groove var(--face-shadow-dark);
+}
+
+.mode-title {
+  font-weight: bold;
+  font-size: 12px;
+}
+
+.mode-buttons {
+  display: flex;
+  gap: 4px;
+}
+
+.mode-btn {
+  font-size: 12px;
+  padding: 3px 8px;
+}
+
+/* El modo activo queda "hundido", como un boton de Windows 95 pulsado. */
+.mode-btn.active {
+  background: #000080;
+  color: #fff;
+  box-shadow: inset 2px 2px 0 var(--face-shadow-darker), inset -2px -2px 0 var(--face-shadow-light);
+}
+
+.mode-note {
+  flex-basis: 100%;
+  font-size: 11px;
+  font-style: italic;
+  color: #333;
+}
+
+.mode-note.local {
+  background: #ffffcc;
+  border: 1px solid #808080;
+  padding: 2px 4px;
+  font-style: normal;
+}

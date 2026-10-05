@@ -13,6 +13,10 @@
 # Por ahora solo Crispi arranca desbloqueado; los demas se desbloquean desde
 # la terminal (ver guides.py).
 #
+# El "cerebro" tiene dos modos (llm_router.py): PLUS = Gemini en la nube y
+# ESSENTIALS = modelo local en la placa, con RAG sobre knowledge/ (rag.py).
+# Se elige desde el dashboard (boton ESSENTIALS / PLUS) o con /modo.
+#
 # Las personalidades y la llamada al LLM viven en brain.py; la metodologia
 # BANG (fases solida/gaseosa/liquida, tarjetas, ideas) en bang.py; los gestos
 # de la carita en gestures.py, para poder probarlos sin arrancar la App entera.
@@ -34,8 +38,11 @@ from arduino.app_utils import App
 import bang
 import brain
 import bt
+import curioso
 import gestures
+import guardrails
 import guides
+import llm_router
 import voice
 import wifinet
 
@@ -51,6 +58,12 @@ ui = WebUI(use_tls=True)
 
 _current_persona = None
 _follow_up = None  # guia al que se le puede contestar sin decir su nombre
+# Despues de una interrupcion (escucha activa): lo proximo que diga el niño a
+# este guia es un APORTE para su reto (bang.contribute), no un turno normal.
+# Solo en modo BANG; en Curioso una interrupcion es un turno mas.
+# {"persona", "spoken", "depth", "at", "oido"}
+_awaiting_aporte = None
+APORTE_WAIT_S = 20.0  # pasado esto, lo que diga ya es un turno normal
 
 
 def _broadcast_status(text):
@@ -71,6 +84,8 @@ voice.set_debug_reporter(_broadcast_debug)
 voice.set_mouth_reporter(gestures.send_mouth)
 # Y los brazos bailan nota por nota con la melodia de celebracion.
 voice.set_arm_reporter(gestures.send_arm_step)
+# Los respaldos de Gemini al modelo local (y sus fallos) se ven en el panel.
+llm_router.set_reporter(_broadcast_debug)
 
 AUTO_WAKE = ("robot", "bang")
 
@@ -90,10 +105,18 @@ def _personas_payload():
     }
 
 
+def _llm_mode_payload():
+    m = llm_router.mode()
+    return {"mode": m, "label": llm_router.MODE_LABELS[m], "modes": list(llm_router.MODES)}
+
+
 def on_ui_connect(sid):
     ui.send_message("version", {"version": APP_VERSION, "notice": VERSION_NOTICE}, sid)
+    ui.send_message("llm_mode", _llm_mode_payload(), sid)
     ui.send_message("personas", _personas_payload(), sid)
     ui.send_message("active_persona", {"key": _current_persona}, sid)
+    ui.send_message("chat_mode", _chat_mode_payload(), sid)
+    ui.send_message("escucha", _escucha_payload(), sid)
     _broadcast_bang(_current_persona, sid)
 
 
@@ -105,6 +128,14 @@ ui.on_connect(on_ui_connect)
 _HELP = """Comandos:
   /help                 esta ayuda
   /status               guias desbloqueados, guia activo y salida de audio
+  /modo [plus|essentials]  cerebro del robot: plus = Gemini en la nube;
+                        essentials = modelo local (más lento, sin Gemini;
+                        la voz sigue usando internet)
+  /modo_chat [bang|curioso]  cómo conversa el robot: bang = acompaña el reto
+                        por sus fases; curioso = charla libre, responde lo que
+                        le pregunten y obedece "ponte feliz", "baila"...
+                        Por voz: "modo curioso" / "modo bang"
+  /elegir_modo          vuelve a preguntar por voz cuál de los dos modos
   /unlock_<guia>        desbloquea un guia (carmel, cesia, cori, cristal)
   /unlock_all           desbloquea todos
   /lock_<guia>          vuelve a bloquear un guia (Crispi no se bloquea)
@@ -117,6 +148,12 @@ _HELP = """Comandos:
   /bt_audio <n>         la bocina n de la lista es la que habla (si hay varias)
   /bt_mode [headset|music]  headset = mic y voz por la bocina (calidad llamada)
                         music = solo voz por la bocina, en alta calidad
+  /barge                estado de la escucha activa (siempre encendida: si el
+                        niño habla, el guía se calla y escucha). Local (Vosk),
+                        sin costo de API
+  /interrumpir <texto>  simula una interrupción (p. ej. /interrumpir cori se
+                        me ocurrió algo); si nadie habla, se dispara con la
+                        próxima respuesta
   /test_audio           pitido de prueba por la salida actual
   /cara <guia>          muestra la cara de un guia en la pantalla y la hace
                         "hablar" 3 s (para probarla sin microfono)
@@ -175,7 +212,117 @@ def _status():
     active = brain.PERSONAS[_current_persona]["name"] if _current_persona else "ninguno"
     s = bang.session(_current_persona) if _current_persona else None
     reto = f"{bang.PHASE_LABELS[s.phase]} — {s.reto}" if s and s.reto else "sin reto"
-    return f"Chat BANG v{APP_VERSION}\nDesbloqueados: {unlocked}\nActivo: {active} ({reto})\nVoz: {voice.output_name()}\nMicrófono: {voice.input_name()}"
+    cerebro = llm_router.MODE_LABELS[llm_router.mode()]
+    bs = voice.barge_status()
+    escucha = "lista" if bs["lista"] else f"NO disponible ({bs['vosk']})"
+    modo = curioso.MODE_NAMES[curioso.mode()]
+    reto = reto if not curioso.is_curioso() else "charla libre (modo Curioso)"
+    return (
+        f"Chat BANG v{APP_VERSION}\nModo: {modo}\nCerebro: {cerebro}\nDesbloqueados: {unlocked}\n"
+        f"Activo: {active} ({reto})\nVoz: {voice.output_name()}\nMicrófono: {voice.input_name()}\n"
+        f"Escucha activa: nativa, siempre encendida — {escucha} (Vosk: {bs['vosk']})"
+    )
+
+
+# La escucha activa ya no se prende ni se apaga: es parte de como conversa el
+# robot (ver voice.py). Lo unico que se muestra es si Vosk esta listo.
+_VOSK_LABELS = {
+    "listo": "lista: si hablas mientras el guía habla, se calla y te escucha",
+    "cargando": "cargando el modelo (unos segundos)...",
+    "sin vosk": "⚠ falta el paquete vosk: revisa python/requirements.txt",
+    "sin modelo": "⚠ no hay modelo Vosk: corre tools/install_vosk_model.py",
+    "error": "⚠ Vosk no cargó: revisa los logs",
+}
+
+
+def _escucha_payload():
+    bs = voice.barge_status()
+    return {"vosk": bs["vosk"], "lista": bs["lista"], "minimo": bs["minimo"],
+            "label": _VOSK_LABELS.get(bs["vosk"], f"⚠ Vosk: {bs['vosk']}")}
+
+
+def _barge_cmd(arg):
+    bs = voice.barge_status()
+    nota = _VOSK_LABELS.get(bs["vosk"], f"⚠ Vosk: {bs['vosk']}")
+    salida = "bocina Bluetooth" if voice.bluetooth_status()["sink"] else "headset USB"
+    return (
+        f"✋ Escucha activa NATIVA (no se apaga): {nota}\n"
+        f"Con {salida} hacen falta {bs['minimo']} palabras nuevas para callar al guía.\n"
+        "Para probarla sin micrófono: /interrumpir <texto>"
+    )
+
+
+# --- Modo de conversacion: BANG o Curioso ------------------------------------
+
+
+def _chat_mode_payload():
+    m = curioso.mode()
+    return {"mode": m, "name": curioso.MODE_NAMES[m], "label": curioso.MODE_LABELS[m], "modes": list(curioso.MODES)}
+
+
+_MODO_DICHO = {
+    "bang": "¡Listo! Modo BANG: te acompaño a convertir tu reto en ideas. Elige un guía y cuéntame tu reto.",
+    "curioso": "¡Listo! Modo Curioso: pregúntame lo que quieras, o pídeme cosas como ponerme feliz o bailar.",
+}
+
+
+def _set_chat_mode(arg, hablado=False, voz=None):
+    """Cambia el modo de conversacion (lo usan /modo_chat, el dashboard y la
+    voz). Los retos en curso NO se borran: si se vuelve a BANG, siguen ahi.
+
+    hablado: ademas lo dice en voz alta (con `voz`, o la presentadora)."""
+    arg = (arg or "").strip()
+    if not arg:
+        return f"Modo actual: {curioso.MODE_LABELS[curioso.mode()]}. Uso: /modo_chat bang o /modo_chat curioso"
+    try:
+        m = curioso.set_mode(arg)
+    except ValueError as exc:
+        return f"⚠ {exc}"
+    ui.send_message("chat_mode", _chat_mode_payload())
+    _broadcast_debug(f"🎛 modo {curioso.MODE_NAMES[m]}")
+    if hablado:
+        texto = _MODO_DICHO[m]
+        persona = voz or WELCOME_VOICE
+        ui.send_message("reply", {"persona": persona, "text": texto})
+        gestures.send(gestures.HAPPY, persona if persona in brain.PERSONAS else guides.ALWAYS_UNLOCKED)
+        voice.say(persona, texto)
+        gestures.send(gestures.REST, persona if persona in brain.PERSONAS else guides.ALWAYS_UNLOCKED)
+    return f"🎛 {curioso.MODE_LABELS[m]}"
+
+
+def _interrumpir_cmd(arg):
+    if not arg.strip():
+        return "Uso: /interrumpir <texto>, p. ej. /interrumpir cori se me ocurrió algo"
+    what, trig = voice.inject_barge(arg)
+    if what == "now":
+        return f"✋ interrumpido: {trig['kind']} → {trig['persona']}"
+    if what == "armed":
+        return "✋ nadie está hablando: la interrupción se dispara en la próxima respuesta de un guía"
+    return "No reconocí una interrupción en ese texto (usa un nombre de guía o 'se me ocurrió algo', 'pásame con...')"
+
+
+def _set_llm_mode(arg):
+    """Cambia el cerebro (lo usan /modo y el boton del dashboard).
+
+    Los retos en curso se conservan; solo se borran las memorias de chat,
+    porque el historial de un cerebro no le sirve al otro.
+    """
+    arg = (arg or "").strip()
+    if not arg:
+        return f"Cerebro actual: {llm_router.MODE_LABELS[llm_router.mode()]}. Uso: /modo plus o /modo essentials"
+    before = llm_router.mode()
+    try:
+        m = llm_router.set_mode(arg)
+    except ValueError as exc:
+        return f"⚠ {exc}"
+    if m != before:
+        brain.clear_all()
+    ui.send_message("llm_mode", _llm_mode_payload())
+    if m == "essentials":
+        _broadcast_debug("🧠 modo ESSENTIALS: modelo local (cargándolo en segundo plano, ~20 s)")
+        return "🧠 ESSENTIALS: modelo local en la placa (más lento, sin Gemini). La voz sigue usando internet."
+    _broadcast_debug("☁️ modo PLUS: Gemini en la nube (si falla, contesta el modelo local)")
+    return "☁️ PLUS: Gemini en la nube. Si Gemini falla, ese turno lo contesta el modelo local."
 
 
 def _bt():
@@ -270,6 +417,13 @@ def run_command(line):
         return _HELP
     if cmd == "status":
         return _status()
+    if cmd == "modo":
+        return _set_llm_mode(line.split(maxsplit=1)[1] if len(line.split()) > 1 else "")
+    if cmd == "modo_chat":
+        return _set_chat_mode(line.split(maxsplit=1)[1] if len(line.split()) > 1 else "")
+    if cmd == "elegir_modo":
+        threading.Thread(target=_elegir_modo, daemon=True, name="modo").start()
+        return "🎛 preguntando por voz: BANG o Curioso"
     if cmd == "bt":
         return _bt()
     arg = line.split(maxsplit=1)[1] if len(line.split()) > 1 else ""
@@ -290,6 +444,10 @@ def run_command(line):
         return f"🔊 La voz va a salir por {name} (cuando esté conectada)"
     if cmd == "bt_mode":
         return _bt_mode(arg)
+    if cmd == "barge":
+        return _barge_cmd(arg)
+    if cmd == "interrumpir":
+        return _interrumpir_cmd(arg)
     if cmd == "test_audio":
         voice.ack()
         return f"🔊 pitido por {voice.output_name()}"
@@ -384,6 +542,40 @@ def on_terminal(sid, data):
 
 
 ui.on_message("terminal", on_terminal)
+
+
+# --- Boton ESSENTIALS / PLUS del dashboard ----------------------------------
+# La web manda {"mode": "plus"|"essentials"} (o {} para solo consultar); el
+# estado vuelve como 'llm_mode_response' al que pregunto y como 'llm_mode' a
+# todas las pestanas abiertas.
+
+
+def on_llm_mode(sid, data):
+    data = data if isinstance(data, dict) else {}
+    message = _set_llm_mode(data.get("mode", "")) if data.get("mode") else ""
+    return dict(_llm_mode_payload(), message=message)
+
+
+ui.on_message("llm_mode", on_llm_mode)
+
+
+# Estado de la escucha activa: solo se consulta (es nativa, no se apaga).
+def on_escucha(sid, data):
+    return dict(_escucha_payload(), message=_barge_cmd(""))
+
+
+ui.on_message("escucha", on_escucha)
+
+
+# Selector BANG / CURIOSO del dashboard: {"mode": "bang"|"curioso"} (o {} para
+# consultar). Vuelve como 'chat_mode_response' y 'chat_mode'.
+def on_chat_mode(sid, data):
+    data = data if isinstance(data, dict) else {}
+    message = _set_chat_mode(data.get("mode", "")) if data.get("mode") else ""
+    return dict(_chat_mode_payload(), message=message)
+
+
+ui.on_message("chat_mode", on_chat_mode)
 
 
 # --- Boton de Bluetooth del dashboard ---------------------------------------
@@ -519,7 +711,8 @@ ui.on_message("wifi", on_wifi)
 
 # El primer chat con Gemini cuesta ~25 s y los siguientes ~1 s, asi que lo
 # pagamos aqui, en segundo plano, mientras nadie esta preguntando todavia.
-# Lo mismo con los canales de STT/TTS de Google.
+# En Essentials lo que se paga es la carga del modelo local (~22 s): ver
+# brain.warmup(). Lo mismo con los canales de STT/TTS de Google.
 threading.Thread(target=brain.warmup, daemon=True).start()
 threading.Thread(target=voice.warmup, daemon=True).start()
 
@@ -578,6 +771,62 @@ def _show_menu():
     time.sleep(0.2)
     gestures.send_menu_idle()  # ninguno resaltado: no hay nada que pulsar
     _broadcast_status("🎤 di el nombre de un guía en voz alta")
+
+
+# Paso 4 del arranque: el niño elige COMO quiere conversar. Se pregunta por
+# voz (no hay botones en el robot) y se acepta tambien por el dashboard.
+MODO_WAIT_S = 40.0  # cuanto se espera la respuesta
+_MODO_FOLLOW = "__modo__"  # clave falsa: listen_turn() devuelve con esto lo que se oiga
+_MODO_PREGUNTA = (
+    "Antes de empezar, dime cómo quieres que hablemos. Si dices BANG, te acompaño paso a paso a "
+    "convertir tu reto en ideas, con mis cinco guías. Si dices CURIOSO, charlamos libre: me preguntas "
+    "lo que quieras y hasta puedes pedirme que me ponga feliz o que baile. ¿BANG o Curioso?"
+)
+_MODO_REPITE = "No te escuché bien. Dime BANG, o dime Curioso."
+_modo_lock = threading.Lock()
+_pending_turn = None  # (wake, texto) que ya se oyo y loop() tiene que atender
+
+
+def _elegir_modo(intentos=2):
+    """Pregunta por voz BANG o Curioso y deja el modo elegido.
+
+    Devuelve True si el niño, en vez del modo, dijo el nombre de un guía: ahí
+    el modo se queda como estaba y ese turno pasa a loop() por _pending_turn
+    (no se pierde lo que dijo).
+    """
+    global _pending_turn
+    if not _modo_lock.acquire(blocking=False):
+        return False  # ya se está preguntando
+    try:
+        for intento in range(intentos):
+            texto = _MODO_PREGUNTA if intento == 0 else _MODO_REPITE
+            _broadcast_status("🎛 ¿BANG o Curioso? dilo en voz alta")
+            ui.send_message("reply", {"persona": WELCOME_VOICE, "text": texto})
+            gestures.send(gestures.TALK, guides.ALWAYS_UNLOCKED)
+            # La pregunta también se puede interrumpir: si el niño contesta
+            # antes de que termine, lo que oyó Vosk sirve de respuesta.
+            res = voice.say(WELCOME_VOICE, texto, barge=voice.make_barge(WELCOME_VOICE, tuple(brain.PERSONAS)))
+            gestures.send(gestures.REST, guides.ALWAYS_UNLOCKED)
+            wake, text = voice.listen_turn(
+                list(brain.PERSONAS) + list(AUTO_WAKE), follow_up=_MODO_FOLLOW,
+                follow_up_s=MODO_WAIT_S, name_only=tuple(brain.PERSONAS) + AUTO_WAKE,
+            )
+            if wake in brain.PERSONAS:
+                _pending_turn = (wake, text or "")
+                _broadcast_debug(f"🎛 eligió guía sin elegir modo: sigo en {curioso.MODE_NAMES[curioso.mode()]}")
+                return True
+            dicho = f"{wake if wake in AUTO_WAKE else ''} {text or ''}".strip()
+            if not dicho:
+                # No alcanzó a entrar al STT, pero la escucha activa sí lo oyó.
+                dicho = ((res.get("trigger") or {}).get("text") or "").strip()
+            m = curioso.find_mode(dicho, bare=True)
+            if m:
+                _set_chat_mode(m, hablado=True)
+                return False
+        _set_chat_mode(curioso.mode(), hablado=True)
+        return False
+    finally:
+        _modo_lock.release()
 
 
 def _show_aviso():
@@ -678,8 +927,9 @@ def _boot_sequence():
         1. ADVERTENCIA   aviso de seguridad (lo primero que se ve)
         2. BANG          bienvenida con la presentadora
         3. RED           solo si no hay internet: QR + panel de red
-        4. MENU          los 5 guias, para elegir por voz
-        5. AGENTES       la conversacion, que la lleva loop() cuando el niño
+        4. MODO          BANG o Curioso, elegido por voz (_elegir_modo())
+        5. MENU          los 5 guias, para elegir por voz
+        6. AGENTES       la conversacion, que la lleva loop() cuando el niño
                          dice un nombre (ver _greet())
 
     El sketch ya arranca mostrando el aviso sin esperar a Python (por si tarda
@@ -688,6 +938,8 @@ def _boot_sequence():
     _show_aviso()
     _welcome()
     _network_if_needed()
+    if _elegir_modo():
+        return  # dijo el nombre de un guia: loop() atiende ese turno
     _show_menu()
 
 
@@ -706,16 +958,19 @@ def _card_cmd(arg):
 def _menu():
     """/menu: todo vuelve al inicio y a elegir guia. Si justo hay una
     respuesta en camino, esa termina igual (no se corta a medio hablar)."""
-    global _current_persona, _follow_up
+    global _current_persona, _follow_up, _awaiting_aporte
     for key in brain.PERSONAS:
         bang.reset(key)
     _current_persona = None
     _follow_up = None
+    _awaiting_aporte = None
     ui.send_message("active_persona", {"key": None})
     _broadcast_bang(None)
 
     def _volver_al_inicio():
         _welcome()
+        if _elegir_modo():
+            return  # eligió guía mientras se le preguntaba el modo
         _show_menu()  # sin esto la pantalla se quedaba en la bienvenida
 
     threading.Thread(target=_volver_al_inicio, daemon=True, name="welcome").start()
@@ -732,11 +987,15 @@ def _greet(persona):
     _current_persona = persona
     ui.send_message("active_persona", {"key": persona})
     _broadcast_bang(persona)
-    msg = f"¡Hola! Soy {p['name']}, {p['tagline'].lower()}. Cuéntame, ¿cuál es tu reto?"
+    msg = curioso.greeting(persona) if curioso.is_curioso() else f"¡Hola! Soy {p['name']}, {p['tagline'].lower()}. Cuéntame, ¿cuál es tu reto?"
     ui.send_message("reply", {"persona": persona, "text": msg})
+    if llm_router.is_local():
+        # Mientras se presenta, el modelo local lee y cachea el prompt del guia.
+        threading.Thread(target=llm_router.warmup_local, args=(brain.local_system(persona),), daemon=True, name="llm-warmup").start()
     _broadcast_status(f"🔊 {p['name']} está hablando...")
-    gestures.send(gestures.HAPPY, persona)
-    voice.say(persona, msg)
+    gestures.send(gestures.WAVE, persona)  # se presenta: saluda con el brazo
+    if _speak(persona, msg):
+        return  # lo interrumpieron: _on_barge() ya dejo todo listo
     gestures.send(gestures.REST, persona)
     _follow_up = persona
 
@@ -749,13 +1008,25 @@ def _pick_persona(wake, text):
     if _current_persona and guides.is_unlocked(_current_persona) and bang.session(_current_persona):
         return _current_persona, ""
     unlocked = guides.unlocked()
+    if curioso.is_curioso():
+        # En Curioso no hay reto que clasificar: sigue el guia de siempre (o
+        # Crispi), y asi no se paga una llamada al LLM por cada pregunta.
+        if _current_persona in unlocked:
+            return _current_persona, ""
+        persona = unlocked[0] if unlocked else guides.ALWAYS_UNLOCKED
+        return persona, f"Te acompaño yo, {brain.PERSONAS[persona]['name']}. "
+    if guardrails.respuesta_fija(text, ""):
+        # Pregunta de identidad, datos privados...: la contesta bang.turn()
+        # con respuesta fija; no vale la pena clasificar.
+        persona = _current_persona if _current_persona in unlocked else guides.ALWAYS_UNLOCKED
+        return persona, ""
     if len(unlocked) == 1:
         # Con un solo guia no hay nada que clasificar: nos ahorramos una
         # llamada entera al LLM.
         persona = unlocked[0]
     else:
         _broadcast_status("🧭 eligiendo el mejor guía para tu reto...")
-        persona = bang.classify(text)
+        persona = bang.classify(text, unlocked)
         if persona not in unlocked:
             persona = guides.ALWAYS_UNLOCKED
     return persona, f"Para este reto te acompaño yo, {brain.PERSONAS[persona]['name']}. "
@@ -779,24 +1050,210 @@ def _say_locked(wake):
     gestures.send(gestures.REST, crispi)
 
 
+# --- Escucha activa y cambio de guia -------------------------------------------
+# Mientras el guia habla, voice.BargeIn escucha en local (Vosk, sin costo de
+# API) su nombre y frases como "se me ocurrio algo" o "pasame con Cesia". Si
+# dispara, la voz se corta, la boca se cierra y:
+# - "pasame con <guia>" (o el nombre de OTRO guia): _switch_to(), que le pasa
+#   el reto entero al nuevo guia (bang.handover) y lo presenta;
+# - si no: el guia dice "¡Dime!" (audio en cache, sin esperar al TTS) y lo
+#   proximo que le digan es un APORTE (bang.contribute) en vez de un turno.
+
+
+def _speak(persona, text, depth=0):
+    """voice.say() con escucha activa. SIEMPRE con escucha: el guía nunca
+    habla encima del niño, pase lo que pase (tampoco en la respuesta a un
+    aporte, ni en la tercera interrupcion seguida).
+
+    Devuelve True si lo interrumpieron: en ese caso _on_barge() ya atendio la
+    interrupcion y el que llama NO debe tocar _follow_up ni el gesto."""
+    barge = voice.make_barge(persona, tuple(brain.PERSONAS))
+    res = voice.say(persona, text, barge=barge)
+    if not res.get("interrupted"):
+        return False
+    _on_barge(persona, res, depth)
+    return True
+
+
+def _on_barge(persona, res, depth):
+    global _follow_up, _awaiting_aporte
+    trig = res.get("trigger") or {}
+    name = brain.PERSONAS[persona]["name"]
+    gestures.send(gestures.REST, persona)  # la boca ya la cerro voice (visema 0)
+    bang.mark_interrupted(persona, res.get("spoken", ""))
+    ui.send_message("interrupted", {
+        "persona": persona, "spoken": res.get("spoken", ""), "kind": trig.get("kind"),
+        "to": trig.get("persona"), "text": trig.get("text", ""),
+    })
+    _broadcast_bang(persona)
+    target = trig.get("persona")
+    if trig.get("kind") == "switch" and target in brain.PERSONAS and target != persona:
+        _switch_to(target, persona, depth=depth + 1)
+        return
+    # "speech": el niño ya está hablando. El guía NO contesta nada (hablarle
+    # encima es justo lo que hay que evitar): se calla y escucha. Solo cuando
+    # la interrupción fue una palabra clave corta ("¡Cori!", "espera") dice
+    # "¡Dime!", porque ahí el niño está esperando turno.
+    hablando = trig.get("kind") == "speech"
+    if hablando:
+        _broadcast_status(f"✋ {name} se calló: te escucha")
+    else:
+        _broadcast_status(f"✋ {name} te escucha: cuéntale tu idea")
+        gestures.send(gestures.TALK, persona)
+        voice.say_cached(persona, "dime")
+        gestures.send(gestures.REST, persona)
+    _awaiting_aporte = {
+        "persona": persona, "spoken": res.get("spoken", ""), "depth": depth + 1,
+        "at": time.monotonic(),
+        # Lo que Vosk ya entendió: si el STT de Google no alcanza a captar nada
+        # (pasa cuando el niño dice una frase corta justo al interrumpir), se
+        # usa esto en vez de perder el turno.
+        "oido": trig.get("text", "") if hablando else "",
+    }
+    _follow_up = persona
+
+
+def _switch_to(new, old, depth=0, ask=True):
+    """Cambio de guia pedido por el niño ("quiero hablar con Cori"): cara del
+    nuevo guia, el reto pasa con todo (fase, pregunta, ideas, aportes) y un
+    saludo de plantilla que lo cuenta, sin llamar al LLM. Devuelve "ok",
+    "locked" o "interrupted" (el saludo tambien se puede interrumpir)."""
+    global _current_persona, _follow_up, _awaiting_aporte
+    _awaiting_aporte = None
+    if not guides.is_unlocked(new):
+        if old in brain.PERSONAS and guides.is_unlocked(old):
+            # Lo dice el guia que ya estaba (con su cara), no Crispi: el reto
+            # sigue con el.
+            name = brain.PERSONAS[new]["name"]
+            msg = f"{name} todavía está bloquead{_o(new)}, así que sigo yo contigo. ¿Seguimos?"
+            _broadcast_status(f"🔒 {name} todavía está bloquead{_o(new)}")
+            gestures.send_card()
+            ui.send_message("reply", {"persona": old, "text": msg})
+            gestures.send(gestures.TALK, old)
+            voice.say(old, msg)
+            gestures.send(gestures.REST, old)
+        else:
+            _say_locked(new)
+        _follow_up = old
+        return "locked"
+    s = bang.handover(old, new) if old else None
+    if s is None and bang.has_reto(new):
+        s = bang.session(new)  # ya tenia su propio reto: lo retoma
+    gestures.send_card()
+    gestures.send_menu()  # por si estaba el menu: aparece su cara
+    _current_persona = new
+    ui.send_message("active_persona", {"key": new})
+    _broadcast_bang(new)
+    if old and old != new:
+        carried = "con el reto" if s is not None and s.relevo == old else "sin reto en curso"
+        _broadcast_debug(f"🔀 {brain.PERSONAS[old]['name']} → {brain.PERSONAS[new]['name']} ({carried})")
+    msg = curioso.greeting(new) if curioso.is_curioso() else bang.handover_greeting(new, s, ask=ask)
+    ui.send_message("reply", {"persona": new, "text": msg})
+    if llm_router.is_local():
+        threading.Thread(target=llm_router.warmup_local, args=(brain.local_system(new),), daemon=True, name="llm-warmup").start()
+    _broadcast_status(f"🔊 {brain.PERSONAS[new]['name']} está hablando...")
+    gestures.send(gestures.WAVE, new)  # llega al relevo: saluda
+    if _speak(new, msg, depth):
+        return "interrupted"
+    gestures.send(gestures.REST, new)
+    _follow_up = new
+    return "ok"
+
+
+# Frases de relleno (Essentials, o Plus cuando Gemini se demora), por guia. Cortas a proposito: la
+# frase entera se sintetiza antes de sonar y el modelo ya esta pensando.
+_FILLERS = {
+    "crispi": ("Mmm, déjame pensarlo un momento...", "A ver, a ver... dame un segundo."),
+    "carmel": ("Buena. Dame un segundo para pensarlo.", "Déjame pensarlo un momento..."),
+    "cesia": ("¡Uy! Déjame pensarlo un momento...", "Mmm, dame un segundo..."),
+    "cori": ("Mmm, a ver, a ver... déjame pensarlo.", "¡Qué curioso! Dame un segundo..."),
+    "cristal": ("Déjame pensarlo un momento...", "Mmm, qué interesante. Dame un segundo..."),
+}
+_filler_turn = 0
+PLUS_FILLER_AFTER = 3.0  # s sin respuesta de Gemini antes de decir la frase de relleno
+
+_SOURCE_LABELS = {"gemini": "☁️ Gemini", "local": "🧠 modelo local", "fijo": "🛡 respuesta fija", "plantilla": "📋 plantilla"}
+
+
+def _say_filler(persona):
+    global _filler_turn
+    options = _FILLERS.get(persona) or _FILLERS["crispi"]
+    _filler_turn += 1
+    try:
+        # Gesto de pensar: un brazo arriba, quieto. Es exactamente lo que dice
+        # la frase ("déjame pensarlo"), y se nota que el robot no se colgó.
+        gestures.send(gestures.THINK, persona)
+        voice.say(persona, options[_filler_turn % len(options)])
+    except Exception as exc:
+        _broadcast_debug(f"⚠ no pude decir la frase de relleno: {exc}")
+
+
+def _turn_worker(job, box):
+    try:
+        box["result"] = job()
+    except Exception as exc:
+        _broadcast_debug(f"⚠ el turno falló: {exc}")
+
+
 _welcomed = False
 
 
 def loop():
-    global _current_persona, _follow_up, _welcomed
+    global _current_persona, _follow_up, _welcomed, _awaiting_aporte, _pending_turn
 
     if not _welcomed:
         _welcomed = True
         _boot_sequence()
 
+    # Mientras se le pregunta el modo (arranque, /menu, /elegir_modo) manda esa
+    # escucha: dos sesiones de microfono a la vez se pisan.
+    while _modo_lock.locked():
+        time.sleep(0.2)
+
     follow_up, _follow_up = _follow_up, None
-    if follow_up:
-        _broadcast_status(f"🎧 te escucho... responde a {brain.PERSONAS[follow_up]['name']} sin decir su nombre.")
+    pendiente, _pending_turn = _pending_turn, None
+    if pendiente:
+        # Ya se oyó mientras se elegía el modo: no se vuelve a escuchar.
+        wake, text = pendiente
+        switch = False
     else:
-        _broadcast_status("🎧 escuchando... di 'Crispi' (o 'robot') y tu pregunta.")
-    wake, text = voice.listen_turn(
-        list(brain.PERSONAS.keys()) + list(AUTO_WAKE), follow_up=follow_up, name_only=tuple(brain.PERSONAS)
-    )
+        if follow_up:
+            _broadcast_status(f"🎧 te escucho... responde a {brain.PERSONAS[follow_up]['name']} sin decir su nombre.")
+        else:
+            _broadcast_status("🎧 escuchando... di 'Crispi' (o 'robot') y tu pregunta.")
+        wake, text = voice.listen_turn(
+            list(brain.PERSONAS.keys()) + list(AUTO_WAKE), follow_up=follow_up, name_only=tuple(brain.PERSONAS)
+        )
+        switch = voice.last_switch()
+
+    # Tras una interrupcion, lo siguiente que le dicen a ESE guia es un aporte.
+    espera, _awaiting_aporte = _awaiting_aporte, None
+    if espera and time.monotonic() - espera["at"] <= APORTE_WAIT_S and espera.get("oido") and not (wake and text):
+        # El niño interrumpió con una frase corta y el STT de Google no alcanzó
+        # a abrirse: se usa lo que Vosk ya entendió en local, para no perder el
+        # turno ni obligarlo a repetir.
+        wake, text, switch = espera["persona"], espera["oido"], False
+        _broadcast_debug(f"🗣 uso lo que oí al interrumpir: «{text}»")
+    aporte = espera
+    if aporte and (switch or wake != aporte["persona"] or time.monotonic() - aporte["at"] > APORTE_WAIT_S):
+        aporte = None
+    if curioso.is_curioso():
+        aporte = None  # en Curioso no hay reto: una interrupción es un turno más
+
+    # Cambio de guia: "quiero hablar con Cori", "pasame a Cristal"... O solo
+    # el nombre de otro guia mientras hay un reto en curso: el reto se pasa.
+    if wake in brain.PERSONAS and (
+        switch or (not text and _current_persona and wake != _current_persona and bang.has_reto(_current_persona))
+    ):
+        voice.ack()
+        if text:
+            ui.send_message("heard", {"persona": wake, "text": text})
+        if _switch_to(wake, _current_persona, ask=not text) != "ok" or not text:
+            return
+        # Traia algo mas ("pasame con Cori, se me ocurrio un mural"): eso
+        # sigue como turno normal del guia nuevo.
+        _follow_up = None
+
     if wake in brain.PERSONAS and not text:
         # Solo el nombre (p. ej. respondiendo a la bienvenida): se presenta.
         voice.ack()
@@ -812,8 +1269,20 @@ def loop():
         time.sleep(1)
         return
 
+    # "Modo curioso", "cambia a modo BANG": cambia como conversa el robot y lo
+    # dice en voz alta. Va antes del turno: no se le pasa al LLM.
+    pedido = curioso.find_mode(text)
+    if pedido and pedido != curioso.mode():
+        voz = _current_persona if _current_persona in brain.PERSONAS and guides.is_unlocked(_current_persona) else None
+        ui.send_message("heard", {"persona": voz or guides.ALWAYS_UNLOCKED, "text": text})
+        voice.ack()
+        _set_chat_mode(pedido, hablado=True, voz=voz)
+        _follow_up = voz
+        return
+
     heard_at = time.monotonic()
-    voice.ack()  # "te escuche": suena mientras el LLM piensa
+    if not switch:
+        voice.ack()  # "te escuche": suena mientras el LLM piensa (en el cambio ya sono)
 
     if wake in brain.PERSONAS and not guides.is_unlocked(wake):
         ui.send_message("heard", {"persona": wake, "text": text})
@@ -824,13 +1293,49 @@ def loop():
     _current_persona = persona
     name = brain.PERSONAS[persona]["name"]
     ui.send_message("active_persona", {"key": persona})
-    ui.send_message("heard", {"persona": persona, "text": text})
+    if not switch:
+        ui.send_message("heard", {"persona": persona, "text": text, "aporte": bool(aporte)})
     _broadcast_status(f"🤔 {name} está pensando...")
 
-    result = bang.turn(persona, text)
+    # El turno se piensa en un hilo. Essentials: el modelo local tarda
+    # (~10-20 s), asi que el guia dice enseguida una frase corta para que nadie
+    # crea que se colgo. Plus: Gemini suele contestar en 1-2 s; si se demora
+    # mas de PLUS_FILLER_AFTER (503, cuota, respaldo local), tambien la dice.
+    # slow_turn() se mira ANTES de arrancar el hilo: turn() cambia la sesion.
+    # Un aporte tras "¡Dime!" va por bang.contribute(): en Essentials es una
+    # plantilla (sin modelo local), en Plus una sola llamada a Gemini.
+    depth = 0
+    if aporte:
+        depth = aporte["depth"]
+        spoken = aporte["spoken"]
+        slow = not bang.has_reto(persona) and bang.slow_turn(persona, text)
+        job = lambda: bang.contribute(persona, text, spoken, use_llm=not llm_router.is_local())  # noqa: E731
+        _broadcast_status(f"💡 {name} agrega tu aporte al reto...")
+    elif curioso.is_curioso():
+        # Modo Curioso: charla libre con la personalidad del guía, mas las
+        # ordenes cortas ("ponte feliz", "baila"), que no pasan por el LLM.
+        slow = curioso.slow_turn(persona, text)
+        job = lambda: curioso.turn(persona, text)  # noqa: E731
+    else:
+        slow = bang.slow_turn(persona, text)
+        job = lambda: bang.turn(persona, text)  # noqa: E731
+    box = {}
+    worker = threading.Thread(target=_turn_worker, args=(job, box), daemon=True, name="turn")
+    worker.start()
+    if slow:
+        _broadcast_status(f"🤔 {name} está pensando (modelo local)...")
+        _say_filler(persona)
+    else:
+        worker.join(PLUS_FILLER_AFTER)
+        if worker.is_alive():
+            _say_filler(persona)
+    worker.join()
+    result = box.get("result") or bang.Turn(brain.FALLBACK_REPLY)
     reply = intro + result.reply
-    gesture = gestures.emotion_of(reply)
-    _broadcast_debug(f"⏱ respuesta del LLM en {time.monotonic() - heard_at:.1f}s")
+    # En Curioso, "ponte triste" trae su propio gesto; si no, se saca del texto.
+    pedido_gesto = getattr(result, "gesture", None)
+    gesture = pedido_gesto if pedido_gesto is not None else gestures.emotion_of(reply)
+    _broadcast_debug(f"⏱ respuesta en {time.monotonic() - heard_at:.1f}s ({_SOURCE_LABELS.get(result.source, result.source or '?')})")
 
     ui.send_message("reply", {"persona": persona, "text": reply})
     _broadcast_bang(persona)
@@ -839,7 +1344,7 @@ def loop():
     # baile de brazos de Diome-chan (ver voice.celebrate()).
     if result.phase_changed:
         _broadcast_status(f"🎉 ¡{bang.PHASE_LABELS[bang.session(persona).phase]}!")
-        gestures.send(gestures.HAPPY, persona)
+        gestures.send(gestures.CLAP, persona)  # aplaude el paso de fase
         voice.celebrate()
 
     _broadcast_status(f"🔊 {name} está hablando...")
@@ -854,7 +1359,13 @@ def loop():
     # El gesto viaja ANTES de hablar: como Python controla el parlante, sabe
     # exactamente cuando empieza y termina la voz.
     gestures.send(gesture, persona)
-    voice.say(persona, reply)
+    if _speak(persona, reply, depth):
+        return  # lo interrumpieron: _on_barge() ya dejo el seguimiento armado
+    if getattr(result, "celebrate", False):
+        # "¡Baila!", "¡canta!": la cancioncita y el baile de brazos, DESPUES de
+        # decir la frase (bailar mientras habla se pisa con la boca).
+        _broadcast_status(f"🎉 ¡{name} está bailando!")
+        voice.celebrate()
     gestures.send(gestures.REST, persona)
 
     # Como Alexa: unos segundos para contestarle sin repetir su nombre.
