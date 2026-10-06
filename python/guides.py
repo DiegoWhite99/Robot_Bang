@@ -10,10 +10,39 @@ from pathlib import Path
 from arduino.app_utils import Logger
 
 import brain
+import llm_router
 
 logger = Logger("chat-bang")
 
 ALWAYS_UNLOCKED = "crispi"
+
+# El unico guia del modo ESSENTIALS.
+#
+# Essentials corre entero en la placa: Qwen de 0.8B para pensar, Vosk para oir
+# y espeak-ng para hablar. Con cinco guias eso no da: cada uno tiene su propio
+# system prompt, y llama.cpp solo reusa el prefijo en cache mientras el prompt
+# no cambie — cambiar de guia tira la cache y el siguiente turno vuelve a
+# costar los ~22 s de releer todo. Con uno solo el prefijo se queda caliente y
+# el turno baja a unos 8 s, que es la diferencia entre conversar y esperar.
+#
+# Y es Cristal, no Crispi (el de Plus), por dos razones: es la musa reflexiva,
+# que es la que mejor le sienta a un modelo pequeño —calmada, frases cortas,
+# preguntas en vez de recetas— y es mujer, que es la voz que se pidio para el
+# modo local (espeak-ng "es-419+f3", ver localvoice.py).
+ESSENTIALS_GUIDE = "cristal"
+
+
+def essentials_only():
+    """True si ahora mismo hay un solo guia porque el modo es Essentials."""
+    return llm_router.is_local()
+
+
+def default_guide():
+    """A quien va todo cuando no hay nadie mas: Cristal en Essentials, Crispi
+    en Plus. Usar esto en vez de ALWAYS_UNLOCKED en cualquier respaldo, o en
+    Essentials se acabaria llamando a un guia que no esta disponible."""
+    return ESSENTIALS_GUIDE if essentials_only() else ALWAYS_UNLOCKED
+
 
 _PATH = Path(__file__).resolve().parent.parent / "data" / "unlocks.json"
 _lock = threading.Lock()
@@ -50,12 +79,20 @@ def _save():
 
 
 def unlocked():
-    """Claves desbloqueadas, en el orden de brain.PERSONAS."""
+    """Claves disponibles ahora mismo, en el orden de brain.PERSONAS.
+
+    En Essentials es siempre una sola (ver ESSENTIALS_GUIDE); los candados de
+    /lock_* y /unlock_* siguen ahi y vuelven a mandar al pasar a Plus.
+    """
+    if essentials_only():
+        return [ESSENTIALS_GUIDE]
     with _lock:
         return [k for k in brain.PERSONAS if k in _unlocked]
 
 
 def is_unlocked(key):
+    if essentials_only():
+        return key == ESSENTIALS_GUIDE
     with _lock:
         return key in _unlocked
 

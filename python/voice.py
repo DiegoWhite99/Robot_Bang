@@ -56,6 +56,9 @@ from arduino.app_peripherals.speaker import Speaker
 from arduino.app_utils import Logger
 
 import gestures  # solo por las constantes VISEME_* y send_viseme (no importa a voice)
+import llm_router  # solo para saber si el modo es Essentials (no importa a voice)
+import localvoice
+import song
 
 logger = Logger("chat-bang")
 
@@ -64,6 +67,9 @@ _CREDENTIALS_PATH = Path(__file__).resolve().parent.parent / "google-credentials
 
 _SAMPLE_RATE = 16000  # mic, para el STT
 _TTS_SAMPLE_RATE = 24000  # parlante, para el TTS (Chirp3-HD)
+# El mismo numero, publico: main.py lo necesita para precalentar la cancion
+# (song.warmup) al sample rate al que de verdad va a sonar.
+TTS_SAMPLE_RATE = _TTS_SAMPLE_RATE
 _LANGUAGE = "es-CO"
 
 # Una voz Chirp3-HD (las mas naturales del catalogo) por guia, para que se
@@ -103,9 +109,67 @@ _STREAMING_CONFIG = speech.StreamingRecognitionConfig(
     interim_results=True,
 )
 
-# Lo transcrito tiene que quedarse quieto este tiempo para dar la frase por
-# terminada. Mas bajo = responde antes pero corta a quien hace pausas largas.
-_ENDPOINT_S = 0.7
+# --- Fin de frase (endpointing) ------------------------------------------------
+# El problema que arreglaron estas constantes: con un plazo fijo y corto (0.7 s)
+# el robot cerraba el turno en cuanto el niño respiraba. Un niño de 5 a 14 años
+# que esta PENSANDO lo que va a decir hace pausas de 1,5-2 s en mitad de la
+# idea ("mi reto es que en el salon... [pausa] ...nadie recicla"), y el robot
+# se le lanzaba encima con media frase. Era la queja numero uno.
+#
+# Ahora el plazo depende de COMO quedo la frase, que es la unica pista fiable
+# de si el niño termino o solo esta pensando:
+#
+#   termina en "y", "porque", "que"...  -> la idea sigue, se espera mucho mas
+#   1 o 2 palabras sueltas              -> apenas esta arrancando
+#   termina en punto/interrogacion y ya dijo bastante -> se puede contestar ya
+#   cualquier otro caso                 -> el plazo normal
+#
+# Y ademas de lo transcrito se mira el MICROFONO (_VOICE_HOLD_S): mientras siga
+# entrando voz no se cierra el turno, aunque Google no mande texto nuevo. Eso
+# cubre el caso de quien alarga las palabras o duda en voz alta ("eeeeh...").
+# El caso normal es "la frase esta quieta pero el STT no la cerro con punto",
+# que es justo donde se cortaba al niño. Google puntua solo: si una frase
+# terminada de verdad, le pone punto y cae en _ENDPOINT_DONE_S (0,8 s), que es
+# lo que se lleva casi todos los turnos. Aqui caen las que quedaron ABIERTAS,
+# y a esas hay que darles aire: medido con niños, la pausa de "estoy pensando
+# la segunda mitad" anda entre 1 y 2 segundos.
+_ENDPOINT_S = 1.5
+_ENDPOINT_HANGING_S = 2.4  # termina en conector: la idea no termino
+_ENDPOINT_SHORT_S = 2.0  # 1-2 palabras: todavia esta arrancando
+_ENDPOINT_DONE_S = 0.8  # termina en . ? ! y ya dijo bastante: se contesta rapido
+_ENDPOINT_DONE_WORDS = 4  # "bastante" = esta cantidad de palabras
+_ENDPOINT_MAX_S = 30.0  # tope duro: nunca se escucha para siempre
+_VOICE_HOLD_S = 0.5  # si el mic sigue oyendo voz, el turno no se cierra
+_VOICE_RMS = 420  # int16: por encima de esto hay voz de verdad en el mic
+
+# Palabras con las que NADIE termina una idea: si la frase acaba aqui, lo que
+# viene es el resto de lo que el niño queria decir.
+_HANGING_WORDS = frozenset(
+    """
+    y e o u ni que porque pero mas aunque entonces cuando mientras si como donde cual quien
+    para por con sin sobre de del al a en desde hasta hacia segun tras durante ante bajo
+    el la los las un una unos unas mi mis tu tus su sus este esta estos estas ese esa eso
+    lo le les me te se nos muy mas tan tanto casi solo tambien ademas igual osea sea
+    quiero quisiera puedo podemos queremos necesito tengo hay era fue estaba
+    pues eh este bueno o sea digamos tipo como que
+    yo tu el ella usted nosotros nosotras ustedes ellos ellas uno
+    pronto luego despues antes ahora encima aparte primero segundo ultimo
+    """.split()
+)
+
+# Conjunciones que abren una oracion subordinada. "Me gustaria que el colegio"
+# no termina en palabra colgante ("colegio" es un sustantivo cualquiera), pero
+# sigue siendo media idea: la subordinada que abrio "que" no tiene verbo
+# todavia. Si el ultimo subordinador tiene muy poquito detras, la frase sigue.
+# Ojo con lo que NO entra: "para", "como" y "segun" son casi siempre
+# preposiciones, no subordinadores ("un buzon PARA el salon" esta terminadisimo),
+# y meterlas hacia esperar de mas en frases completas.
+_SUBORDINATORS = frozenset("que porque cuando si aunque donde mientras quien cual".split())
+# 3 y no 2: el caso real que lo motivo fue "mi reto es que en el salon" (tres
+# palabras detras del "que", y ni rastro de verbo todavia: el niño iba a decir
+# "...nadie recicla"). Pasarse de generoso aqui solo cuesta esperar un poquito
+# mas en frases que ya estaban completas; quedarse corto cuesta cortar al niño.
+_SUBORDINATE_TAIL = 3
 # Si solo se oyo "Crispi" y nada mas, cuanto se espera la pregunta.
 _WAKE_ONLY_WAIT_S = 6.0
 # Para los nombres que valen solos (listen_turn(name_only=...)): tras decir
@@ -141,6 +205,38 @@ _mic_device = None  # con que dispositivo se abrio _mic
 _spk = None
 _spk_device = None  # con que dispositivo se abrio _spk
 _spk_lock = threading.Lock()  # ack() suena en otro hilo: nunca dos escrituras a la vez
+# ...y lo mismo para LEER. El objeto Microphone entrega cada bloque UNA vez: si
+# dos hilos llaman a capture()/stream() a la vez, cada uno se lleva la mitad de
+# los bloques y los dos transcriben audio con agujeros. Se oye exactamente como
+# el log del 06/10: "quiero que" -> "quiero checar", y despues palabras sueltas
+# ("pero", "art", "la") que son pedazos de frases partidas.
+#
+# Pasaba porque nadie garantizaba que el lector anterior hubiera terminado:
+# listen_turn() devolvia el turno sin esperar a su hilo, y BargeIn.stop() se
+# rendia a 1 s y seguia. Con este candado, el que llega segundo espera.
+_mic_read_lock = threading.Lock()
+_MIC_READ_WAIT_S = 2.0  # lo que se espera a que el lector anterior suelte
+
+
+def _mic_reader(quien):
+    """Contexto que da el microfono en exclusiva. Si el lector anterior no
+    suelta a tiempo se avisa (es un sintoma, no algo normal) y se sigue: mejor
+    oir regular que quedarse sordo."""
+    import contextlib
+
+    @contextlib.contextmanager
+    def _ctx():
+        tomado = _mic_read_lock.acquire(timeout=_MIC_READ_WAIT_S)
+        if not tomado:
+            logger.warning(f"{quien}: el lector anterior del microfono no solto en {_MIC_READ_WAIT_S}s; leo igual")
+            _debug(f"⚠ dos lectores del micrófono a la vez ({quien}): el audio se parte")
+        try:
+            yield
+        finally:
+            if tomado:
+                _mic_read_lock.release()
+
+    return _ctx()
 
 # Ademas de `app logs`, cada evento importante (lo que se va transcribiendo,
 # fallas de mic/TTS) se reenvia aqui, para poder mostrarlo en vivo en la web
@@ -152,6 +248,48 @@ _debug_reporter = None
 def set_debug_reporter(fn):
     global _debug_reporter
     _debug_reporter = fn
+
+
+# --- Voz local (modo Essentials) -----------------------------------------------
+# Essentials es "todo en la placa": el modelo (Qwen), la escucha (Vosk) y la voz
+# (espeak-ng) sin tocar internet. Plus sigue con Google, que suena mucho mejor.
+# Si falta alguna de las dos piezas locales se avisa UNA vez y ese pedazo se
+# hace con Google: es mejor que quedarse mudo o sordo.
+_sin_local_avisado = set()
+
+
+def _falta_local(que, detalle):
+    if que not in _sin_local_avisado:
+        _sin_local_avisado.add(que)
+        logger.warning(f"Modo Essentials sin {que} local ({detalle}): uso Google para esto")
+        _debug(f"⚠ sin {que} local ({detalle}): este modo deja de ser 100% offline")
+
+
+def local_voice():
+    """True si este turno habla con espeak-ng en vez de con Google TTS."""
+    if not llm_router.is_local():
+        return False
+    if localvoice.available():
+        return True
+    _falta_local("voz", localvoice.tts_state())
+    return False
+
+
+def local_stt():
+    """True si este turno escucha con Vosk en vez de con Google STT."""
+    if not llm_router.is_local():
+        return False
+    if localvoice.stt_ready(_SAMPLE_RATE):
+        return True
+    _falta_local("escucha", "no hay modelo Vosk")
+    return False
+
+
+def _voice_name(persona):
+    """El nombre de voz del guia en el motor que toca (Google o espeak-ng)."""
+    if local_voice():
+        return localvoice.VOICES.get(persona, localvoice.DEFAULT_VOICE)
+    return _VOICES.get(persona, _DEFAULT_VOICE)
 
 
 # Mientras suena la voz, cada bloque de audio avisa aqui cuan abierta va la
@@ -225,16 +363,32 @@ def _tts():
 
 
 def warmup():
-    """Abre los canales gRPC de STT y TTS mientras nadie espera: la primera
-    llamada de cada cliente cuesta bastante mas que las siguientes."""
+    """Deja lista la voz del modo activo mientras nadie espera.
+
+    Plus: abre los canales gRPC de STT y TTS (la primera llamada de cada
+    cliente cuesta bastante mas que las siguientes). Essentials: carga
+    libespeak-ng y el modelo de Vosk del turno, que tambien tardan la primera
+    vez y no tienen por que pagarse con un niño esperando.
+    """
     try:
-        _speech()
-        _synthesize("Hola.", _DEFAULT_VOICE)
-        logger.info("Voz precalentada: la primera respuesta ya sera rapida")
+        if llm_router.is_local():
+            localvoice.synthesize("Hola.", localvoice.DEFAULT_VOICE, _TTS_SAMPLE_RATE)
+            localvoice.stt_ready(_SAMPLE_RATE)
+            logger.info("Voz local precalentada (espeak-ng + Vosk)")
+        else:
+            _speech()
+            _synthesize("Hola.", _DEFAULT_VOICE)
+            logger.info("Voz precalentada: la primera respuesta ya sera rapida")
     except Exception as exc:
         logger.warning(f"No se pudo precalentar la voz: {exc}")
     # Los "¡Dime!" de la escucha activa (una vez: despues salen de data/tts_cache/).
-    warm_cached(_CACHED_PHRASES["dime"])
+    # En Essentials solo habla Cristal, asi que no se sintetizan los otros
+    # cuatro: con espeak saldrian iguales (hay una sola voz local) y serian
+    # cuatro archivos de cache que nadie va a usar.
+    if llm_router.is_local():
+        warm_cached([k for k in _CACHED_PHRASES["dime"] if k in localvoice.VOICES])
+    else:
+        warm_cached(_CACHED_PHRASES["dime"])
 
 
 # --- Dispositivos de audio: headset USB o bocina Bluetooth -------------------
@@ -558,6 +712,62 @@ def resume_listening(tail=_ECHO_TAIL_S):
         _debug(f"⚠ sin microfono: {exc}")
 
 
+def mic_check(segundos=4.0):
+    """Mide lo que ENTRA por el microfono, sin STT de por medio.
+
+    Existe porque cuando "no se oye" hay cuatro cosas distintas que pueden
+    estar pasando y desde fuera se ven igual: que el micrófono no se abra, que
+    se abra y no entregue nada, que entregue silencio (micrófono lejos, mudo o
+    con el volumen a cero) o que entregue audio de sobra y el problema sea el
+    reconocimiento. Esto las separa: devuelve nivel medio y pico en una escala
+    0-100, y cuántos bloques llegaron.
+
+    Devuelve un dict; nunca lanza.
+    """
+    out = {"ok": False, "dispositivo": None, "bloques": 0, "medio": 0, "pico": 0, "voz": 0, "error": None}
+    tomado = _mic_read_lock.acquire(timeout=_MIC_READ_WAIT_S)
+    try:
+        mic = _microphone()
+        out["dispositivo"] = input_name()
+        niveles = []
+        hasta = time.monotonic() + max(0.5, segundos)
+        while time.monotonic() < hasta:
+            chunk = mic.capture()
+            if chunk is None or len(chunk) == 0:
+                time.sleep(0.005)
+                continue
+            niveles.append(float(np.sqrt(np.mean(chunk.astype(np.float32) ** 2))))
+        if niveles:
+            out["bloques"] = len(niveles)
+            out["medio"] = round(100.0 * (sum(niveles) / len(niveles)) / 32768.0, 1)
+            out["pico"] = round(100.0 * max(niveles) / 32768.0, 1)
+            # Bloques que pasarian la compuerta de voz de la escucha activa.
+            out["voz"] = sum(1 for n in niveles if n > _VOICE_RMS)
+            out["ok"] = True
+    except Exception as exc:
+        out["error"] = str(exc)
+    finally:
+        if tomado:
+            _mic_read_lock.release()
+    return out
+
+
+def mic_report(segundos=4.0):
+    """mic_check() en una o dos lineas, para la terminal del dashboard."""
+    r = mic_check(segundos)
+    if r["error"]:
+        return f"⚠ no pude abrir el micrófono: {r['error']}"
+    if not r["ok"] or not r["bloques"]:
+        return f"⚠ el micrófono ({r['dispositivo']}) se abrió pero NO entregó audio. ¿Está conectado?"
+    linea = (f"🎙 {r['dispositivo']} · {r['bloques']} bloques · nivel medio {r['medio']}/100 · "
+             f"pico {r['pico']}/100 · {r['voz']} bloques con voz")
+    if r["pico"] < 1.0:
+        return linea + "\n⚠ SILENCIO: entra audio pero está plano. Micrófono mudo, muy lejos o con ganancia a cero."
+    if r["voz"] == 0:
+        return linea + "\n⚠ Se oye algo, pero demasiado bajo para contar como voz. Acércate o sube la ganancia."
+    return linea + "\n✅ El micrófono capta voz de sobra. Si aun así no te entiende, el problema es el reconocimiento, no el micrófono."
+
+
 # --- Escucha: nombre del guia + la pregunta ---------------------------------
 
 
@@ -566,16 +776,30 @@ def _normalize(word):
     return "".join(c for c in plain if not unicodedata.combining(c))
 
 
+def _aliases():
+    """Como se escriben mal los nombres, segun QUIEN transcribe.
+
+    Con Google (Plus) solo valen los suyos: "Carmen" tiene que poder ser una
+    amiga del niño. Con Vosk (Essentials) los nombres no estan en su
+    vocabulario y salen siempre cambiados, asi que ahi si se suman los alias
+    de localvoice.VOSK_WAKE_ALIASES o no se reconoceria ningun guia.
+    """
+    if local_stt():
+        return {**_WAKE_ALIASES, **localvoice.VOSK_WAKE_ALIASES}
+    return _WAKE_ALIASES
+
+
 def _find_wake_word(text, wake_keys):
     """Busca el nombre de un guia palabra por palabra y devuelve
     (clave, resto_de_la_frase), o None si no aparece ninguno. Tolera las
     transcripciones tipicas mal escritas y el nombre partido en dos
     ("Cris pi")."""
     words = text.split()
+    alias = _aliases()
     keys = [re.sub(r"[^a-z]", "", _normalize(w)) for w in words]
     for i, key in enumerate(keys):
         for cand, skip in ((key, 1), (key + (keys[i + 1] if i + 1 < len(keys) else ""), 2)):
-            cand = _WAKE_ALIASES.get(cand, cand)
+            cand = alias.get(cand, cand)
             if cand in wake_keys:
                 return cand, " ".join(words[i + skip :]).lstrip(" ,.")
     return None
@@ -587,6 +811,7 @@ def _canon_tokens(text, keys):
     (tokens, spans, words): spans[i] = (desde, hasta) en words, para poder
     devolver el resto de la frase con sus tildes."""
     words = (text or "").split()
+    alias = _aliases()
     plain = [re.sub(r"[^a-z]", "", _normalize(w)) for w in words]
     tokens, spans = [], []
     i = 0
@@ -595,13 +820,13 @@ def _canon_tokens(text, keys):
         if not k or k == "unk":  # el [unk] de la gramatica de Vosk
             i += 1
             continue
-        pair = _WAKE_ALIASES.get(k + plain[i + 1], k + plain[i + 1]) if i + 1 < len(plain) else None
+        pair = alias.get(k + plain[i + 1], k + plain[i + 1]) if i + 1 < len(plain) else None
         if pair in keys:
             tokens.append(pair)
             spans.append((i, i + 2))
             i += 2
             continue
-        k = _WAKE_ALIASES.get(k, k) if _WAKE_ALIASES.get(k) in keys else k
+        k = alias.get(k, k) if alias.get(k) in keys else k
         tokens.append(k)
         spans.append((i, i + 1))
         i += 1
@@ -676,7 +901,11 @@ def find_switch(text, persona_keys):
     return m.group("who"), rest
 
 
-def _audio_requests(stop):
+def _audio_requests(stop, voice_at=None):
+    """Los bloques del mic hacia Google. Si se pasa `voice_at` (una lista de un
+    elemento), ahi se va dejando el monotonic del ultimo bloque con voz: eso es
+    lo que deja a listen_turn() esperar mientras el niño todavia esta hablando,
+    aunque Google no haya mandado texto nuevo (ver _VOICE_HOLD_S)."""
     # OJO: el config va aparte, como argumento de streaming_recognize(), NO
     # embebido aqui como primer item (esa era la forma de APIs viejas de
     # Google Speech; en google-cloud-speech 2.x streaming_recognize() exige
@@ -687,7 +916,45 @@ def _audio_requests(stop):
             return  # cierra el stream: ya se lanzo el turno
         if chunk is None or len(chunk) == 0:
             continue
+        if voice_at is not None:
+            try:
+                if float(np.sqrt(np.mean(chunk.astype(np.float32) ** 2))) > _VOICE_RMS:
+                    voice_at[0] = time.monotonic()
+            except Exception:
+                pass
         yield speech.StreamingRecognizeRequest(audio_content=chunk.tobytes())
+
+
+def endpoint_wait(text):
+    """Cuanto silencio hace falta para dar por terminada `text` (segundos).
+
+    Pura a proposito: tools/test_dialogo.py la prueba sin microfono ni red.
+    Ver el comentario de _ENDPOINT_S para el porque de cada caso.
+    """
+    t = (text or "").strip()
+    if not t:
+        return _ENDPOINT_S
+    words = t.split()
+    plain = [re.sub(r"[^a-z0-9]", "", _normalize(w)) for w in words]
+    # "y...", "porque...", "mi...": la idea quedo colgando, venga lo que venga.
+    if plain[-1] in _HANGING_WORDS:
+        return _ENDPOINT_HANGING_S
+    # Termino en punto, interrogacion o exclamacion (Google puntua solo) y ya
+    # dijo algo con cuerpo: no hay para que hacerlo esperar. Va antes que la
+    # regla de la subordinada: si el STT cerro la frase, la frase esta cerrada.
+    if t[-1] in ".?!" and len(words) >= _ENDPOINT_DONE_WORDS:
+        return _ENDPOINT_DONE_S
+    # Subordinada a medias: "me gustaria QUE el colegio", "no voy PORQUE mi
+    # mama". La ultima palabra no dice nada, pero la frase claramente sigue.
+    for i in range(len(plain) - 1, -1, -1):
+        if plain[i] in _SUBORDINATORS:
+            if len(plain) - 1 - i <= _SUBORDINATE_TAIL:
+                return _ENDPOINT_HANGING_S
+            break
+    # Dos palabras sueltas no son una idea: casi siempre viene mas.
+    if len(words) <= 2:
+        return _ENDPOINT_SHORT_S
+    return _ENDPOINT_S
 
 
 _last_switch = False  # el ultimo listen_turn() fue un "pasame con <guia>"
@@ -741,10 +1008,11 @@ def listen_turn(wake_keys, follow_up=None, follow_up_s=FOLLOW_UP_S, name_only=()
     stop = threading.Event()
     events = queue.Queue()
     started = time.monotonic()
+    voice_at = [0.0]  # monotonic del ultimo bloque del mic con voz
 
     def reader():
         try:
-            responses = _speech().streaming_recognize(config=_STREAMING_CONFIG, requests=_audio_requests(stop))
+            responses = _speech().streaming_recognize(config=_STREAMING_CONFIG, requests=_audio_requests(stop, voice_at))
             for response in responses:
                 # Un interim puede venir partido en varios results (tramo
                 # estable + tramo inestable): juntos son la frase en curso.
@@ -757,7 +1025,28 @@ def listen_turn(wake_keys, follow_up=None, follow_up_s=FOLLOW_UP_S, name_only=()
                 events.put(("error", exc, None))
         events.put(("end", None, None))
 
-    threading.Thread(target=reader, daemon=True, name="stt").start()
+    def reader_local():
+        # Essentials: el turno lo transcribe Vosk en la placa, sin red. Pone en
+        # `events` lo mismo que el lector de Google, asi que de aqui para abajo
+        # la maquina de estados (palabra clave, cambio de guia, fin de frase)
+        # es exactamente la misma.
+        try:
+            localvoice.listen_events(_microphone(), stop, events, _SAMPLE_RATE, voice_at, _VOICE_RMS)
+        except Exception as exc:
+            if not stop.is_set():
+                events.put(("error", exc, None))
+            events.put(("end", None, None))
+
+    # El microfono, en exclusiva, durante todo el turno: ni la escucha activa de
+    # la respuesta anterior ni un lector que se haya quedado colgado pueden
+    # robarle bloques. Se toma AQUI (y se suelta en el finally) y no dentro del
+    # generador de gRPC, que puede sobrevivir al turno y no soltarlo nunca.
+    mic_tomado = _mic_read_lock.acquire(timeout=_MIC_READ_WAIT_S)
+    if not mic_tomado:
+        logger.warning(f"El lector anterior no solto el microfono en {_MIC_READ_WAIT_S}s; escucho igual")
+        _debug("⚠ dos lectores del micrófono a la vez: el audio se puede partir")
+    hilo = threading.Thread(target=reader_local if local_stt() else reader, daemon=True, name="stt")
+    hilo.start()
 
     persona = None
     finals = []  # frases ya cerradas por Google despues de la palabra clave
@@ -843,29 +1132,50 @@ def listen_turn(wake_keys, follow_up=None, follow_up_s=FOLLOW_UP_S, name_only=()
                     interim = rest
                     last_change = now
                 if is_final:
+                    # OJO: aqui NO se devuelve el turno. Google cierra una
+                    # frase apenas hay una pausita, asi que devolver en el
+                    # primer final era exactamente lo que cortaba al niño a
+                    # media idea ("mi reto es que en el salon." -> turno). Lo
+                    # final se guarda y se sigue escuchando: quien manda es el
+                    # silencio de endpoint_wait() y el microfono.
                     if interim:
                         finals.append(interim)
+                        last_change = now
                     interim = ""
                     in_wake_utterance = False
-                    if finals:
-                        _last_switch = switched
-                        return persona, said()
 
             if persona is not None:
-                if said() and now - last_change >= _ENDPOINT_S:
+                dicho = said()
+                # Mientras siga entrando voz por el mic no se cierra el turno,
+                # aunque el texto lleve rato quieto: el niño esta alargando una
+                # palabra o dudando en voz alta ("eeeh...").
+                hablando = now - voice_at[0] < _VOICE_HOLD_S
+                espera = endpoint_wait(dicho)
+                if dicho and not hablando and now - last_change >= espera:
                     _last_switch = switched
-                    return persona, said()
-                if switched and not said() and now - last_heard >= _ENDPOINT_S:
+                    return persona, dicho
+                if dicho and now - wake_at >= _ENDPOINT_MAX_S:
+                    _last_switch = switched  # tope duro: algo hay que contestar
+                    return persona, dicho
+                if switched and not dicho and now - last_heard >= _ENDPOINT_S:
                     _last_switch = True
                     return persona, ""  # "pasame con Cori" y nada mas
-                if not said() and persona in name_only and now - wake_at > _NAME_ONLY_S:
+                if not dicho and not hablando and persona in name_only and now - wake_at > _NAME_ONLY_S:
                     return persona, ""  # solo dijo el nombre: que el guia se presente
-                if not said() and now - wake_at > _WAKE_ONLY_WAIT_S:
+                if not dicho and now - wake_at > _WAKE_ONLY_WAIT_S:
                     # Solo dijo el nombre y se quedo callado: vuelta a esperar.
                     persona = None
                     switched = False
     finally:
         stop.set()
+        # Esperar al lector NO es opcional: mientras siga vivo tiene el
+        # microfono y le quita bloques a quien escuche despues (la escucha
+        # activa de la respuesta, o el turno siguiente).
+        hilo.join(timeout=3.0)
+        if hilo.is_alive():
+            logger.warning("El lector de voz no termino en 3s: puede robarle audio al turno siguiente")
+        if mic_tomado:
+            _mic_read_lock.release()
 
     if persona and (said() or switched):
         _last_switch = switched
@@ -876,7 +1186,19 @@ def listen_turn(wake_keys, follow_up=None, follow_up_s=FOLLOW_UP_S, name_only=()
 # --- Voz --------------------------------------------------------------------
 
 
+_LOCAL_VOICE_NAMES = frozenset(localvoice.VOICES.values()) | {localvoice.DEFAULT_VOICE}
+
+
 def _synthesize(text, voice_name):
+    # Voz local (Essentials): espeak-ng devuelve el WAV al mismo sample rate que
+    # el parlante, asi que de aqui para abajo no cambia nada (boca, visemas y
+    # corte por barge-in funcionan igual).
+    if voice_name in _LOCAL_VOICE_NAMES:
+        return localvoice.synthesize(text, voice_name, _TTS_SAMPLE_RATE)
+    return _synthesize_google(text, voice_name)
+
+
+def _synthesize_google(text, voice_name):
     input_text = texttospeech.SynthesisInput(text=text)
     voice = texttospeech.VoiceSelectionParams(language_code="es-US", name=voice_name)
     # LINEAR16 con Google TTS trae el header WAV incluido: se puede
@@ -1301,7 +1623,7 @@ def say_with_music(persona, text):
     lista), pero el aviso no es una conversacion: no urge.
     """
     pause_listening()
-    voice_name = _VOICES.get(persona, _DEFAULT_VOICE)
+    voice_name = _voice_name(persona)
     partes = _split_sentences(text)
     futures = [_tts_pool.submit(_synthesize, p, voice_name) for p in partes]
     try:
@@ -1519,6 +1841,229 @@ def celebrate():
         resume_listening()
 
 
+# --- Baile largo: la cancion que pide el niño con "baila" ---------------------
+#
+# celebrate() es un gancho de 3 s para marcar el paso de fase. Esto es otra
+# cosa: ~30 s de musica con ritmo para que el robot BAILE, con los brazos
+# cambiando de pose en cada golpe.
+#
+# La melodia es propia (escrita aqui, nada con derechos de autor) y la base
+# ritmica se sintetiza: bombo en cada golpe, redoblante en el 2 y el 4, y
+# charles en las corcheas. Eso es lo que hace que suene a cancion y no a
+# timbre de microondas, sin tener que cargar ningun archivo de audio.
+#
+# La coreografia (que pose va en cada golpe) vive AQUI, no en el sketch: el
+# sketch solo tiene la tabla DANCE_POSES y pone la que le digan, asi que
+# cambiar el baile no obliga a recompilar el MCU.
+
+_DANCE_TEMPO = 132  # pulsos por minuto: un golpe cada 455 ms
+
+# Cada tupla es (nota, divisor): 8 = corchea, 4 = negra, 2 = blanca.
+# Cuatro bloques de 4 compases: gancho (A), subida (B), gancho otra vez y
+# cierre (D). 16 compases de 4/4 a 132 ppm = ~29 s.
+_DANCE_A = [
+    ("C5", 8), ("C5", 8), ("E5", 8), ("G5", 8), ("G5", 8), ("E5", 8), ("C5", 4),
+    ("D5", 8), ("D5", 8), ("F5", 8), ("A5", 8), ("A5", 8), ("F5", 8), ("D5", 4),
+    ("E5", 8), ("E5", 8), ("G5", 8), ("C6", 8), ("C6", 8), ("G5", 8), ("E5", 4),
+    ("D5", 8), ("F5", 8), ("A5", 8), ("G5", 8), ("E5", 8), ("D5", 8), ("C5", 4),
+]
+_DANCE_B = [
+    ("G5", 8), ("A5", 8), ("B5", 8), ("C6", 8), ("C6", 8), ("B5", 8), ("A5", 4),
+    ("F5", 8), ("G5", 8), ("A5", 8), ("B5", 8), ("B5", 8), ("A5", 8), ("G5", 4),
+    ("E5", 8), ("F5", 8), ("G5", 8), ("A5", 8), ("A5", 8), ("G5", 8), ("F5", 4),
+    ("G5", 8), ("E5", 8), ("C5", 8), ("E5", 8), ("G5", 4), ("C6", 4),
+]
+_DANCE_D = [
+    ("C6", 8), ("B5", 8), ("A5", 8), ("G5", 8), ("F5", 8), ("E5", 8), ("D5", 4),
+    ("C5", 8), ("E5", 8), ("G5", 8), ("C6", 8), ("G5", 8), ("E5", 8), ("C5", 4),
+    ("C5", 8), ("E5", 8), ("G5", 8), ("C6", 8), ("C6", 8), ("G5", 8), ("E5", 4),
+    ("C5", 2), ("C5", 2),
+]
+_DANCE_SONG = _DANCE_A + _DANCE_B + _DANCE_A + _DANCE_D
+
+# Pose de DANCE_POSES (sketch.ino) para cada golpe, en bucle: cuatro tijeras,
+# los dos arriba, los dos abajo y un brazo cada vez; despues las tijeras
+# grandes. 16 poses sobre 64 golpes = el baile no se repite igual seguido.
+_DANCE_STEPS = (0, 1, 0, 1, 4, 5, 6, 7, 2, 3, 2, 3, 4, 5, 4, 5)
+
+
+def _drums_pcm(n, sample_rate, beat_samples):
+    """Base ritmica del largo de la melodia: bombo, redoblante y charles."""
+    out = np.zeros(n, dtype=np.float64)
+    rng = np.random.default_rng(7)  # semilla fija: el baile suena siempre igual
+
+    def pega(pos, muestras):
+        if pos >= n:
+            return
+        fin = min(n, pos + len(muestras))
+        out[pos:fin] += muestras[: fin - pos]
+
+    # Bombo: seno grave que cae de 110 a 45 Hz, como una patada.
+    d_bombo = int(0.16 * sample_rate)
+    t = np.arange(d_bombo) / sample_rate
+    bombo = np.sin(2 * np.pi * (110 - 65 * np.clip(t / 0.08, 0, 1)) * t) * np.exp(-t * 22) * 7000
+    # Redoblante: ruido corto con un golpe de tono abajo.
+    d_caja = int(0.12 * sample_rate)
+    t2 = np.arange(d_caja) / sample_rate
+    caja = (rng.normal(0, 1, d_caja) * 0.8 + np.sin(2 * np.pi * 190 * t2) * 0.5) * np.exp(-t2 * 32) * 2600
+    # Charles: ruido muy corto y flojito, para marcar las corcheas.
+    d_hat = int(0.035 * sample_rate)
+    t3 = np.arange(d_hat) / sample_rate
+    hat = rng.normal(0, 1, d_hat) * np.exp(-t3 * 130) * 900
+
+    golpe = 0
+    pos = 0
+    while pos < n:
+        if golpe % 4 in (0, 2):
+            pega(pos, bombo)
+        else:
+            pega(pos, caja)
+        pega(pos, hat)
+        pega(pos + beat_samples // 2, hat)  # la corchea de en medio
+        golpe += 1
+        pos += beat_samples
+    return out
+
+
+def _dance_pcm(sample_rate):
+    """PCM del baile entero y la muestra en que cae cada golpe."""
+    melodia, _ = _melody_pcm(_DANCE_SONG, _DANCE_TEMPO, sample_rate)
+    n = len(melodia)
+    beat_samples = int(60.0 / _DANCE_TEMPO * sample_rate)
+    mezcla = melodia.astype(np.float64) * 0.75 + _drums_pcm(n, sample_rate, beat_samples)
+    pcm = np.clip(mezcla, -32000, 32000).astype(np.int16)
+    beats = list(range(0, n, beat_samples))
+    return pcm, beats
+
+
+def dance(barge=None):
+    """El baile largo: ~30 s de musica con los brazos siguiendo el ritmo.
+
+    barge: un BargeIn (voice.make_barge()) para poder cortarlo hablando. Son
+    30 s: dejar al robot sordo todo ese rato seria peor que el baile.
+    Devuelve {"interrupted": bool, "trigger": ...}. Nunca tira error.
+    """
+    out = {"interrupted": False, "trigger": None}
+    pause_listening(keep_mic=barge is not None)
+    if barge is not None and not barge.start():
+        barge = None
+    stop = barge.event if barge is not None else None
+    try:
+        with _spk_lock:
+            spk = _speaker()
+            pcm, beats = _dance_pcm(spk.sample_rate)
+            chunk = spk.buffer_size
+            beat_chunks = {s // chunk: i for i, s in enumerate(beats)}
+            logger.info(f"Baile: {len(pcm) / spk.sample_rate:.1f}s, {len(beats)} golpes")
+
+            def on_audible(i):
+                paso = beat_chunks.get(i)
+                if paso is not None and _arm_reporter is not None:
+                    try:
+                        _arm_reporter(_DANCE_STEPS[paso % len(_DANCE_STEPS)])
+                    except Exception:
+                        pass
+
+            _play_synced(spk, pcm, on_audible, stop=stop)
+    except Exception as exc:
+        logger.warning(f"No pude tocar el baile: {exc}")
+        _reset_speaker()
+    finally:
+        if barge is not None:
+            barge.stop()
+            if barge.fired():
+                out.update(interrupted=True, trigger=barge.trigger)
+        resume_listening()
+    return out
+
+
+# --- La canción: "¡A despegar!" ------------------------------------------------
+# Lo que la diferencia del baile de dance(): aquí suena un MP3 de verdad
+# (assets/audio/), así que la boca puede seguir el VOLUMEN DE LA CANCIÓN y
+# parecer que canta, mientras los brazos van en el golpe que song.py encontró.
+# Las dos cosas salen del mismo bucle de reproducción, que es lo que las deja
+# sincronizadas de verdad y no cada una por su lado.
+#
+# Dura casi tres minutos: igual que el baile, se puede cortar hablando.
+
+_SING_MOUTH_MIN = 1  # la boca nunca se cierra del todo mientras canta
+
+
+def sing(barge=None):
+    """Toca la canción moviendo la boca con la música y los brazos en el golpe.
+
+    barge: un BargeIn (voice.make_barge()) para poder cortarla hablando. Son
+    ~170 s: dejar al robot sordo todo ese rato sería peor que la canción.
+    Devuelve {"interrupted", "trigger", "reason"}. Nunca tira error: si no hay
+    canción o no se puede decodificar, lo dice en "reason" y el que llama
+    decide qué hacer (main.py hace entonces el baile de siempre).
+    """
+    out = {"interrupted": False, "trigger": None, "reason": None}
+    spk_rate = None
+    try:
+        spk_rate = _speaker().sample_rate
+    except Exception as exc:
+        out["reason"] = f"sin parlante: {exc}"
+        logger.warning(f"No pude cantar: {exc}")
+        return out
+    pcm, beats = song.load(spk_rate)
+    if pcm is None or not len(pcm):
+        out["reason"] = "no hay canción decodificable en assets/audio/"
+        logger.warning(f"No pude cantar: {out['reason']}")
+        return out
+
+    pause_listening(keep_mic=barge is not None)
+    if barge is not None and not barge.start():
+        barge = None
+    stop = barge.event if barge is not None else None
+    try:
+        with _spk_lock:
+            spk = _speaker()
+            chunk = spk.buffer_size
+            # La boca, igual que al hablar: el nivel sale del volumen de cada
+            # bloque. Con música nunca se cierra del todo, porque una boca
+            # cerrada en mitad de una canción parece que se colgó.
+            boca = _mouth_levels(pcm, chunk)
+            boca = [max(_SING_MOUTH_MIN, v) for v in boca]
+            # Los brazos, en el golpe: bloque donde cae cada uno -> paso.
+            paso_de_bloque = {int(b) // chunk: i for i, b in enumerate(beats)}
+            logger.info(f"Canción: {len(pcm) / spk.sample_rate:.0f}s, {len(beats)} golpes")
+
+            enviado = None
+
+            def on_audible(i):
+                nonlocal enviado
+                nivel = boca[min(i, len(boca) - 1)]
+                if nivel != enviado:  # solo los cambios: el Bridge no se satura
+                    _report_mouth(nivel)
+                    enviado = nivel
+                paso = paso_de_bloque.get(i)
+                if paso is not None and _arm_reporter is not None:
+                    try:
+                        _arm_reporter(_DANCE_STEPS[paso % len(_DANCE_STEPS)])
+                    except Exception:
+                        pass
+
+            _play_synced(spk, pcm, on_audible, stop=stop)
+    except Exception as exc:
+        out["reason"] = str(exc)
+        logger.warning(f"No pude tocar la canción: {exc}")
+        _reset_speaker()
+    finally:
+        _report_mouth(0)  # cortada o entera, la boca termina cerrada
+        if barge is not None:
+            barge.stop()
+            if barge.fired():
+                out.update(interrupted=True, trigger=barge.trigger)
+        resume_listening()
+    return out
+
+
+def song_ready():
+    """Para /status y el panel: si la canción está lista para sonar."""
+    return song.available()
+
+
 # Sin audio propio no hay volumen que medir: con espeak la boca recorre los
 # visemas del texto a este ritmo estimado (segundos por unidad de peso; espeak
 # habla a ~175 palabras por minuto) mientras el proceso siga hablando.
@@ -1621,12 +2166,22 @@ _BARGE_MAX_LEAD = 2  # la frase clave tiene que empezar entre las 3 primeras pal
 _BARGE_WEAK_MAX_TOKENS = 3  # "¡Cori!", "¡Oye, Cori!": lo debil solo en frases cortas
 # Palabras NUEVAS y DISTINTAS (que no son eco del robot ni muletillas) para
 # cortar la voz sin palabra clave. Dos bastan: "mi colegio", "los arboles"...
+#
+# Se probo subirlo a 3 para matar los falsos disparos del eco, y NO sirve: el
+# caso de los logs («que necesitas mejor seria conveniente», que es el propio
+# robot mal entendido) trae CUATRO palabras nuevas, asi que pasaba igual. Lo
+# unico que conseguia era que el guia tardara una palabra mas en callarse con
+# un niño de verdad, que es justo lo contrario de lo que se busca. Quien mata
+# el eco es _same_partial() (abajo) y, con bocina, _BARGE_MIN_NOVEL_BT.
 _BARGE_MIN_NOVEL = 2
 # Vosk transcribe el ruido del microfono como una palabra repetida ("tic tic
 # tic tic..."): visto en la placa al conectarse la bocina Bluetooth. Un niño
 # no repite la misma palabra tantas veces seguidas en una frase.
 _BARGE_MAX_REPEAT = 3
-_BARGE_MIN_NOVEL_BT = 3  # con bocina Bluetooth el mic oye al robot: una mas
+# Con bocina Bluetooth el microfono oye al robot de verdad (es por donde
+# entraron TODOS los falsos disparos de los logs), asi que ahi si se pide una
+# palabra mas que antes: 4. Con headset USB el eco es minimo y manda el 2.
+_BARGE_MIN_NOVEL_BT = 4
 
 # Muletillas y palabras sueltas que no cuentan como "voz nueva": son las que
 # Vosk inventa con cualquier ruido. Las claves de verdad ("espera", "oye") van
@@ -1804,6 +2359,24 @@ def _speech_trigger(tokens, joined, spoken, speaker, bt):
     return {"kind": "speech", "persona": speaker, "strong": True, "words": distintas, "text": joined}
 
 
+def _same_partial(previo, actual):
+    """True si dos parciales seguidos de Vosk dicen LO MISMO, y por tanto hay
+    de verdad alguien hablando.
+
+    "Lo mismo" no es identico: la voz real crece ("mi colegio" -> "mi colegio
+    no recicla"), asi que basta con que el parcial nuevo conserve las palabras
+    del anterior. Lo que NO vale es que cambien las palabras de un parcial al
+    siguiente quedandose el mismo tipo: eso es Vosk tanteando con el eco del
+    propio robot, y era lo que callaba al guia sin que nadie hubiera hablado.
+    """
+    if previo is None or actual is None:
+        return False
+    if previo[:2] != actual[:2]:  # (kind, persona)
+        return False
+    antes, ahora = previo[2], actual[2]
+    return bool(antes) and antes <= ahora
+
+
 _vosk_model = None
 _vosk_rec = None  # un solo reconocedor con la gramatica, reusado (Reset) en cada say()
 _vosk_state = "cargando"
@@ -1950,7 +2523,14 @@ class BargeIn:
         if text:
             self.inject(text)  # la respuesta fue mas corta que 1 s
         if self._thread is not None:
-            self._thread.join(timeout=1.0)
+            # Antes era join(timeout=1.0) y, si se pasaba, se seguia igual: el
+            # hilo quedaba vivo leyendo el microfono y le robaba bloques al
+            # turno siguiente. Ahora se espera lo que haga falta (es un bloque
+            # de audio y un Vosk, decimas) y si de verdad no sale, se avisa.
+            self._thread.join(timeout=5.0)
+            if self._thread.is_alive():
+                logger.warning("La escucha activa no termino en 5s: puede estar robandole audio al turno")
+                _debug("⚠ la escucha activa no soltó el micrófono")
         if _active_barge is self:
             _active_barge = None
         if self.audio_s > 0:
@@ -1960,66 +2540,73 @@ class BargeIn:
         if not _vosk_lock.acquire(blocking=False):
             return  # otra voz ya lo usa (no deberia pasar: say() va con _spk_lock)
         try:
-            rec = _vosk_rec
-            rec.Reset()
-            bt = _bt_sink is not None
-            noise = 100.0
-            voiced = []  # monotonic de los bloques con voz
-            last_partial = None
-            while not self._stop.is_set() and not self.event.is_set():
-                try:
-                    chunk = mic.capture()
-                except Exception as exc:
-                    logger.debug(f"Escucha activa: se corto el mic ({exc})")
-                    return
-                if chunk is None or len(chunk) == 0:
-                    time.sleep(0.005)
-                    continue
-                now = time.monotonic()
-                rms = float(np.sqrt(np.mean(chunk.astype(np.float32) ** 2)))
-                if rms > max(_BARGE_MIN_RMS, _BARGE_NOISE_X * noise):
-                    voiced.append(now)
-                else:
-                    noise = 0.95 * noise + 0.05 * rms
-                voiced = [t for t in voiced if now - t < _BARGE_VOICED_TAIL]
-                reciente = [t for t in voiced if now - t < _BARGE_VOICED_WINDOW]
-
-                c0 = time.process_time()
-                is_final = rec.AcceptWaveform(chunk.tobytes())
-                res = json.loads(rec.Result() if is_final else rec.PartialResult())
-                self.cpu_s += time.process_time() - c0
-                self.audio_s += len(chunk) / _SAMPLE_RATE
-
-                text = res.get("text") if is_final else res.get("partial")
-                if not text:
-                    last_partial = None
-                    continue
-                trig = _barge_trigger(text, self.current, self.keys, bt, self.previous, self.persona)
-                # En un final la voz ya paso (Vosk cierra la frase con el
-                # silencio): vale la cola larga. En un parcial, voz AHORA.
-                con_voz = len(reciente if not is_final else voiced) >= _BARGE_VOICED_CHUNKS
-                if trig is not None and now - _audio_change_at < _BARGE_DEVICE_GRACE_S:
-                    logger.debug(f"Barge-in descartado: acaba de cambiar el audio ({trig['text']})")
-                    continue
-                if trig is None or not con_voz or now - self.sentence_at < _BARGE_GRACE_S:
-                    if trig is None:
-                        last_partial = None
-                    continue
-                key = (trig["kind"], trig["persona"])
-                if is_final:
-                    conf = _trigger_conf(res.get("result", []), trig, self.keys)
-                    minima = _BARGE_MIN_CONF_SPEECH if trig["kind"] == "speech" else _BARGE_MIN_CONF
-                    if conf >= minima:
-                        self._fire(trig)
-                    else:
-                        logger.debug(f"Barge-in descartado por confianza {conf:.2f} (<{minima}): {trig['text']}")
-                    last_partial = None
-                elif trig["strong"] and last_partial == key:
-                    self._fire(trig)
-                else:
-                    last_partial = key
+            with _mic_reader("escucha activa"):
+                self._loop(mic)
         finally:
             _vosk_lock.release()
+
+    def _loop(self, mic):
+        """El bucle que lee el mic. Separado de _run() para que el candado
+        del microfono se vea de un vistazo: mientras esto corre, nadie mas
+        puede leer bloques (ver _mic_reader)."""
+        rec = _vosk_rec
+        rec.Reset()
+        bt = _bt_sink is not None
+        noise = 100.0
+        voiced = []  # monotonic de los bloques con voz
+        last_partial = None
+        while not self._stop.is_set() and not self.event.is_set():
+            try:
+                chunk = mic.capture()
+            except Exception as exc:
+                logger.debug(f"Escucha activa: se corto el mic ({exc})")
+                return
+            if chunk is None or len(chunk) == 0:
+                time.sleep(0.005)
+                continue
+            now = time.monotonic()
+            rms = float(np.sqrt(np.mean(chunk.astype(np.float32) ** 2)))
+            if rms > max(_BARGE_MIN_RMS, _BARGE_NOISE_X * noise):
+                voiced.append(now)
+            else:
+                noise = 0.95 * noise + 0.05 * rms
+            voiced = [t for t in voiced if now - t < _BARGE_VOICED_TAIL]
+            reciente = [t for t in voiced if now - t < _BARGE_VOICED_WINDOW]
+
+            c0 = time.process_time()
+            is_final = rec.AcceptWaveform(chunk.tobytes())
+            res = json.loads(rec.Result() if is_final else rec.PartialResult())
+            self.cpu_s += time.process_time() - c0
+            self.audio_s += len(chunk) / _SAMPLE_RATE
+
+            text = res.get("text") if is_final else res.get("partial")
+            if not text:
+                last_partial = None
+                continue
+            trig = _barge_trigger(text, self.current, self.keys, bt, self.previous, self.persona)
+            # En un final la voz ya paso (Vosk cierra la frase con el
+            # silencio): vale la cola larga. En un parcial, voz AHORA.
+            con_voz = len(reciente if not is_final else voiced) >= _BARGE_VOICED_CHUNKS
+            if trig is not None and now - _audio_change_at < _BARGE_DEVICE_GRACE_S:
+                logger.debug(f"Barge-in descartado: acaba de cambiar el audio ({trig['text']})")
+                continue
+            if trig is None or not con_voz or now - self.sentence_at < _BARGE_GRACE_S:
+                if trig is None:
+                    last_partial = None
+                continue
+            key = (trig["kind"], trig["persona"], frozenset(trig.get("words") or ()))
+            if is_final:
+                conf = _trigger_conf(res.get("result", []), trig, self.keys)
+                minima = _BARGE_MIN_CONF_SPEECH if trig["kind"] == "speech" else _BARGE_MIN_CONF
+                if conf >= minima:
+                    self._fire(trig)
+                else:
+                    logger.debug(f"Barge-in descartado por confianza {conf:.2f} (<{minima}): {trig['text']}")
+                last_partial = None
+            elif trig["strong"] and _same_partial(last_partial, key):
+                self._fire(trig)
+            else:
+                last_partial = key
 
 
 def _trigger_conf(result_words, trig, keys):
@@ -2102,22 +2689,23 @@ def _cached_text(persona, key):
 
 
 def _cached_wav(persona, key):
-    wav = _cached_wavs.get((persona, key))
+    voz = _voice_name(persona)
+    wav = _cached_wavs.get((persona, key, voz))
     if wav is not None:
         return wav
     text = _cached_text(persona, key)
     # El hash del texto va en el nombre: si se cambia la frase, se vuelve a sintetizar.
-    path = _TTS_CACHE_DIR / f"{persona}_{key}_{hashlib.md5(text.encode()).hexdigest()[:8]}.wav"
+    path = _TTS_CACHE_DIR / f"{persona}_{key}_{hashlib.md5((voz + text).encode()).hexdigest()[:8]}.wav"
     if path.exists():
         wav = np.frombuffer(path.read_bytes(), dtype=np.uint8)
     else:
-        wav = _synthesize(text, _VOICES.get(persona, _DEFAULT_VOICE))
+        wav = _synthesize(text, _voice_name(persona))
         try:
             _TTS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
             path.write_bytes(wav.tobytes())
         except Exception as exc:
             logger.debug(f"No pude guardar {path}: {exc}")
-    _cached_wavs[(persona, key)] = wav
+    _cached_wavs[(persona, key, voz)] = wav
     return wav
 
 
@@ -2186,7 +2774,7 @@ def say(persona, text, barge=None):
             pass
     stop = barge.event if barge is not None else None
     t0 = time.monotonic()
-    voice_name = _VOICES.get(persona, _DEFAULT_VOICE)
+    voice_name = _voice_name(persona)
     parts = _split_sentences(text)
     futures = [_tts_pool.submit(_synthesize, p, voice_name) for p in parts]
     spoken = []

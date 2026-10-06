@@ -5,7 +5,9 @@
 #               contesta el modelo local y se avisa en el panel de diagnostico.
 #   essentials  Qwen3.5-0.8B en la propia placa (arduino:llm, servido por
 #               llamacpp-models-runner). Mas lento y mas simple, sin Gemini.
-#               La voz (STT/TTS de Google) sigue necesitando internet.
+#               Desde 1.1.1 la voz tampoco sale a internet: se oye con Vosk y
+#               se habla con espeak-ng (ver localvoice.py). Y hay una sola
+#               guia, Cristal (ver guides.ESSENTIALS_GUIDE).
 #
 # El modo lo elige un adulto desde el dashboard (boton ESSENTIALS / PLUS) o la
 # terminal (/modo) y se guarda en data/llm_mode.txt, igual que el modo de la
@@ -32,7 +34,7 @@ logger = Logger("chat-bang")
 
 MODES = ("plus", "essentials")
 DEFAULT_MODE = "plus"
-MODE_LABELS = {"plus": "PLUS (Gemini en la nube)", "essentials": "ESSENTIALS (modelo local)"}
+MODE_LABELS = {"plus": "PLUS (Gemini y voz de Google)", "essentials": "ESSENTIALS (todo en la placa, sin internet)"}
 _MODE_PATH = Path(__file__).resolve().parent.parent / "data" / "llm_mode.txt"
 
 LOCAL_MAX_TOKENS = 70  # ~14 s de generacion como mucho; 1-2 frases + 1 pregunta

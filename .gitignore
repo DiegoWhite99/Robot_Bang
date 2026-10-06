@@ -17,3 +17,6 @@ models/
 # cache de Python (se regenera sola)
 __pycache__/
 *.pyc
+
+# Cache de la cancion: PCM decodificado + golpes (se rehace solo, ver song.py)
+data/song_cache/

@@ -37,9 +37,11 @@
   despues solo viaja por SPI lo que cambia (ver facePlanDiff()). El
   parpadeo recorre la Cara 1..6 (ida y vuelta).
 
-  Baile de celebracion (de Diome-chan): al pasar de fase BANG, Python toca
-  una cancioncita y en cada nota manda Bridge.notify("arm_step", n); el
-  sketch alterna los dos brazos entre dos poses espejadas (ver consumeArmStep()).
+  Baile (de Diome-chan): Python toca musica y en cada golpe manda
+  Bridge.notify("arm_step", i); el sketch pone los brazos en la pose i de
+  DANCE_POSES (ver consumeArmStep()). Son dos bailes: la cancioncita corta al
+  pasar de fase BANG (voice.celebrate(), ~3 s) y el baile largo que pide el
+  niño con "baila" (voice.dance(), ~30 s con ritmo y coreografia).
 
   Bienvenida al BANG: al arrancar la pantalla muestra el GIF de
   assets/img/menu/Bang.gif (convertido por tools/make_splash.py ->
@@ -461,9 +463,31 @@ unsigned long servoLastWriteMs = 0;
 // 90°, como Diome-chan alternaba 30/100 y 0/130 en sus dos brazos. Mientras
 // dura, updateServos() no toca los servos; al terminar, vuelve a la pose
 // del gesto que estaba (o a reposo si ya no habla).
-const int DANCE_SWING_SMALL = 30;
-const int DANCE_SWING_BIG = 60;
-const unsigned long DANCE_HOLD_MS = 450; // sin notas nuevas en este tiempo, se termina el baile
+// Poses del baile, una por golpe de la musica. Python manda el indice con
+// Bridge.notify("arm_step", i) justo cuando suena el golpe, asi la coreografia
+// vive del lado de Python (se cambia sin reflashear) y aqui solo estan las
+// posturas que los SG90 pueden hacer sin pedir demasiada corriente.
+//
+// Antes esto eran dos poses que solo cambiaban de AMPLITUD (-30/+30 y
+// -60/+60): los brazos nunca se cruzaban y el "baile" era un bombeo. Ahora hay
+// tijera en los dos sentidos, los dos arriba, los dos abajo y un brazo solo.
+// Nada pasa de ±60 (ver la nota de corriente de ANGRY).
+const int8_t DANCE_POSES[][2] = {
+  { -35,  35},  // 0 tijera: brazo 1 abajo, brazo 2 arriba
+  {  35, -35},  // 1 tijera al reves
+  { -60,  60},  // 2 tijera grande
+  {  60, -60},  // 3 tijera grande al reves
+  {  55,  55},  // 4 los dos arriba
+  { -25, -25},  // 5 los dos abajo
+  {  60,   0},  // 6 solo el brazo 1 arriba
+  {   0,  60},  // 7 solo el brazo 2 arriba
+  {   0,   0},  // 8 los dos en reposo (para marcar un silencio)
+};
+const uint8_t DANCE_POSE_COUNT = sizeof(DANCE_POSES) / sizeof(DANCE_POSES[0]);
+// Sin golpes nuevos en este tiempo, se termina el baile. Tiene que ser mayor
+// que el tiempo entre golpes de la cancion (a 132 pulsos por minuto, 455 ms):
+// con los 450 de antes el baile se cortaba entre golpe y golpe.
+const unsigned long DANCE_HOLD_MS = 900;
 const uint8_t NO_PENDING_STEP = 0xFF;
 volatile uint8_t pendingArmStep = NO_PENDING_STEP;
 unsigned long danceUntil = 0;
@@ -1052,9 +1076,9 @@ void consumeArmStep() {
   if (step == NO_PENDING_STEP) return;
   pendingArmStep = NO_PENDING_STEP;
 
-  const int swing = (step % 2 == 0) ? DANCE_SWING_SMALL : DANCE_SWING_BIG;
+  const uint8_t pose = step % DANCE_POSE_COUNT;
   rampActive = false;
-  writeArmPair(-swing, swing);
+  writeArmPair(DANCE_POSES[pose][0], DANCE_POSES[pose][1]);
   danceUntil = millis() + DANCE_HOLD_MS;
   servoDancing = true;
   servoRestSettling = false; // al terminar, updateServos() vuelve a reposo solo

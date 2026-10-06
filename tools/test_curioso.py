@@ -70,40 +70,53 @@ _chat_real = llm_router.chat
 llm_router.chat = no_llm
 
 ORDENES = [
-    ("ponte feliz", gestures.HAPPY, False),
-    ("cori ponte muy contenta", gestures.HAPPY, False),
-    ("sonríe", gestures.HAPPY, False),
-    ("ponte triste", gestures.SAD, False),
-    ("ponte enojado", gestures.ANGRY, False),
-    ("sorpréndete", gestures.SURPRISE, False),
-    ("ponte normal", gestures.REST, False),
-    ("descansa", gestures.REST, False),
-    ("baila", gestures.HAPPY, True),
-    ("canta una canción", gestures.HAPPY, True),
-    ("celebra", gestures.HAPPY, True),
+    ("ponte feliz", gestures.HAPPY, None),
+    ("cori ponte muy contenta", gestures.HAPPY, None),
+    ("sonríe", gestures.HAPPY, None),
+    ("ponte triste", gestures.SAD, None),
+    ("ponte enojado", gestures.ANGRY, None),
+    ("sorpréndete", gestures.SURPRISE, None),
+    ("ponte normal", gestures.REST, None),
+    ("descansa", gestures.REST, None),
+    # Bailar es el baile corto sintetizado (voice.dance)...
+    ("baila", gestures.DANCE, "baila"),
+    ("celebra", gestures.DANCE, "baila"),
+    ("haz una fiesta", gestures.DANCE, "baila"),
+    # ...y cantar es "¡A despegar!" de assets/audio/ (voice.sing), que es otra
+    # cosa: canción de verdad, boca con la música y brazos en el golpe (1.1.1).
+    ("canta una canción", gestures.DANCE, "canta"),
+    ("canta", gestures.DANCE, "canta"),
+    ("cántame una canción", gestures.DANCE, "canta"),
+    ("pon música", gestures.DANCE, "canta"),
+    ("ponme la canción", gestures.DANCE, "canta"),
+    ("quiero una canción", gestures.DANCE, "canta"),
+    ("a despegar", gestures.DANCE, "canta"),
     # Gestos de brazos agregados en 1.1.0
-    ("salúdame", gestures.WAVE, False),
-    ("di hola", gestures.WAVE, False),
-    ("aplaude", gestures.CLAP, False),
-    ("dame un aplauso", gestures.CLAP, False),
-    ("ponte a pensar", gestures.THINK, False),
-    ("di que sí", gestures.YES, False),
-    ("di que no", gestures.NO, False),
-    ("muévete", gestures.DANCE, False),
-    ("mueve los brazos", gestures.DANCE, False),
-    ("abrázame", gestures.HUG, False),
-    ("dame un abrazo", gestures.HUG, False),
-    ("duérmete", gestures.SLEEP, False),
-    ("estírate", gestures.STRETCH, False),
-    ("haz un bostezo", gestures.STRETCH, False),
+    ("salúdame", gestures.WAVE, None),
+    ("di hola", gestures.WAVE, None),
+    ("aplaude", gestures.CLAP, None),
+    ("dame un aplauso", gestures.CLAP, None),
+    ("ponte a pensar", gestures.THINK, None),
+    ("di que sí", gestures.YES, None),
+    ("di que no", gestures.NO, None),
+    ("muévete", gestures.DANCE, None),
+    ("mueve los brazos", gestures.DANCE, None),
+    ("abrázame", gestures.HUG, None),
+    ("dame un abrazo", gestures.HUG, None),
+    ("duérmete", gestures.SLEEP, None),
+    ("estírate", gestures.STRETCH, None),
+    ("haz un bostezo", gestures.STRETCH, None),
     # La orden también vale tras el nombre del guía o una cortesía.
-    ("cori, salúdame", gestures.WAVE, False),
-    ("oye cori, por favor aplaude", gestures.CLAP, False),
+    ("cori, salúdame", gestures.WAVE, None),
+    ("oye cori, por favor aplaude", gestures.CLAP, None),
+    ("cori, cántame una canción", gestures.DANCE, "canta"),
 ]
-for text, gesto, celebra in ORDENES:
+for text, gesto, musica in ORDENES:
     r = curioso.turn("cori", text)
-    ok = r.gesture == gesto and r.celebrate == celebra and r.source == "plantilla" and r.reply
-    check(ok, f"{text!r} -> gesto={r.gesture} celebra={r.celebrate} · {r.reply!r}")
+    tiene = {"celebra": r.celebrate, "baila": r.dance, "canta": r.sing}
+    ok = (r.gesture == gesto and r.source == "plantilla" and r.reply
+          and all(v == (k == musica) for k, v in tiene.items()))
+    check(ok, f"{text!r} -> gesto={r.gesture} celebra={r.celebrate} baila={r.dance} canta={r.sing} · {r.reply!r}")
 
 # El genero del guia se respeta en las frases de las ordenes.
 check("enojada" in curioso.turn("cesia", "ponte enojada").reply, "guía mujer: 'enojada'")

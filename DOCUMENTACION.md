@@ -41,7 +41,8 @@ modo ESSENTIALS la conversación la piensa un modelo local en la placa (ver
 16. [Conexión de hardware](#17-conexión-de-hardware)
 17. [Problemas conocidos y su estado](#18-problemas-conocidos-y-su-estado)
 18. [Registro de pruebas realizadas](#19-registro-de-pruebas-realizadas)
-19. [Checklist de pruebas en el robot (1.1.0)](#20-checklist-de-pruebas-en-el-robot-110)
+19. [Diálogo natural, Essentials local y la canción (1.1.1)](#19-bis-diálogo-natural-essentials-local-y-la-canción-111) — [por qué cortaba al niño](#19bis1-por-qué-el-robot-cortaba-al-niño), [el eco del propio robot](#19bis2-el-guía-ya-no-se-calla-solo), [interrumpir y retomar](#19bis3-interrumpir-recordar-y-seguir), [Essentials 100 % en la placa](#19bis4-essentials-todo-en-la-placa), [la canción "¡A despegar!"](#19bis5-la-canción-a-despegar)
+20. [Checklist de pruebas en el robot (1.1.0)](#20-checklist-de-pruebas-en-el-robot-110)
 
 ---
 
@@ -1773,12 +1774,267 @@ flashear**: el robot sigue corriendo el código anterior hasta el próximo
 
 ---
 
+## 19 bis. Diálogo natural, Essentials local y la canción (1.1.1)
+
+### 19bis.1. Por qué el robot cortaba al niño
+
+La escucha daba el turno por terminado cuando lo transcrito llevaba **0,7 s**
+sin cambiar (`voice._ENDPOINT_S`). Un niño de 5 a 14 años que está *pensando*
+lo que va a decir hace pausas de **1,5 a 2 s** en mitad de la idea, así que
+cualquiera de esas pausas disparaba el turno y el guía contestaba a media
+frase. Encima, `listen_turn()` devolvía en cuanto Google marcaba `is_final`,
+y Google cierra una frase apenas oye una pausita: era el mismo corte, por dos
+caminos distintos.
+
+**Lo que hay ahora** (`voice.endpoint_wait()`, función pura y probada):
+
+| Cómo quedó la frase | Espera | Por qué |
+|---|---|---|
+| Termina en conector: "y", "porque", "mi", "nosotros", "de pronto"… | 2,4 s | La idea no terminó, venga lo que venga |
+| Subordinada sin verbo: "mi reto es que en el salón" | 2,4 s | El "que" abrió algo que todavía no cerró |
+| Una o dos palabras | 2,0 s | Todavía está arrancando |
+| Termina en `.`/`?`/`!` y ≥ 4 palabras | 0,8 s | Google puntúa solo: la frase está cerrada |
+| El resto | 1,5 s | Quedó abierta: se le da aire |
+| Tope duro | 30 s | Nunca se escucha para siempre |
+
+Y dos cosas más:
+
+- **`is_final` ya no devuelve el turno**: lo final se acumula en `finals` y se
+  sigue escuchando. Quien manda es el silencio.
+- **Se mira el micrófono**: `_audio_requests()` marca en `voice_at` cada bloque
+  con energía de voz, y mientras haya voz reciente (`_VOICE_HOLD_S`, 0,5 s) el
+  turno no se cierra aunque el texto lleve rato quieto. Cubre a quien alarga
+  las palabras o duda en voz alta.
+
+Los subordinadores son solo `que porque cuando si aunque donde mientras quien
+cual`. **"para", "como" y "según" quedaron fuera a propósito**: son casi
+siempre preposiciones ("un buzón *para* el salón" está terminadísimo) y
+metiéndolas se esperaba de más en frases completas.
+
+### 19bis.2. El guía ya no se calla solo
+
+En los logs del 06/10 la escucha activa se disparaba con el eco del propio
+robot: `{'kind': 'speech', 'words': ['necesitas', 'mejor', 'seria',
+'conveniente']}` no es un niño, es el guía oyéndose a sí mismo mal
+transcrito por Vosk. Dos cambios en `voice._barge_trigger()` / `BargeIn`:
+
+- **3 palabras nuevas** en vez de 2 (`_BARGE_MIN_NOVEL`), y 4 con bocina
+  Bluetooth. Con dos, cualquier mala pasada de Vosk callaba al guía.
+- **El parcial tiene que repetir las mismas palabras** (`_same_partial()`): la
+  voz de verdad crece parcial a parcial ("mi colegio" → "mi colegio no
+  recicla"), el eco mal entendido cambia de palabras cada vez. Antes la clave
+  era solo `(kind, persona)`, así que dos malentendidos distintos contaban
+  como el mismo parcial repetido.
+
+El nombre del guía y "espera" **siguen valiendo con una sola palabra**: ahí el
+niño está pidiendo turno, no hablando.
+
+### 19bis.3. Interrumpir, recordar y seguir
+
+Lo que se pidió: *"cuando el usuario hable con el nombre del agente, se calla
+y escucha, almacena la memoria, prosigue con la memoria y con la nueva idea"*.
+
+1. **Se calla**: `BargeIn` dispara, `voice.say()` corta el audio y vacía el
+   buffer del parlante.
+2. **Almacena**: `bang.mark_interrupted()` guarda en la sesión hasta dónde
+   llegó (`Session.interrumpido`).
+3. **Escucha**: si fue por el nombre o por "espera", dice "¡Dime!" (audio en
+   caché, instantáneo) y arma `_awaiting_aporte`. Si el niño simplemente
+   empezó a hablar (`kind: "speech"`), **no dice nada**: hablarle encima es lo
+   que había que evitar.
+4. **Prosigue con las dos cosas**: en BANG, `bang._context()` mete en el
+   prompt el aporte nuevo *y* lo que el guía venía diciendo, con un "no la
+   repitas entera". En **Curioso** no hay sesión donde guardarlo, así que
+   desde la 1.1.1 `main.loop()` lo lleva a mano hasta
+   `curioso.turn(..., interrumpido=...)`.
+
+### 19bis.4. Essentials: todo en la placa
+
+| Pieza | Plus | Essentials |
+|---|---|---|
+| Modelo | Gemini (`arduino:cloud_llm`) | Qwen3.5-0.8B en la placa (`arduino:llm`) |
+| Escuchar | Google Speech (streaming) | **Vosk**, `models/vosk-es/` |
+| Hablar | Google TTS Chirp3-HD | **espeak-ng**, `es-419+f3` |
+| Guías | los 5 | **solo Cristal** |
+
+- **`python/localvoice.py`** (nuevo) es todo el motor local. El TTS entra por
+  `ctypes` contra `libespeak-ng.so`, que llega como **wheel de pip**
+  (`espeakng-loader`, con el `es_dict` adentro): **no hace falta apt** en el
+  contenedor. Se sintetiza a 22050 Hz, se remuestrea a los 24000 del parlante
+  y se envuelve en un WAV, así que devuelve **exactamente lo mismo** que
+  `voice._synthesize()` y la boca, los visemas y el corte por barge-in siguen
+  funcionando sin tocar nada.
+- La voz es **`es-419+f3`**: español latinoamericano, variante femenina 3, a
+  150 palabras por minuto (las 175 de fábrica son demasiado para un niño).
+  Suena robótica, y está aceptado: lo que se pidió fue una voz de mujer
+  gratis y sin internet.
+- El STT local reusa el modelo de Vosk para el **turno entero**, poniendo en
+  la cola los mismos eventos `("text", frase, es_final)` que el lector de
+  Google: la máquina de estados de `listen_turn()` es **una sola** para los
+  dos modos.
+- Los alias de cómo Vosk oye los nombres ("carmen" → Carmel) **solo** se
+  aplican en este modo (`voice._aliases()`): con Google, "Carmen" tiene que
+  poder ser una amiga del niño.
+- Si falta alguna pieza local (sin `espeakng-loader`, sin modelo de Vosk), se
+  avisa **una vez** en el log y en el panel y ese pedazo lo hace Google: es
+  mejor que quedarse mudo o sordo.
+
+**Por qué una sola guía.** `llama.cpp` reusa el prefijo del prompt que ya
+leyó, pero solo mientras el prompt no cambie. Cinco guías son cinco *system
+prompts* distintos: cambiar de guía tira la caché y el turno siguiente vuelve
+a costar los ~22 s de releer todo. Con una sola el prefijo se queda caliente y
+el turno baja a unos 8 s — la diferencia entre conversar y esperar. Es
+**Cristal** porque la musa reflexiva (calmada, frases cortas, preguntas en vez
+de recetas) es la que mejor le sienta a un modelo pequeño, y porque es la voz
+femenina que se pidió para el modo local. Los candados de `/lock_*` siguen
+existiendo y vuelven a mandar al pasar a Plus.
+
+### 19bis.5. La canción "¡A despegar!"
+
+En **los dos modos** (BANG y Curioso) el niño puede pedir que cante y suena la
+canción de `assets/audio/`, con **la boca siguiendo la música y los brazos en
+el golpe**. Se pide hablando (*"canta"*, *"cántame una canción"*, *"pon
+música"*, *"a despegar"*) o con **`/cantar`** en la terminal del dashboard.
+
+**`python/song.py`** hace tres cosas, y las tres por un motivo:
+
+1. **Decodificar.** El archivo es MP3 y en el contenedor no hay `ffmpeg` del
+   sistema, ni `libsndfile`, ni rueda de `miniaudio` para aarch64 (intentarlo
+   falla al compilar). Se usa el **ffmpeg que viene dentro del wheel**
+   `imageio-ffmpeg`, exactamente la misma idea que `espeakng-loader` en
+   `localvoice.py`: un binario estático dentro de un paquete de pip, sin apt.
+2. **Encontrarle el pulso**, para que los brazos vayan EN el golpe. Flujo
+   espectral (la energía nueva que entra en cada frame, que marca los golpes
+   mejor que el volumen) + autocorrelación, en numpy puro.
+   - La autocorrelación sola se quedaba en **80 BPM**, medio tiempo, con los
+     brazos dormidos: daba picos parecidos en 59,8 / 80,4 / 122,3 BPM y elegía
+     el más lento. Se arregló como en librosa, con una **preferencia de tempo**
+     (campana logarítmica centrada en 120 BPM, `PREF_BPM`/`PREF_WIDTH`) y
+     normalizando la autocorrelación por el solape. Ahora da los **122 BPM**
+     reales: 344 golpes en 169 s.
+   - Si no le encuentra el pulso, rejilla fija a 120 BPM: mover los brazos a
+     tiempo constante se ve mucho mejor que no moverlos.
+3. **Guardarlo en caché** (`data/song_cache/`, en el `.gitignore`). Los dos
+   pasos juntos cuestan ~3 s, así que se hacen **una vez al arrancar la App**,
+   en segundo plano (`song.warmup()` desde `main.loop()`). La clave lleva
+   tamaño y fecha del MP3: cambiar la canción rehace la caché sola.
+
+**`voice.sing()`** reproduce el PCM con `_play_synced()` y, en el **mismo
+bucle**, manda el nivel de boca de cada bloque y el paso de brazos de cada
+golpe — es lo que los deja sincronizados de verdad y no cada uno por su lado.
+Se corta hablando, igual que el baile (son casi tres minutos). La boca nunca
+se cierra del todo mientras canta (`_SING_MOUTH_MIN`): una boca cerrada en
+mitad de una canción parece que se colgó. Si no hay canción, devuelve
+`reason` y `main.py` hace el baile de siempre en vez de dejar la frase
+colgando.
+
+**Cantar y bailar son cosas distintas.** Antes `canta` caía en la misma orden
+que `baila` (el baile corto sintetizado de `voice.dance()`). Ahora `baila`
+sigue siendo ese y `canta` es la canción.
+
+**En BANG es un recreo**: no gasta turno de fase, no pasa por el LLM y el reto
+queda intacto (misma fase, mismas ideas) para seguir al terminar. El comando
+`bang._CMD_SING` va **anclado al principio** de la frase (con el nombre del
+guía o la cortesía delante, como `_ORDEN_LEAD` en Curioso). Sin anclarlo, un
+reto perfectamente normal se convertía en concierto: *"mi reto es que nadie
+**canta** en el coro"* ponía a cantar al robot en vez de escuchar el reto. Lo
+encontró la prueba nueva, no el robot.
+
+### 19bis.6. Conocimiento del RAG
+
+De **198 a 342 fragmentos**. Nuevos: `knowledge/conversacion.md` (cómo se
+conversa por voz) y `knowledge/ejemplos_retos.md` (retos reales de un niño,
+fase por fase). Ampliados: `guias/cristal.md` (al doble: en Essentials **toda**
+la pista sale de ahí o de los generales), `bang_metodologia.md` y
+`comportamiento.md`.
+
+> Cuidado al añadir títulos: `rag._heading_tags()` etiqueta por el texto del
+> `##`. Si dice "tarjeta", esas viñetas pasan a ser lecturas de carta y dejan
+> de salir como pista; si nombra una fase, solo valen en esa fase. Por eso el
+> título nuevo es "Las cartas del mazo, cómo se usan" y no "...una tarjeta".
+
+### 19bis.7. Pruebas
+
+`tools/test_dialogo.py` — **136 comprobaciones**, sin hardware, sin red y sin
+LLM, en seis capas:
+
+1. `endpoint_wait()`: decenas de frases, colgando / cerradas / cortas.
+2. **`listen_turn()` entero**, con un micrófono falso y guiones de
+   transcripciones **con sus tiempos reales**. Aquí vive la prueba del caso
+   que rompía todo ("Cristal mi reto es que en el salón" … pausa de 1,6 s …
+   "nadie recicla la basura").
+3. Barge-in: se calla con voz de verdad, **no** se calla con su propio eco.
+4. Interrumpir y retomar, en BANG y en Curioso.
+5. Essentials (una guía, voz femenina local de verdad sintetizada).
+6. La canción: que se pida igual en los dos modos, que **no** se dispare con
+   un reto que lleve la palabra "canta" dentro, que no toque el reto en curso,
+   y que el audio se decodifique y tenga un pulso parejo y bailable.
+
+Con `--rapido` se salta la capa 2, que corre en tiempo real y tarda ~1 min.
+
+> **Fijar el modo en las pruebas.** Desde 1.1.1 `listen_turn()` elige motor de
+> escucha según el modo activo, y el modo vive en `data/llm_mode.txt`, que
+> sobrevive a los reinicios. Una prueba que falsea el STT de Google tiene que
+> poner `llm_router._mode = "plus"` mientras dura (y restaurarlo): si no,
+> cuando la placa se queda en Essentials la prueba falla sin que nada esté
+> roto. Le pasó a `test_barge_in.py`.
+
 ## 20. Checklist de pruebas en el robot (1.1.0)
 
 Para hacer **después de** `arduino-app-cli app restart`
 (`~/ArduinoApps/robot-bang-stable`). El reinicio compila y flashea el sketch
 nuevo, reinstala el entorno de Python (incluye `vosk`) y levanta el runner
 del modelo local. El primer arranque tarda varios minutos. Ir marcando:
+
+**0 bis. Lo nuevo de la 1.1.1 (hacerlo primero: es lo que hay que validar)**
+
+Esto es lo que no se pudo probar sin un niño delante. Lo demás de la lista
+sigue valiendo igual.
+
+- [ ] **Dejar terminar la idea.** Decir "Crispi" y contar un reto **despacio,
+      con una pausa larga en mitad de la frase**: "mi reto es que en el
+      salón… *(2 s)* …nadie recicla". El guía **no** debe contestar en la
+      pausa: tiene que esperar la segunda mitad. Repetirlo 5 veces: las 5.
+- [ ] **Pausa después de un conector.** "en mi colegio no hay canecas y…
+      *(2 s)* …la basura se queda en el piso". Tampoco debe cortar.
+- [ ] **Y que no se vuelva lento.** Una frase terminada y clara ("quiero
+      mejorar mi equipo de fútbol") tiene que contestarse **en menos de 2 s**
+      de silencio. Si se siente perezoso, bajar `voice._ENDPOINT_DONE_S`.
+- [ ] **El guía no se calla solo.** Dejarlo hablar una respuesta larga **en
+      silencio total** (nadie habla). No puede cortarse. Mirar los logs: no
+      debe aparecer ningún `Barge-in: {'kind': 'speech'...}`. Probar con
+      headset USB **y** con la bocina Bluetooth (ahí el mic lo oye más).
+- [ ] **Pero sí se calla con una persona.** Mientras habla, decirle algo
+      normal ("mi colegio no tiene canecas"): se calla **al instante** y
+      **sin decir nada**, y contesta a lo que se dijo.
+- [ ] **Interrumpir por el nombre.** Mientras habla, decir "¡Cristal!": se
+      calla, dice "¡Dime!" y escucha. Lo que se le diga después tiene que
+      quedar en el reto **y** el guía tiene que retomar donde iba, sin repetir
+      lo ya dicho ni empezar de cero. Probar en **BANG y en Curioso**.
+- [ ] **El guía habla menos.** Ninguna respuesta debería pasar de 3 frases ni
+      de una pregunta.
+- [ ] **Essentials de verdad local.** `/modo essentials` y después
+      **desconectar el wifi**. Tiene que seguir oyendo y hablando: voz de
+      mujer robótica (espeak-ng) y respuestas del Qwen de la placa.
+- [ ] **Essentials, una sola guía.** En ese modo el dashboard muestra solo a
+      Cristal; decir "Crispi" tiene que responder Cristal explicando que en
+      este modo está ella sola. Al volver a `/modo plus`, vuelven los cinco.
+- [ ] **Se entiende la voz local.** Que un niño repita lo que dijo el robot.
+      Si cuesta entenderla, bajar `localvoice.WPM` (150) o tocar `PITCH` (60).
+- [ ] **La canción suena y se oye bien.** `/cantar` en la terminal: tiene que
+      sonar "¡A despegar!" completa (~2:49) por el parlante que esté activo.
+- [ ] **Los brazos van EN el golpe**, no a destiempo ni arrastrados. Mirarlo
+      durante 20-30 s seguidos, que es donde se nota si se desfasa. Si va a
+      medio tiempo (lento) o a doble (frenético), ajustar `song.PREF_BPM`.
+- [ ] **La boca se mueve con la música** (parece que canta) y **se cierra** al
+      terminar o al cortarla.
+- [ ] **Se pide hablando, en los dos modos.** En BANG y en Curioso: "canta",
+      "cántame una canción", "pon música", "a despegar".
+- [ ] **En BANG no se come el reto.** Con un reto en curso, pedir la canción y
+      después seguir: el guía tiene que continuar en la misma fase, con las
+      mismas ideas. Y contar un reto que lleve la palabra dentro ("mi reto es
+      que nadie canta en el coro") **no** debe poner música: debe escucharlo.
+- [ ] **Se corta hablando**, como el baile.
 
 **0. Arranque**
 
@@ -1949,9 +2205,16 @@ docker exec robot-bang-stable-main-1 /app/.cache/.venv/bin/python /app/tools/tes
 docker exec robot-bang-stable-main-1 /app/.cache/.venv/bin/python /app/tools/test_barge_in.py --vosk
 # modo Curioso: elección de modo, órdenes cortas, guardarraíles (sin LLM)
 docker exec robot-bang-stable-main-1 /app/.cache/.venv/bin/python /app/tools/test_curioso.py
+# la canción: decodifica, le busca el pulso y deja la caché lista
+docker exec robot-bang-stable-main-1 /app/.cache/.venv/bin/python /app/python/song.py
+# DIÁLOGO (1.1.1): fin de frase, listen_turn con guiones de tiempos reales,
+#   barge-in contra el propio eco, interrumpir y retomar, Essentials y RAG.
+#   Tarda ~1 min por la capa que corre en tiempo real; con --rapido se salta.
+docker exec robot-bang-stable-main-1 /app/.cache/.venv/bin/python /app/tools/test_dialogo.py
 # gestos
 docker exec -w /app/python robot-bang-stable-main-1 /app/.cache/.venv/bin/python gestures.py
 ```
 
-Las cuatro tienen que terminar en `todo bien`. Los pendientes y las
+Las primeras cuatro tienen que terminar en `todo bien`; `test_dialogo.py`
+termina en `136/136 pruebas pasan (100.0%)` y con código de salida 0. Los pendientes y las
 limitaciones conocidas están en [§18.5](#185-limitaciones-conocidas-escucha-activa-modos-cambio-de-guía-y-caras).

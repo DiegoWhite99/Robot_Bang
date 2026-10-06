@@ -43,13 +43,14 @@ import gestures
 import guardrails
 import guides
 import llm_router
+import song
 import voice
 import wifinet
 
 # Version del producto. FUENTE UNICA: el dashboard la pide al conectarse y
 # /status la repite, asi no hay dos numeros distintos dando vueltas. El tag
 # de git (1.1.0) se pone al final, sobre el commit ya validado.
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.1.1"
 VERSION_NOTICE = "Este producto está en desarrollo y seguirá recibiendo actualizaciones."
 
 # HTTPS con el certificado autofirmado de certs/ (si falta, el brick lo
@@ -129,8 +130,8 @@ _HELP = """Comandos:
   /help                 esta ayuda
   /status               guias desbloqueados, guia activo y salida de audio
   /modo [plus|essentials]  cerebro del robot: plus = Gemini en la nube;
-                        essentials = modelo local (más lento, sin Gemini;
-                        la voz sigue usando internet)
+                        essentials = todo en la placa, sin internet (modelo
+                        Qwen, oído con Vosk y voz con espeak-ng); solo Cristal
   /modo_chat [bang|curioso]  cómo conversa el robot: bang = acompaña el reto
                         por sus fases; curioso = charla libre, responde lo que
                         le pregunten y obedece "ponte feliz", "baila"...
@@ -154,9 +155,21 @@ _HELP = """Comandos:
   /interrumpir <texto>  simula una interrupción (p. ej. /interrumpir cori se
                         me ocurrió algo); si nadie habla, se dispara con la
                         próxima respuesta
+  /mic [segundos]       mide lo que ENTRA por el micrófono (nivel y picos),
+                        sin reconocimiento de por medio: separa "el micrófono
+                        no capta" de "capta pero no se entiende"
   /test_audio           pitido de prueba por la salida actual
   /cara <guia>          muestra la cara de un guia en la pantalla y la hace
                         "hablar" 3 s (para probarla sin microfono)
+  /gesto <nombre>       dispara un solo gesto (cara + brazos) sin hablar, para
+                        ver qué hace cada servo: reposo, hablar, feliz,
+                        sorpresa, enojado, uff, triste, saludo, aplauso,
+                        pensar, si, no, baile, abrazo, dormir, estiron
+  /baila                la canción de baile (~30 s) con la coreografía de
+                        brazos; háblale al robot para cortarla
+  /cantar               "¡A despegar!" (assets/audio/): la canción de verdad,
+                        con la boca siguiendo la música y los brazos en el
+                        golpe; háblale al robot para cortarla
   /bienvenida           repite la bienvenida al BANG (GIF + presentadora)
   /menu_guias           muestra el menú de los 5 guías en la pantalla, con su
                         tono; /menu_guias off lo cierra
@@ -284,9 +297,9 @@ def _set_chat_mode(arg, hablado=False, voz=None):
         texto = _MODO_DICHO[m]
         persona = voz or WELCOME_VOICE
         ui.send_message("reply", {"persona": persona, "text": texto})
-        gestures.send(gestures.HAPPY, persona if persona in brain.PERSONAS else guides.ALWAYS_UNLOCKED)
+        gestures.send(gestures.HAPPY, persona if persona in brain.PERSONAS else guides.default_guide())
         voice.say(persona, texto)
-        gestures.send(gestures.REST, persona if persona in brain.PERSONAS else guides.ALWAYS_UNLOCKED)
+        gestures.send(gestures.REST, persona if persona in brain.PERSONAS else guides.default_guide())
     return f"🎛 {curioso.MODE_LABELS[m]}"
 
 
@@ -315,14 +328,27 @@ def _set_llm_mode(arg):
         m = llm_router.set_mode(arg)
     except ValueError as exc:
         return f"⚠ {exc}"
+    global _current_persona, _follow_up
     if m != before:
         brain.clear_all()
+        # El modo cambia QUIEN esta disponible (en Essentials solo Cristal), asi
+        # que un guia activo que ya no existe en este modo tiene que soltarse: si
+        # no, el proximo turno seguiria hablandole a alguien que no esta.
+        if _current_persona and not guides.is_unlocked(_current_persona):
+            _broadcast_debug(f"🔀 {brain.PERSONAS[_current_persona]['name']} no está en este modo: pasa a {brain.PERSONAS[guides.default_guide()]['name']}")
+            _current_persona = guides.default_guide()
+            ui.send_message("active_persona", {"key": _current_persona})
+        _follow_up = None
+        ui.send_message("personas", _personas_payload())
     ui.send_message("llm_mode", _llm_mode_payload())
     if m == "essentials":
-        _broadcast_debug("🧠 modo ESSENTIALS: modelo local (cargándolo en segundo plano, ~20 s)")
-        return "🧠 ESSENTIALS: modelo local en la placa (más lento, sin Gemini). La voz sigue usando internet."
+        _broadcast_debug("🧠 modo ESSENTIALS: todo en la placa (modelo, escucha y voz); cargando, ~20 s")
+        threading.Thread(target=voice.warmup, daemon=True, name="voz-warmup").start()
+        return ("🧠 ESSENTIALS: todo corre en la placa, sin internet — modelo Qwen, escucha con Vosk y voz "
+                f"con espeak-ng. Te acompaña {brain.PERSONAS[guides.ESSENTIALS_GUIDE]['name']}, la única guía de este modo.")
     _broadcast_debug("☁️ modo PLUS: Gemini en la nube (si falla, contesta el modelo local)")
-    return "☁️ PLUS: Gemini en la nube. Si Gemini falla, ese turno lo contesta el modelo local."
+    threading.Thread(target=voice.warmup, daemon=True, name="voz-warmup").start()
+    return "☁️ PLUS: Gemini en la nube y voz de Google. Si Gemini falla, ese turno lo contesta el modelo local."
 
 
 def _bt():
@@ -448,11 +474,21 @@ def run_command(line):
         return _barge_cmd(arg)
     if cmd == "interrumpir":
         return _interrumpir_cmd(arg)
+    if cmd in ("mic", "microfono", "micro"):
+        # Diagnóstico honesto: mide lo que ENTRA, sin STT de por medio, para
+        # separar "el micrófono no capta" de "capta pero no se entiende".
+        return voice.mic_report(float(arg) if arg.replace(".", "").isdigit() else 4.0)
     if cmd == "test_audio":
         voice.ack()
         return f"🔊 pitido por {voice.output_name()}"
     if cmd == "cara":
         return _face_demo(arg)
+    if cmd == "gesto":
+        return _gesture_cmd(arg)
+    if cmd == "baila":
+        return _dance_cmd()
+    if cmd in ("cantar", "canta", "cancion"):
+        return _cantar_cmd()
     if cmd == "menu":
         return _menu()
     if cmd == "tarjeta":
@@ -531,6 +567,72 @@ def _face_demo(arg):
 
     threading.Thread(target=run, daemon=True, name="face-demo").start()
     return f"🙂 mostrando la cara de {brain.PERSONAS[key]['name']}"
+
+
+# Nombre hablado -> gesto, para /gesto. Es el mismo orden en que se prueban
+# los brazos al calibrar los servos (ver la cabecera de sketch/sketch.ino).
+_GESTOS = {
+    "reposo": gestures.REST, "hablar": gestures.TALK, "feliz": gestures.HAPPY,
+    "sorpresa": gestures.SURPRISE, "enojado": gestures.ANGRY,
+    "uff": gestures.FRUSTRATED, "triste": gestures.SAD, "saludo": gestures.WAVE,
+    "aplauso": gestures.CLAP, "pensar": gestures.THINK, "si": gestures.YES,
+    "no": gestures.NO, "baile": gestures.DANCE, "abrazo": gestures.HUG,
+    "dormir": gestures.SLEEP, "estiron": gestures.STRETCH,
+}
+
+
+def _gesture_cmd(arg):
+    """/gesto <nombre>: dispara UN gesto en la cara y los brazos, sin hablar.
+
+    Es la forma de ver que hace cada servo sin tener que adivinar la frase que
+    lo dispara, y es lo que hay que usar para calibrar ARM1_DIR / ARM2_DIR en
+    sketch/sketch.ino: con /gesto feliz los DOS brazos tienen que subir.
+    """
+    nombre = (arg or "").strip().lower().replace("ó", "o").replace("í", "i")
+    if nombre not in _GESTOS:
+        return "Uso: /gesto <nombre>. Opciones: " + ", ".join(_GESTOS)
+    key = _current_persona or "crispi"
+    gesto = _GESTOS[nombre]
+
+    def run():
+        gestures.send(gesto, key)
+        time.sleep(4)  # lo que dura la entrada del gesto mas un poco de vaiven
+        gestures.send(gestures.REST, key)
+
+    threading.Thread(target=run, daemon=True, name="gesture-demo").start()
+    return f"🦾 gesto «{nombre}» con {brain.PERSONAS[key]['name']} (vuelve a reposo en 4 s)"
+
+
+def _cantar_cmd():
+    """/cantar: pone la canción sin tener que pedirla por voz (para probar)."""
+    persona = _current_persona if _current_persona in brain.PERSONAS else guides.default_guide()
+    if not voice.song_ready():
+        return "⚠ no hay ninguna canción en assets/audio/"
+    def run():
+        gestures.send(gestures.DANCE, persona)
+        res = voice.sing(barge=voice.make_barge(persona, tuple(brain.PERSONAS)))
+        gestures.send(gestures.REST, persona)
+        if res.get("reason"):
+            _broadcast_debug(f"⚠ no pude cantar: {res['reason']}")
+    threading.Thread(target=run, daemon=True, name="cantar").start()
+    return "🎤 ¡A despegar! (háblale para que pare)"
+
+
+def _dance_cmd():
+    """/baila: la cancion larga con la coreografia, sin tener que hablarle.
+
+    Es la misma voice.dance() de la orden "baila", para poder probar el ritmo
+    y las poses de los servos desde la terminal del dashboard.
+    """
+    key = _current_persona or "crispi"
+
+    def run():
+        gestures.send(gestures.DANCE, key)
+        voice.dance(barge=voice.make_barge(key, tuple(brain.PERSONAS)))
+        gestures.send(gestures.REST, key)
+
+    threading.Thread(target=run, daemon=True, name="dance-demo").start()
+    return f"🕺 {brain.PERSONAS[key]['name']} está bailando (~30 s; háblale para parar)"
 
 
 def on_terminal(sid, data):
@@ -743,10 +845,21 @@ AVISO_TEXTO = (
 
 
 def _welcome_text():
-    names = [f"{p['name']}, {p['tagline'].lower()}" for p in brain.PERSONAS.values()]
+    keys = guides.unlocked()
+    if len(keys) == 1:
+        # Essentials: ofrecer cinco guias y tener uno solo es prometer lo que
+        # no hay; el niño diria "Cori" y le contestaria Cristal.
+        p = brain.PERSONAS[keys[0]]
+        return (
+            "¡Hola! Bienvenidos a BANG, la Academia de Innovación de la CUN. "
+            "Aquí convertimos tus retos en ideas que se pueden construir. "
+            f"En este modo te acompaño yo, {p['name']}, {p['tagline'].lower()}. "
+            f"Di {p['name']} y cuéntame tu reto."
+        )
+    names = [f"{brain.PERSONAS[k]['name']}, {brain.PERSONAS[k]['tagline'].lower()}" for k in keys]
     return (
         "¡Hola! Bienvenidos a BANG, la Academia de Innovación de la CUN. "
-        "Aquí convertimos tus retos en ideas que se pueden construir, con la ayuda de cinco guías. "
+        f"Aquí convertimos tus retos en ideas que se pueden construir, con la ayuda de {len(names)} guías. "
         f"¿Con qué guía quieres conversar? {'; '.join(names[:-1])}; o {names[-1]}. "
         "Di su nombre para empezar."
     )
@@ -802,11 +915,11 @@ def _elegir_modo(intentos=2):
             texto = _MODO_PREGUNTA if intento == 0 else _MODO_REPITE
             _broadcast_status("🎛 ¿BANG o Curioso? dilo en voz alta")
             ui.send_message("reply", {"persona": WELCOME_VOICE, "text": texto})
-            gestures.send(gestures.TALK, guides.ALWAYS_UNLOCKED)
+            gestures.send(gestures.TALK, guides.default_guide())
             # La pregunta también se puede interrumpir: si el niño contesta
             # antes de que termine, lo que oyó Vosk sirve de respuesta.
             res = voice.say(WELCOME_VOICE, texto, barge=voice.make_barge(WELCOME_VOICE, tuple(brain.PERSONAS)))
-            gestures.send(gestures.REST, guides.ALWAYS_UNLOCKED)
+            gestures.send(gestures.REST, guides.default_guide())
             wake, text = voice.listen_turn(
                 list(brain.PERSONAS) + list(AUTO_WAKE), follow_up=_MODO_FOLLOW,
                 follow_up_s=MODO_WAIT_S, name_only=tuple(brain.PERSONAS) + AUTO_WAKE,
@@ -867,11 +980,11 @@ def _welcome():
         _broadcast_status("🎉 ¡Bienvenidos a BANG!")
         ui.send_message("reply", {"persona": WELCOME_VOICE, "text": text})
         # Con el GIF en pantalla el gesto solo mueve los brazos.
-        gestures.send(gestures.HAPPY, guides.ALWAYS_UNLOCKED)
+        gestures.send(gestures.HAPPY, guides.default_guide())
         voice.say(WELCOME_VOICE, text)
         gestures.send_splash(False)
     finally:
-        gestures.send(gestures.REST, guides.ALWAYS_UNLOCKED)
+        gestures.send(gestures.REST, guides.default_guide())
         _welcome_lock.release()
 
 
@@ -1013,12 +1126,12 @@ def _pick_persona(wake, text):
         # Crispi), y asi no se paga una llamada al LLM por cada pregunta.
         if _current_persona in unlocked:
             return _current_persona, ""
-        persona = unlocked[0] if unlocked else guides.ALWAYS_UNLOCKED
+        persona = unlocked[0] if unlocked else guides.default_guide()
         return persona, f"Te acompaño yo, {brain.PERSONAS[persona]['name']}. "
     if guardrails.respuesta_fija(text, ""):
         # Pregunta de identidad, datos privados...: la contesta bang.turn()
         # con respuesta fija; no vale la pena clasificar.
-        persona = _current_persona if _current_persona in unlocked else guides.ALWAYS_UNLOCKED
+        persona = _current_persona if _current_persona in unlocked else guides.default_guide()
         return persona, ""
     if len(unlocked) == 1:
         # Con un solo guia no hay nada que clasificar: nos ahorramos una
@@ -1028,7 +1141,7 @@ def _pick_persona(wake, text):
         _broadcast_status("🧭 eligiendo el mejor guía para tu reto...")
         persona = bang.classify(text, unlocked)
         if persona not in unlocked:
-            persona = guides.ALWAYS_UNLOCKED
+            persona = guides.default_guide()
     return persona, f"Para este reto te acompaño yo, {brain.PERSONAS[persona]['name']}. "
 
 
@@ -1039,15 +1152,28 @@ def _o(key):
 
 
 def _say_locked(wake):
+    """El niño llamo a un guia que ahora no esta: contesta el que si esta.
+
+    Son dos situaciones distintas y el mensaje tiene que notarlo. En Plus es un
+    candado (/lock_cesia) y se puede quitar. En Essentials no hay candado: el
+    modo entero corre con un solo guia (guides.ESSENTIALS_GUIDE), asi que lo
+    honesto es decir que en este modo esta ella sola, no que "esta bloqueada".
+    """
     name = brain.PERSONAS[wake]["name"]
-    crispi = guides.ALWAYS_UNLOCKED
+    quien = guides.default_guide()
+    yo = brain.PERSONAS[quien]["name"]
     gestures.send_card()
-    _broadcast_status(f"🔒 {name} todavía está bloquead{_o(wake)}")
-    msg = f"{name} todavía está bloquead{_o(wake)}. Por ahora te acompaño yo, Crispi: di Crispi y cuéntame tu reto."
-    ui.send_message("reply", {"persona": crispi, "text": msg})
-    gestures.send(gestures.TALK, crispi)
-    voice.say(crispi, msg)
-    gestures.send(gestures.REST, crispi)
+    if guides.essentials_only():
+        _broadcast_status(f"🔒 en modo Essentials solo está {yo}")
+        msg = (f"En este modo estoy yo sola, {yo}. {name} vuelve cuando cambien el robot a modo Plus. "
+               f"Mientras tanto te acompaño yo: cuéntame tu reto.")
+    else:
+        _broadcast_status(f"🔒 {name} todavía está bloquead{_o(wake)}")
+        msg = f"{name} todavía está bloquead{_o(wake)}. Por ahora te acompaño yo, {yo}: di {yo} y cuéntame tu reto."
+    ui.send_message("reply", {"persona": quien, "text": msg})
+    gestures.send(gestures.TALK, quien)
+    voice.say(quien, msg)
+    gestures.send(gestures.REST, quien)
 
 
 # --- Escucha activa y cambio de guia -------------------------------------------
@@ -1172,7 +1298,8 @@ _FILLERS = {
 _filler_turn = 0
 PLUS_FILLER_AFTER = 3.0  # s sin respuesta de Gemini antes de decir la frase de relleno
 
-_SOURCE_LABELS = {"gemini": "☁️ Gemini", "local": "🧠 modelo local", "fijo": "🛡 respuesta fija", "plantilla": "📋 plantilla"}
+_SOURCE_LABELS = {"gemini": "☁️ Gemini", "gemini_web": "☁️🔎 Gemini + internet", "local": "🧠 modelo local",
+                  "fijo": "🛡 respuesta fija", "plantilla": "📋 plantilla"}
 
 
 def _say_filler(persona):
@@ -1203,6 +1330,9 @@ def loop():
 
     if not _welcomed:
         _welcomed = True
+        # Decodificar el MP3 y buscarle el pulso cuesta ~3 s: se hace ahora, en
+        # segundo plano, para que cuando el niño pida la canción suene ya.
+        threading.Thread(target=song.warmup, args=(voice.TTS_SAMPLE_RATE,), daemon=True, name="song-warmup").start()
         _boot_sequence()
 
     # Mientras se le pregunta el modo (arranque, /menu, /elegir_modo) manda esa
@@ -1237,6 +1367,10 @@ def loop():
     aporte = espera
     if aporte and (switch or wake != aporte["persona"] or time.monotonic() - aporte["at"] > APORTE_WAIT_S):
         aporte = None
+    # Lo que el guia alcanzo a decir antes de que lo cortaran. En BANG se guarda
+    # en la sesion (bang.mark_interrupted) y viaja en _context(); en Curioso no
+    # hay sesion donde guardarlo, asi que se lleva a mano hasta curioso.turn().
+    cortado = (aporte or {}).get("spoken", "") if aporte else ""
     if curioso.is_curioso():
         aporte = None  # en Curioso no hay reto: una interrupción es un turno más
 
@@ -1274,7 +1408,7 @@ def loop():
     pedido = curioso.find_mode(text)
     if pedido and pedido != curioso.mode():
         voz = _current_persona if _current_persona in brain.PERSONAS and guides.is_unlocked(_current_persona) else None
-        ui.send_message("heard", {"persona": voz or guides.ALWAYS_UNLOCKED, "text": text})
+        ui.send_message("heard", {"persona": voz or guides.default_guide(), "text": text})
         voice.ack()
         _set_chat_mode(pedido, hablado=True, voz=voz)
         _follow_up = voz
@@ -1314,8 +1448,11 @@ def loop():
     elif curioso.is_curioso():
         # Modo Curioso: charla libre con la personalidad del guía, mas las
         # ordenes cortas ("ponte feliz", "baila"), que no pasan por el LLM.
+        # Si venia de una interrupcion, el guia retoma donde lo cortaron en vez
+        # de arrancar de cero (es lo que hace que la charla no se sienta a
+        # saltos cuando el niño le habla encima).
         slow = curioso.slow_turn(persona, text)
-        job = lambda: curioso.turn(persona, text)  # noqa: E731
+        job = lambda: curioso.turn(persona, text, interrumpido=cortado)  # noqa: E731
     else:
         slow = bang.slow_turn(persona, text)
         job = lambda: bang.turn(persona, text)  # noqa: E731
@@ -1361,10 +1498,36 @@ def loop():
     gestures.send(gesture, persona)
     if _speak(persona, reply, depth):
         return  # lo interrumpieron: _on_barge() ya dejo el seguimiento armado
-    if getattr(result, "celebrate", False):
-        # "¡Baila!", "¡canta!": la cancioncita y el baile de brazos, DESPUES de
-        # decir la frase (bailar mientras habla se pisa con la boca).
-        _broadcast_status(f"🎉 ¡{name} está bailando!")
+    if getattr(result, "sing", False):
+        # "¡A despegar!": la canción de assets/audio/, con la boca siguiendo la
+        # música y los brazos en el golpe (ver voice.sing() y song.py). Son
+        # ~170 s, así que se puede cortar hablando, igual que el baile.
+        _broadcast_status(f"🎤 ¡{name} está cantando! (dile algo para parar)")
+        res = voice.sing(barge=voice.make_barge(persona, tuple(brain.PERSONAS)))
+        gestures.send(gestures.REST, persona)
+        if res.get("reason"):
+            # Sin canción no se deja al niño con la frase colgando: baila.
+            _broadcast_debug(f"⚠ no pude cantar ({res['reason']}): bailo en su lugar")
+            res = voice.dance(barge=voice.make_barge(persona, tuple(brain.PERSONAS)))
+            gestures.send(gestures.REST, persona)
+        if res.get("interrupted"):
+            _broadcast_debug("🗣 la canción se cortó porque el niño habló")
+            _on_barge(persona, {"interrupted": True, "spoken": "", "trigger": res.get("trigger")}, depth)
+            return
+    elif getattr(result, "dance", False):
+        # "¡Baila!": la cancion larga (~30 s) con la coreografia de brazos,
+        # DESPUES de decir la frase (bailar mientras habla se pisa con la
+        # boca). Se puede cortar hablando: 30 s sordo serian demasiados.
+        _broadcast_status(f"🕺 ¡{name} está bailando! (dile algo para parar)")
+        res = voice.dance(barge=voice.make_barge(persona, tuple(brain.PERSONAS)))
+        gestures.send(gestures.REST, persona)
+        if res.get("interrupted"):
+            _broadcast_debug("🗣 el baile se cortó porque el niño habló")
+            _on_barge(persona, {"interrupted": True, "spoken": "", "trigger": res.get("trigger")}, depth)
+            return
+    elif getattr(result, "celebrate", False):
+        # Paso de fase o "¡celebra!": la cancioncita corta de siempre.
+        _broadcast_status(f"🎉 ¡{name} está celebrando!")
         voice.celebrate()
     gestures.send(gestures.REST, persona)
 

@@ -5,6 +5,8 @@
 # nube (el codigo de este archivo) y ESSENTIALS = modelo local en la placa.
 # bang.py sigue llamando a chat() igual que antes; el router decide.
 
+import time
+
 from arduino.app_bricks.cloud_llm import CloudLLM
 from arduino.app_utils import Logger
 
@@ -33,13 +35,19 @@ PERSONAS = {
 #   INVALID_ARGUMENT y ningun modelo llega a responder.
 MODELS = ("google:gemini-3.1-flash-lite", "google:gemini-3.5-flash-lite", "google:gemini-flash-lite-latest")
 # 12 s alcanzaba con el prompt corto de antes; con los prompts de fase de
-# bang.py (y Gemini cargado) varios turnos daban 504 DEADLINE_EXCEEDED.
-TIMEOUT = 20
-# El cliente de Gemini (langchain) reintenta por su cuenta 6 veces, con
-# espera creciente, ante un 503 "high demand": una sola respuesta llego a
-# tardar 96 s. Con 1 reintento se falla rapido y chat() pasa al modelo
-# siguiente, que suele contestar al toque.
-MAX_RETRIES = 1
+# bang.py (y Gemini cargado) varios turnos daban 504 DEADLINE_EXCEEDED, asi que
+# subio a 20. Pero 20 s era el plazo de UN intento: con un reintento y tres
+# modelos, un rato de 503 costaba minutos (medido el 05/10/2026: 48 s en el
+# primer modelo antes de pasar al segundo). Para un robot que contesta por voz
+# eso es un cuelgue. Ahora el plazo vuelve a 12 s (por debajo de 10 Gemini
+# rechaza el deadline con INVALID_ARGUMENT) y no hay reintentos: ante un 503 se
+# pasa al modelo siguiente, que suele contestar al toque.
+TIMEOUT = 12
+MAX_RETRIES = 0
+# Y, pase lo que pase, la ronda entera de modelos no se lleva mas de esto: si
+# ninguno contesto en BUDGET segundos, mejor el modelo local (o la respuesta de
+# reserva) que seguir haciendo esperar al niño en silencio.
+BUDGET = 26
 
 _llms = {}
 
@@ -56,9 +64,16 @@ def persona_intro(key):
 
 
 # Reglas de voz comunes: la respuesta la dice el robot en voz alta.
+#
+# Estaba en "2 a 4 frases" y el guia hablaba de mas: por voz, cuatro frases son
+# unos 15 segundos de monologo, y el niño se desconecta o lo interrumpe (que
+# era justo la queja). En una conversacion hablada de verdad los turnos son
+# cortos y van y vienen; el guia no tiene que decirlo todo de una.
 SPOKEN_RULES = (
-    "Responde en espanol, en 2 a 4 frases cortas: tu respuesta la dice el robot "
-    "en voz alta, asi que debe sonar natural al hablarla. "
+    "Responde en espanol, en 1 a 3 frases cortas y como mucho una pregunta al final: "
+    "tu respuesta la dice el robot en voz alta y la persona esta esperando su turno, "
+    "asi que se breve y deja que ella hable. Nunca pases de 45 palabras. "
+    "No repitas lo que la persona acaba de decir con otras palabras. "
     "No uses markdown, listas, vinetas ni emojis: solo texto hablado natural."
 )
 
@@ -101,7 +116,11 @@ def chat_gemini(cache_key, system_prompt, text, temperature=None, memory=True):
     alterno suele contestar en un par de segundos. Sin API_KEY, CloudLLM
     lanza ValueError al construirse: tambien cae en None.
     """
+    limite = time.monotonic() + BUDGET
     for model in MODELS:
+        if time.monotonic() >= limite:
+            logger.warning(f"Gemini agoto los {BUDGET}s de margen; no pruebo mas modelos")
+            break
         try:
             if memory:
                 return _get_llm(cache_key, model, system_prompt, temperature).chat(text)

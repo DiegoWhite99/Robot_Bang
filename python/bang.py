@@ -38,6 +38,7 @@ import brain
 import guardrails
 import llm_router
 import rag
+import song
 from arduino.app_utils import Logger
 
 logger = Logger("chat-bang")
@@ -155,6 +156,10 @@ class Turn:
     new_persona: str = None  # el clasificador eligio guia (cuando se llamo al "robot")
     card: tuple = None  # (guia, numero) de la tarjeta recien volteada, para la pantalla
     source: str = None  # quien contesto: gemini | local | fijo | plantilla (para el diagnostico)
+    # "canta" tambien vale en BANG (1.1.1): la cancion de assets/audio/, con
+    # la boca siguiendo la musica y los brazos en el golpe (ver voice.sing()).
+    # El reto NO se toca: al terminar, el guia sigue donde iba.
+    sing: bool = False
 
 
 # --- Guardarrailes del facilitador (openai.js de bang-lite-ai) ---------------
@@ -415,6 +420,10 @@ _CMD_NEXT = re.compile(r"\b(siguiente fase|proxima fase|otra fase|cambia\w* de f
 # llevan tilde), para quitarlo del reto que se guarda.
 _CMD_NEW_RAW = re.compile(_CMD_NEW.pattern, re.I)
 _CMD_CARD = re.compile(r"\b(tarjeta|carta|inspirame)\b")
+# Pedir la cancion. Vale en cualquier fase y no gasta turno de la fase: es un
+# recreo en mitad del reto, no una respuesta del niño. El patron vive en
+# song.SING_RE, UNA sola vez para los dos modos: tener una copia aqui y otra en
+# curioso.py ya costo un bug ("canta" funcionaba y "quiero que cantes" no).
 
 
 # --- Turno -------------------------------------------------------------------
@@ -447,6 +456,13 @@ def _turn(persona, text):
     t = _plain(text)
     s = _sessions.get(persona)
 
+    # La cancion va ANTES que nada: si no, pedirla sin reto en curso la
+    # guardaria COMO reto ("tu reto es: canta una cancion"). Es un recreo, no
+    # una respuesta: no gasta turno de fase, no pasa por el LLM y al terminar
+    # el guia sigue justo donde iba.
+    if song.pide_cancion(t):
+        return Turn(_sing_template(), sing=True, source="plantilla")
+
     if s is None or not s.reto or _CMD_NEW.search(t):
         return _start(persona, text, restarted=s is not None and bool(s.reto))
 
@@ -475,6 +491,8 @@ def slow_turn(persona, text):
     if not llm_router.is_local() or guardrails.respuesta_fija(text, ""):
         return False
     t = _plain(text)
+    if song.pide_cancion(t):
+        return False  # la cancion es plantilla: suena al instante
     s = _sessions.get(persona)
     if s is None or not s.reto or _CMD_NEW.search(t):
         return bool(_CMD_NEW.sub("", t).strip(" ,."))  # "nuevo reto" solo: plantilla
@@ -688,6 +706,18 @@ def _clean_aporte(text):
     if not t or _NO_APORTE.match(_plain(t)):
         return ""
     return t
+
+
+_SING_LEAD = ("¡A despegar! Canto y bailo, y después seguimos.",
+              "¡Esa me la sé! A despegar. Háblame cuando quieras que pare.")
+_sing_turno = 0
+
+
+def _sing_template():
+    """Lo que dice el guia antes de cantar, sin gastar una llamada al LLM."""
+    global _sing_turno
+    _sing_turno += 1
+    return _SING_LEAD[_sing_turno % len(_SING_LEAD)]
 
 
 def _contribute_template(s, idea):

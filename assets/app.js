@@ -60,8 +60,8 @@ function onVersion(data) {
 const modeButtons = document.querySelectorAll('.mode-btn[data-mode]');
 const modeNote = document.querySelector('#mode-note');
 const MODE_NOTES = {
-  essentials: 'Essentials: modelo local (más lento, sin Gemini). La voz sigue usando internet.',
-  plus: 'Plus: Gemini en la nube (rápido). Si Gemini falla, ese turno lo contesta el modelo local.',
+  essentials: 'Essentials: todo en la placa, sin internet — modelo, oído y voz. Te acompaña Cristal, la única guía de este modo.',
+  plus: 'Plus: Gemini y voz de Google (rápido, los 5 guías). Si Gemini falla, ese turno lo contesta el modelo local.',
 };
 let llmMode = null;
 
@@ -82,7 +82,7 @@ modeButtons.forEach((btn) => {
   btn.addEventListener('click', () => {
     const mode = btn.dataset.mode;
     if (mode === llmMode) return;
-    const label = mode === 'essentials' ? 'ESSENTIALS (modelo local, más lento)' : 'PLUS (Gemini en la nube)';
+    const label = mode === 'essentials' ? 'ESSENTIALS (todo en la placa, sin internet, solo Cristal)' : 'PLUS (Gemini y voz de Google, los 5 guías)';
     if (!confirm(`¿Cambiar el cerebro del robot a ${label}? El reto en curso se conserva.`)) return;
     modeButtons.forEach((b) => (b.disabled = true));
     modeNote.textContent = 'cambiando de modo...';

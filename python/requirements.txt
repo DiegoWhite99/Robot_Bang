@@ -7,3 +7,13 @@ qrcode==7.4.2
 # el guia habla, sin costo de API. El modelo (~40 MB) lo baja
 # tools/install_vosk_model.py a models/vosk-es/ (voice.py lo llama solo).
 vosk==0.3.45
+
+espeakng-loader==0.2.4  # libespeak-ng + espeak-ng-data como wheel: voz LOCAL del modo
+                        # Essentials (ver python/localvoice.py). No hace falta apt:
+                        # trae la .so y el es_dict adentro.
+
+# La cancion "¡A despegar!" (assets/audio/) viene en MP3 y en el contenedor no
+# hay ffmpeg del sistema, ni libsndfile, ni rueda de miniaudio para aarch64.
+# Este wheel trae un ffmpeg estatico adentro y lo decodifica sin instalar nada
+# con apt. Ver python/song.py.
+imageio-ffmpeg==0.6.0

@@ -100,6 +100,14 @@ def _fake_stt(interims):
     return _NS(streaming_recognize=recognize)
 
 
+# El modo se FIJA en Plus mientras dura este bloque. Desde 1.1.1 listen_turn()
+# elige con que motor escucha segun el modo activo (Google en Plus, Vosk en
+# Essentials), y aqui lo que se falsea es el de Google: si la placa se quedo
+# en Essentials —algo normal, el modo se guarda en data/llm_mode.txt y
+# sobrevive a los reinicios— el STT falso no se usaba y los diez casos daban
+# (None, None). La prueba no puede depender de en que modo quedo el robot.
+_modo_real = llm_router.mode()
+llm_router._mode = "plus"
 _real = (voice._speech, voice._microphone, voice._wanted_mic)
 voice._microphone = lambda: None
 voice._wanted_mic = lambda: voice._mic_device
@@ -123,6 +131,7 @@ try:
         check(got == want and voice.last_switch() == want_sw, f"{interims[-1]!r} (seguimiento: {follow}) -> {got} switch={voice.last_switch()}")
 finally:
     voice._speech, voice._microphone, voice._wanted_mic = _real
+    llm_router._mode = _modo_real
 
 
 # --- Disparo de la escucha activa ------------------------------------------------
@@ -174,9 +183,13 @@ CASES = [
     ("espera", "¡Esperar vale la pena!", "cori", False, None),
     ("se me ocurrió algo", "A mí se me ocurrió algo parecido.", "cori", False, None),
     ("cori se me ocurrió algo", "Soy Cori.", "cori", False, ("interrupt", "cori")),  # el nombre es eco, la frase no
-    # 4. Bluetooth: el mic oye al robot, asi que la voz suelta pide una palabra
-    # nueva mas. Las claves valen igual (la interrupcion es nativa en los dos).
-    ("mi colegio tiene basura", "Cuéntame más.", "cori", True, ("speech", "cori")),
+    # 4. Bluetooth: el mic oye al robot, asi que la voz suelta pide palabras
+    # nuevas de mas. Las claves valen igual (la interrupcion es nativa en los dos).
+    # En 1.1.1 el minimo con bocina paso de 3 a 4: TODOS los falsos disparos de
+    # los logs (el robot callandose al oirse a si mismo) eran con bocina
+    # Bluetooth. Por eso esta frase, que tiene 3 palabras nuevas, ya no dispara.
+    ("mi colegio tiene basura", "Cuéntame más.", "cori", True, None),
+    ("mi colegio tiene mucha basura", "Cuéntame más.", "cori", True, ("speech", "cori")),  # 4: si
     ("colegio sucio", "Cuéntame más.", "cori", True, None),  # 2 palabras nuevas: con BT no alcanza
     ("colegio sucio", "Cuéntame más.", "cori", False, ("speech", "cori")),  # con headset si
     ("mi colegio", "Cuéntame más.", "cori", False, None),  # "mi" es muletilla: queda 1 palabra nueva

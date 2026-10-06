@@ -24,6 +24,8 @@ import brain
 import gestures
 import guardrails
 import llm_router
+import song
+import websearch
 
 logger = Logger("chat-bang")
 
@@ -127,41 +129,59 @@ def find_mode(text, bare=False):
 
 _ORDENES = (
     # (regex, gesto, celebrar, que responde)
-    (r"\b(ponte|pon[ée]s|est[áa]s?|haz(te)?|qu[ée]date|s[ée])\s+(muy\s+)?(feliz|alegre|content[oa]|chever[ea])\b|\bs[oó]nr[íi]e\b|\bre[íi]te\b",
+    #
+    # Cada orden acepta las formas en que un niño la dice de verdad: imperativo
+    # ("saluda"), con pronombre ("saludame"), subjuntivo tras "quiero que"
+    # ("saludes") e INFINITIVO ("saludar"). El infinitivo faltaba y era el caso
+    # mas comun: "saludar" no casaba con \bsaluda\b (la r rompe el limite de
+    # palabra), asi que el turno se iba al LLM y los brazos hacian el vaiven de
+    # hablar — los dos a la vez, lo mismo para todo. Por eso "todos los gestos
+    # se veian iguales".
+    (r"\b(ponte|pon[ée]s|est[áa]s?|haz(te)?|qu[ée]date|s[ée])\s+(muy\s+)?(feliz|alegre|content[oa]|chever[ea])\b|\bs[oó]nr[íi]e\b|\bre[íi]te\b|"
+     r"\b(alza|levanta|sube|arriba)\s+(los\s+|las\s+)?(manos|brazos|bracitos)\b|\b(manos|brazos)\s+arriba\b|"
+     r"\b(alzar|levantar|subir)\s+(los\s+|las\s+)?(manos|brazos|bracitos)\b",
      gestures.HAPPY, False, ("¡Listo! Ya estoy feliz. {exclama}", "¡Hecho! Mírame: así me pongo cuando estoy content{a}.")),
-    (r"\b(ponte|pon[ée]s|haz(te)?|s[ée])\s+(muy\s+)?(triste|melanc[óo]lic[oa])\b",
+    (r"\b(ponte|pon[ée]s|haz(te)?|s[ée])\s+(muy\s+)?(triste|melanc[óo]lic[oa])\b|\bentristecete\b",
      gestures.SAD, False, ("Bueno... ya estoy triste. Pero si me cuentas algo lindo se me pasa.",
                            "Mira mi carita triste. ¿Me cuentas algo para animarme?")),
-    (r"\b(ponte|pon[ée]s|haz(te)?|s[ée])\s+(muy\s+)?(enojad[oa]|brav[oa]|furios[oa]|rabios[oa])\b|\bhaz\s+grr+\b",
+    (r"\b(ponte|pon[ée]s|haz(te)?|s[ée])\s+(muy\s+)?(enojad[oa]|brav[oa]|furios[oa]|rabios[oa])\b|\bhaz\s+grr+\b|\benoj(ate|arte)\b",
      gestures.ANGRY, False, ("¡Grrr! Ya estoy enojad{a}... pero solo de mentiritas, nunca contigo.",
                              "¡Grrr! Mira mi cara de enojad{a}. Es puro juego.")),
-    (r"\b(ponte|pon[ée]s|haz(te)?|s[ée])\s+(muy\s+)?(sorprendid[oa]|asombrad[oa])\b|\bsorpr[ée]ndete\b",
+    (r"\b(ponte|pon[ée]s|haz(te)?|s[ée])\s+(muy\s+)?(sorprendid[oa]|asombrad[oa])\b|\bsorpr[ée]nd(ete|erte)\b",
      gestures.SURPRISE, False, ("¡Wow! ¿Así de sorprendid{a}?", "¡Uy! Mira mi cara de sorpresa.")),
-    (r"\b(ponte|pon[ée]s|haz(te)?|s[ée]|qu[ée]date)\s+(normal|tranquil[oa]|seri[oa]|en\s+reposo)\b|\bdescansa\b",
+    (r"\b(ponte|pon[ée]s|haz(te)?|s[ée]|qu[ée]date)\s+(normal|tranquil[oa]|seri[oa]|en\s+reposo)\b|\bdescansa(r)?\b|\bc[áa]lmate\b",
      gestures.REST, False, ("Listo, vuelvo a mi cara de siempre.", "Ya está, me puse tranquil{a}.")),
-    (r"\b(baila|bailemos|canta|cantemos|celebra|celebremos|haz\s+una\s+fiesta|fiesta)\b",
-     gestures.HAPPY, True, ("¡Vamos con esa fiesta!", "¡Dale! Mira cómo bailo.")),
+    (r"\b(baila|bailar|baile(s|mos)?|bailemos|celebra(r|mos|emos)?|haz\s+una\s+fiesta|fiesta)\b",
+     gestures.DANCE, "baila", ("¡Vamos con esa fiesta! Pon atención a mis brazos.",
+                               "¡Dale! Mira cómo bailo. Háblame cuando quieras que pare.")),
     # Gestos de brazos agregados en 1.1.0 (ver gestures.py y sketch.ino).
-    (r"\b(saluda|saludame|saludanos|di\s+hola|dile\s+hola|haz\s+hola)\b",
+    (r"\b(saluda|saludar|saluda(me|nos)|saludes|salude(n)?|haz(me)?\s+(un\s+)?saludo|"
+     r"di(le|me)?\s+hola|haz\s+hola|hola\s+con\s+la\s+mano|mueve\s+la\s+mano)\b",
      gestures.WAVE, False, ("¡Hola, hola! Mira cómo saludo.", "¡Holaaa! Te saludo con mi brazo.")),
-    (r"\b(aplaude|aplaudeme|aplaudan|dame\s+un\s+aplauso|haz\s+aplausos|palmas)\b",
+    (r"\b(aplaude|aplaudir|aplaude(me|nos)|aplaudan|aplaudas|dame\s+un\s+aplauso|"
+     r"haz\s+aplausos|palmas|bate\s+palmas)\b",
      gestures.CLAP, False, ("¡Clap, clap, clap! Para ti.", "¡Un aplauso! Te lo mereces.")),
-    (r"\b(piensa|ponte\s+a\s+pensar|haz\s+(como\s+)?que\s+piensas|cara\s+de\s+pensar)\b",
+    (r"\b(piensa|pensar|pienses|ponte\s+a\s+pensar|haz\s+(como\s+)?que\s+piensas|cara\s+de\s+pensar)\b",
      gestures.THINK, False, ("Mmm... déjame pensarlo.", "A ver, a ver... estoy pensando.")),
-    (r"\b(di\s+que\s+si|asiente|haz\s+que\s+si|di\s+si)\b",
+    (r"\b(di\s+que\s+si|asiente|asentir|asientas|haz\s+que\s+si|di\s+si)\b",
      gestures.YES, False, ("¡Sí, sí, sí!", "Sí, claro que sí.")),
-    (r"\b(di\s+que\s+no|niega|haz\s+que\s+no|di\s+no)\b",
+    (r"\b(di\s+que\s+no|niega|negar|niegues|haz\s+que\s+no|di\s+no)\b",
      gestures.NO, False, ("No, no y no.", "Nop, así digo que no.")),
-    (r"\b(muevete|mueve\s+(los\s+brazos|las\s+manos)|haz\s+un\s+baile)\b",
+    (r"\b(mu[ée]vete|moverte|mueve\s+(los\s+brazos|las\s+manos|los\s+bracitos))\b",
      gestures.DANCE, False, ("¡Mírame mover los brazos!", "¡Así me muevo yo!")),
-    (r"\b(abrazame|abrazanos|dame\s+un\s+abrazo|abraza)\b",
+    (r"\b(abraza|abrazar|abraza(me|nos)|abraces|dame\s+un\s+abrazo)\b",
      gestures.HUG, False, ("¡Un abrazo grandote para ti!", "Ven, te doy un abrazo de robot.")),
-    (r"\b(duermete|duerme|ponte\s+a\s+dormir|a\s+dormir|haz\s+(como\s+)?que\s+duermes)\b",
+    (r"\b(duerme|dormir|du[ée]rmete|duermas|ponte\s+a\s+dormir|a\s+dormir|"
+     r"haz\s+(como\s+)?que\s+duermes)\b",
      gestures.SLEEP, False, ("Shhh... me estoy durmiendo. Zzz.", "Me duermo un ratico. Zzz...")),
-    (r"\b(estirate|estira\s+(los\s+brazos|las\s+manos)|bosteza|haz\s+un\s+bostezo)\b",
+    (r"\b(estira|estirar(te|se)?|est[íi]rate|estires|estira\s+(los\s+brazos|las\s+manos)|"
+     r"bosteza|bostezar|haz\s+un\s+bostezo)\b",
      gestures.STRETCH, False, ("¡Aaah, qué buen estirón!", "Me estiro... ¡y ya estoy despiert{a}!")),
 )
-_ORDENES = tuple((re.compile(rx), gesto, celebra, frases) for rx, gesto, celebra, frases in _ORDENES)
+# El tercer campo dice que musica acompaña a la orden: False (ninguna),
+# "celebra" (la cancioncita de 3 s) o "baila" (la cancion larga con
+# coreografia, ver voice.dance()).
+_ORDENES = tuple((re.compile(rx), gesto, musica, frases) for rx, gesto, musica, frases in _ORDENES)
 
 # Una orden se DA al empezar la frase ("ponte feliz", "Cori, salúdame", "oye
 # Cori, por favor aplaude"), nunca en mitad de otra cosa: "¿por qué la gente
@@ -183,6 +203,11 @@ _QUE_HACES = re.compile(r"\b(qu[ée] (puedes|sabes) hacer|qu[ée] haces|para qu[
 _MODO_ACTUAL = re.compile(r"\b(en qu[ée] modo|qu[ée] modo)\b")
 
 
+# Los nombres de los guias no son parte de la pregunta: "oye Cori, ¿que paso
+# ayer?" se busca sin "Cori".
+_NOMBRES = tuple(p["name"] for p in brain.PERSONAS.values())
+
+
 @dataclass
 class Reply:
     """Lo que devuelve un turno del modo Curioso. Mismos campos que bang.Turn
@@ -193,7 +218,9 @@ class Reply:
     phase_changed: bool = False  # nunca: en Curioso no hay fases
     card: tuple = None  # nunca: las tarjetas son de BANG
     gesture: int = None  # gesto pedido a mano ("ponte feliz"); None = el del texto
-    celebrate: bool = False  # cancioncita + baile de brazos
+    celebrate: bool = False  # cancioncita corta (~3 s) + brazos
+    dance: bool = False  # cancion larga (~30 s) con coreografia: voice.dance()
+    sing: bool = False  # "¡A despegar!" de assets/audio/: voice.sing()
 
 
 def _a(persona):
@@ -208,18 +235,31 @@ def _formatea(frase, persona):
 _orden_turno = 0
 
 
+_CANTA_FRASES = ("¡A despegar! Canto y bailo, mírame los brazos.",
+                 "¡Esta me encanta! A despegar. Háblame cuando quieras que pare.")
+
+
 def _orden(persona, t):
     """Si la frase es una orden corta, la Reply que la cumple; si no, None."""
     global _orden_turno
     if _ES_PREGUNTA.search(t):
         return None
-    for rx, gesto, celebra, frases in _ORDENES:
+    # Cantar va aparte de _ORDENES y ANTES que todo: _ORDENES exige que lo que
+    # va delante del verbo sea cortesia o el nombre del guia, y eso dejaba
+    # fuera "quiero que cantes" — justo como lo pide un niño. El patron es el
+    # mismo que usa el modo BANG (song.SING_RE): una sola fuente de verdad.
+    if song.pide_cancion(t):
+        _orden_turno += 1
+        return Reply(_formatea(_CANTA_FRASES[_orden_turno % len(_CANTA_FRASES)], persona),
+                     source="plantilla", gesture=gestures.DANCE, sing=True)
+    for rx, gesto, musica, frases in _ORDENES:
         m = rx.search(t)
         if m is None or any(w.strip(",.;:¡!¿?") not in _ORDEN_LEAD for w in t[: m.start()].split()):
             continue
         _orden_turno += 1
         frase = frases[_orden_turno % len(frases)]
-        return Reply(_formatea(frase, persona), source="plantilla", gesture=gesto, celebrate=celebra)
+        return Reply(_formatea(frase, persona), source="plantilla", gesture=gesto,
+                     celebrate=musica == "celebra", dance=musica == "baila", sing=musica == "canta")
     return None
 
 
@@ -274,6 +314,11 @@ def greeting(persona):
     )
 
 
+def _corto(text, words):
+    partes = (text or "").split()
+    return " ".join(partes[:words]) + ("..." if len(partes) > words else "")
+
+
 def slow_turn(persona, text):
     """True si este turno va a esperar al modelo LOCAL (para la frase de
     relleno de main.py). Las ordenes y las respuestas fijas salen al instante."""
@@ -285,8 +330,15 @@ def slow_turn(persona, text):
     return True
 
 
-def turn(persona, text):
-    """Un turno del modo Curioso. Devuelve Reply."""
+def turn(persona, text, interrumpido=""):
+    """Un turno del modo Curioso. Devuelve Reply.
+
+    interrumpido: lo que el guia alcanzo a decir antes de que el niño lo
+    cortara. En Curioso no hay reto donde guardarlo (eso es cosa de bang.py),
+    asi que se le recuerda al modelo en ESTE turno: retoma donde iba y lo
+    engancha con lo nuevo, en vez de arrancar de cero como si no hubiera
+    estado hablando.
+    """
     llm_router.reset_source()
     name = brain.PERSONAS[persona]["name"]
 
@@ -316,15 +368,37 @@ def turn(persona, text):
         return Reply("Estamos en modo Curioso: charlamos de lo que quieras. Si prefieres trabajar un reto, "
                      "dime 'modo BANG'.", source="plantilla")
 
-    # 4. Lo demas lo contesta el cerebro del modo activo (Gemini o local).
+    # 4. Hechos de verdad: si la pregunta pide un dato que cambia con el tiempo
+    #    ("¿quien gano ayer?") se busca en internet ANTES de preguntarle al
+    #    modelo. Gemini no tiene buscador (ver websearch.py): sin esto o dice
+    #    que no sabe o se inventa el dato, que con un niño es peor.
+    #    Solo en Plus: el contexto son ~900 caracteres y el modelo local los
+    #    leeria a ~9 tokens/s, unos 30 s. En Essentials se pregunta sin buscar,
+    #    y en el respaldo local de Plus tambien (el prompt corto de `local=`).
+    pregunta, con_web = text, False
+    if not llm_router.is_local() and websearch.necesita(text):
+        ctx = websearch.contexto(text, personas=_NOMBRES)
+        if ctx:
+            pregunta, con_web = websearch.prompt_con_contexto(text, ctx), True
+
+    if interrumpido:
+        nota = (
+            f"[Te interrumpieron mientras decias: \"{_corto(interrumpido, 20)}\". "
+            "Enlaza con lo que dice ahora y sigue desde ahi; no lo repitas ni empieces de cero]\n"
+        )
+        pregunta = nota + pregunta
+
     raw = llm_router.chat(
-        (persona, "curioso"), _system(persona), text, temperature=0.6,
+        (persona, "curioso"), _system(persona), pregunta, temperature=0.6,
         local=(_local_system(persona), text),
     )
     if not raw:
         return Reply(brain.FALLBACK_REPLY, source=llm_router.last_source() or "plantilla")
     limpio = guardrails.limpiar(raw, max_frases=4) or brain.FALLBACK_REPLY
-    reply = Reply(limpio, source=llm_router.last_source() or "plantilla")
+    fuente = llm_router.last_source() or "plantilla"
+    if con_web and fuente == "gemini":
+        fuente = "gemini_web"  # el panel lo muestra como "Gemini + internet"
+    reply = Reply(limpio, source=fuente)
 
     # 5. Tema delicado: el aviso de hablarlo con un adulto vale aqui igual.
     aviso = guardrails.aviso_adulto(text)
