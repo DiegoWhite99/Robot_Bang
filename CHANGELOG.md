@@ -13,6 +13,11 @@ Cambios por actualización. El detalle técnico de cada punto está en
   local no se vuelva un taladro. Se calla para la frase de relleno y vuelve
   después. No cierra el parlante al pararse (con la bocina Bluetooth eso daba
   un "pop" en cada turno).
+  - **Diez melodías barajadas** (escala pentatónica, así ninguna desafina con
+    otra): ninguna se repite hasta que suenan las diez, y la baraja sigue de un
+    turno al otro. Y los silencios entre melodías **crecen con la espera**
+    (0,6 s → 1,4 s → 2,5 s): en una espera local de 30 s suenan ~13 en vez de
+    ~18 de la misma. Con dos solas, "era muy chévere pero cansaba".
 - **Sin "mmm" en el modo local** (`localvoice.sin_muletillas()`): Piper no
   sabe decir una muletilla y "Mmm" sonaba a zumbido. Se quita en la voz local,
   por donde pasa todo lo de Essentials (relleno, la orden "piensa" de Curioso

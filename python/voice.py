@@ -2118,8 +2118,10 @@ def emotion_sound_reset():
 #     respiro, para no pisar el pitido de "te escuche";
 #   - para con thinking_stop() en el bloque de audio siguiente (~43 ms): la
 #     respuesta no espera a que termine el motivo;
-#   - suelta el parlante entre motivo y motivo, asi la frase de relleno o el
-#     baile pueden meterse sin esperar;
+#   - suelta el parlante entre melodia y melodia, asi la frase de relleno
+#     puede meterse sin esperar;
+#   - diez melodias barajadas, y silencios que crecen si la espera se alarga
+#     (ver _THINK_MOTIFS): en el modo local una sola melodia cansaba;
 #   - tiene tope (_THINK_MAX_S): si algo falla y nadie la para, se calla sola.
 #
 # Va BAJITO (_THINK_GAIN), por debajo de la voz y de los sonidos de emocion:
@@ -2128,14 +2130,67 @@ def emotion_sound_reset():
 _THINK_GAIN = 3200
 _THINK_DELAY_S = 0.35   # despues del pitido de "te escuche" (~0,16 s)
 _THINK_MAX_S = 90.0
-# (nota, duracion) de cada "tu-lun", y el silencio despues. Dos variantes que
-# se alternan, para que en una espera larga (modo local: 15-30 s) no se
-# vuelva un taladro.
+
+# Las melodias. Eran dos y en la espera larga del modo local (15-30 s) se
+# volvian un taladro: "es muy chevere pero cansa". Ahora son diez, todas en
+# escala PENTATONICA de do (do re mi sol la): con esas cinco notas cualquier
+# combinacion suena bien y ninguna desafina contra otra, asi que se pueden
+# encadenar en cualquier orden. Mismo timbre (marimba) y mismo volumen: varia
+# la melodia, no el "instrumento".
+_N = {"sol4": 392.00, "la4": 440.00, "do5": 523.25, "re5": 587.33, "mi5": 659.25,
+      "sol5": 783.99, "la5": 880.00, "do6": 1046.50, "re6": 1174.66, "mi6": 1318.51}
 _THINK_MOTIFS = (
-    ((659.25, 0.12), (880.00, 0.42)),   # mi - LA
-    ((587.33, 0.12), (783.99, 0.46)),   # re - SOL
+    (("mi5", 0.12), ("la5", 0.42)),                                  # tu-LUN, la de siempre
+    (("re5", 0.12), ("sol5", 0.46)),                                 # tu-LUN, un tono abajo
+    (("do5", 0.10), ("mi5", 0.10), ("sol5", 0.42)),                  # tu-lu-LUN, arpegio
+    (("la5", 0.14), ("mi5", 0.40)),                                  # LUN-tu, bajando
+    (("sol5", 0.13), ("mi5", 0.13), ("do6", 0.45)),                  # ding-dong-DING
+    (("do5", 0.09), ("sol5", 0.09), ("do5", 0.09), ("sol5", 0.36)),  # rebote
+    (("re5", 0.12), ("mi5", 0.12), ("la5", 0.50)),                   # pregunta que sube
+    (("sol4", 0.18), ("do5", 0.50)),                                 # grave y tranquila
+    (("mi5", 0.08), ("sol5", 0.08), ("la5", 0.08), ("do6", 0.40)),   # destello
+    (("la5", 0.12), ("sol5", 0.12), ("mi5", 0.45)),                  # respuesta que baja
 )
-_THINK_GAP_S = 0.55
+
+# Los silencios entre melodia y melodia CRECEN con la espera: en Plus (1-3 s)
+# casi no se nota, pero en local una espera de 30 s con el silencio de 0,6 s
+# eran ~20 melodias seguidas. Asi la musica acompaña al principio y despues
+# "respira": (desde cuantos segundos de espera, cuanto silencio).
+# Medido con una espera de 30 s: con silencios fijos sonaban ~18 melodias; con
+# estos, ~12 (Plus, que contesta en 1-3 s, no llega a notar la diferencia).
+_THINK_GAPS = ((0.0, 0.6), (6.0, 1.4), (15.0, 2.5))
+
+_think_deck = []  # la baraja: el orden en que van a sonar las que faltan
+_think_last = None
+_think_deck_lock = threading.Lock()
+
+
+def _next_motif():
+    """La siguiente melodia, como una baraja: ninguna se repite hasta que
+    sonaron las diez, y la baraja sigue de un turno al otro (cada espera
+    empieza con una distinta). Al rebarajar, la primera nueva nunca es la
+    ultima que sono."""
+    global _think_last
+    import random
+
+    with _think_deck_lock:
+        if not _think_deck:
+            orden = list(range(len(_THINK_MOTIFS)))
+            random.shuffle(orden)
+            if orden[0] == _think_last and len(orden) > 1:
+                orden[0], orden[-1] = orden[-1], orden[0]
+            _think_deck.extend(orden)
+        _think_last = _think_deck.pop(0)
+        return _think_last
+
+
+def _think_gap(esperando_s):
+    gap = _THINK_GAPS[0][1]
+    for desde, g in _THINK_GAPS:
+        if esperando_s >= desde:
+            gap = g
+    return gap
+
 
 _think_stop = threading.Event()
 _think_thread = None
@@ -2154,16 +2209,19 @@ def _marimba(freq, dur, sample_rate):
 
 
 def _thinking_pcm(k, sample_rate):
-    """El PCM de un "tu-lun" (variante k), con su silencio detras."""
+    """El PCM de la melodia k (sin el silencio de despues: ese lo pone el bucle,
+    porque crece con la espera)."""
     key = (k, sample_rate)
     hit = _think_cache.get(key)
     if hit is not None:
         return hit
-    trozos = []
-    for freq, dur in _THINK_MOTIFS[k % len(_THINK_MOTIFS)]:
-        trozos.append(_marimba(freq, dur, sample_rate))
-    trozos.append(np.zeros(int(_THINK_GAP_S * sample_rate)))
-    pcm = np.concatenate(trozos)
+    notas = _THINK_MOTIFS[k % len(_THINK_MOTIFS)]
+    # La ultima nota suena 0,3 s mas de lo escrito: asi termina su caida y se
+    # apaga sola, en vez de cortarse a medio sonar (eso hace "clic").
+    pcm = np.concatenate([
+        _marimba(_N[nota], dur + (0.3 if i == len(notas) - 1 else 0.0), sample_rate)
+        for i, (nota, dur) in enumerate(notas)
+    ])
     pico = float(np.abs(pcm).max()) or 1.0
     pcm = (pcm / pico * _THINK_GAIN).astype(np.int16)
     _think_cache[key] = pcm
@@ -2171,11 +2229,12 @@ def _thinking_pcm(k, sample_rate):
 
 
 def _thinking_loop():
-    fin = time.monotonic() + _THINK_MAX_S
+    t0 = time.monotonic()
+    fin = t0 + _THINK_MAX_S
     if _think_stop.wait(_THINK_DELAY_S):
         return
-    k = 0
     while not _think_stop.is_set() and time.monotonic() < fin:
+        k = _next_motif()
         try:
             with _spk_lock:
                 if _think_stop.is_set():
@@ -2196,9 +2255,10 @@ def _thinking_loop():
             logger.debug(f"No sono la musica de pensar: {exc}")
             _reset_speaker()
             return
-        k += 1
-        # Fuera del candado: aqui la frase de relleno puede tomar el parlante.
-        time.sleep(0.01)
+        # El silencio, FUERA del candado: aqui la frase de relleno puede tomar
+        # el parlante, y un thinking_stop() lo corta al instante.
+        if _think_stop.wait(_think_gap(time.monotonic() - t0)):
+            return
 
 
 def thinking_start():
