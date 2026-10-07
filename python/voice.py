@@ -1598,83 +1598,111 @@ _BED_CHORDS = (
     (196.00, 246.94, 293.66),  # Sol mayor
 )
 _BED_CHORD_S = 3.2   # cuanto dura cada acorde (lo-fi = sin prisa)
-_BED_GAIN = 0.20     # respecto a la voz: se oye, pero no la tapa
-
-# Los mismos acordes, una octava abajo: lo-fi vive en los graves.
-_LOFI_CHORDS = tuple(tuple(f / 2 for f in acorde) for acorde in _BED_CHORDS)
+# Respecto a la voz. Estaba en 0,20 y la musica no se oia: entre eso, los
+# acordes graves y el pasa-bajos bajo, quedaba por debajo del ruido del propio
+# parlante. A 0,35 se oye que hay musica y la voz sigue mandando.
+_BED_GAIN = 0.35
 _LOFI_BPM = 72       # el tempo tipico del genero: lento, de fondo
 _LOFI_DETUNE = 0.003  # 0,3 % de desafine entre voces: el "chorus" cansado
+_LOFI_KICK_HZ = 90   # el bombo. En 55 Hz no salia por un parlante pequeño
+_LOFI_LPF_HZ = 9000  # corte del pasa-bajos. En 5200 la musica era un zumbido
+
+
+_lofi_cache = {}  # sample_rate -> un bucle entero ya sintetizado
+_lofi_lock = threading.Lock()
+
+
+def _lofi_loop(sample_rate):
+    """UN bucle de lo-fi (4 acordes), sintetizado una sola vez por sample rate.
+
+    Esto se cachea y no es un lujo: la primera version generaba el colchon
+    entero en cada uso, y las convoluciones sobre los ~665.000 muestras de la
+    intro costaban unos 15 SEGUNDOS de reloj antes de que el robot abriera la
+    boca. Aqui se sintetizan 12,8 s una vez (~0,3 s) y despues solo se repite.
+
+    "Lo-fi" aqui son cuatro cosas, todas con numpy (no hay libreria de audio en
+    el contenedor, ni falta):
+
+      1. ACORDES CALIDOS, con ondas triangulares en vez de senos puros: el seno
+         suena a pitido de laboratorio, el triangulo a teclado viejo. Cada voz
+         va un pelin desafinada respecto a la otra (_LOFI_DETUNE), que es el
+         "chorus" cansado del genero, y debajo el bajo del acorde.
+      2. UN PULSO LENTO, a _LOFI_BPM, con bombo en el 1 y el 3 y un "hat" de
+         ruido en las corcheas. No es una bateria: es para que respire.
+      3. RUIDO DE VINILO, bajo y constante, con algun "crack": es lo que hace
+         que suene a disco y no a sintetizador.
+      4. UN PASA-BAJOS suave, para quitarle el brillo digital.
+
+    OJO CON LOS GRAVES: la primera version ponia los acordes una octava abajo
+    (130-196 Hz) y el bombo en 55 Hz. En un parlante de robot eso no se
+    reproduce: la musica estaba ahi y no se oia. Por eso los acordes van a su
+    altura y el bombo a _LOFI_KICK_HZ, que ya entra por un altavoz pequeño.
+    """
+    with _lofi_lock:
+        hit = _lofi_cache.get(sample_rate)
+        if hit is not None:
+            return hit
+
+        largo = max(1, int(_BED_CHORD_S * sample_rate))
+        trozos = []
+        for acorde in _BED_CHORDS:
+            t = np.arange(largo) / sample_rate
+            # Entrada y salida suaves: que no se oiga el corte entre acordes.
+            env = np.clip(np.minimum(t / 0.6, (_BED_CHORD_S - t) / 0.7), 0, 1)
+            voces = []
+            for k, f in enumerate(acorde):
+                # Triangular via arcoseno de un seno: calida, pocos armonicos.
+                desafine = 1.0 + _LOFI_DETUNE * (1 if k % 2 else -1)
+                voces.append(np.arcsin(np.sin(2 * np.pi * f * desafine * t)) * (2 / np.pi))
+            pad = sum(voces) / len(voces)
+            # El bajo del acorde, una octava bajo la fundamental: da cuerpo sin
+            # irse a frecuencias que el parlante no saca.
+            pad = pad * 0.8 + np.sin(2 * np.pi * (acorde[0] / 2) * t) * 0.35
+            trozos.append(pad * env)
+        bucle = np.concatenate(trozos)
+
+        n = len(bucle)
+        t_all = np.arange(n) / sample_rate
+        beat = 60.0 / _LOFI_BPM
+        fase = (t_all % (beat * 4)) / beat  # compas de 4 tiempos
+        ritmo = np.zeros(n)
+        for golpe in (0.0, 2.0):
+            d = np.clip(fase - golpe, 0, None)
+            hit_k = (fase >= golpe) & (fase < golpe + 0.35)
+            ritmo += np.where(hit_k, np.sin(2 * np.pi * _LOFI_KICK_HZ * d) * np.exp(-d * 16), 0.0)
+        rng = np.random.default_rng(7)  # semilla fija: el fondo suena igual siempre
+        corchea = t_all % (beat / 2)
+        hat = (corchea < 0.03) * rng.standard_normal(n) * np.exp(-corchea * 90) * 0.08
+        ritmo = ritmo * 0.45 + hat
+
+        ruido = rng.standard_normal(n)
+        k = 24  # ruido "rosa" barato: el blanco suavizado queda mate
+        rosa = np.convolve(ruido, np.ones(k) / k, mode="same")
+        cracks = (rng.random(n) < 2e-4) * rng.standard_normal(n) * 0.5
+        vinilo = rosa * 0.06 + cracks
+
+        mezcla = bucle * 0.9 + ritmo + vinilo
+
+        # Pasa-bajos suave. Si se corta muy abajo (la primera version cortaba en
+        # 5,2 kHz) la musica se vuelve un zumbido que no se distingue del ruido
+        # de fondo del parlante.
+        kk = max(2, int(sample_rate / _LOFI_LPF_HZ))
+        mezcla = np.convolve(mezcla, np.ones(kk) / kk, mode="same")
+
+        pico = float(np.abs(mezcla).max())
+        if pico > 0:
+            mezcla = mezcla / pico  # normalizado: el volumen manda _BED_GAIN
+        bucle_final = mezcla * 11000.0
+        _lofi_cache[sample_rate] = bucle_final
+        return bucle_final
 
 
 def _lofi_bed(n, sample_rate):
-    """Colchon LO-FI en bucle, de n muestras (float, sin escalar).
-
-    "Lo-fi" aqui son cuatro cosas, todas sintetizadas con numpy (no hay
-    libreria de audio en el contenedor, ni falta):
-
-      1. ACORDES CALIDOS. Los mismos cuatro acordes de siempre pero una octava
-         abajo y con ondas triangulares en vez de senos puros: el seno suena a
-         pitido de laboratorio, el triangulo suena a teclado viejo. Cada voz va
-         un pelin desafinada (_LOFI_DETUNE) respecto a la otra, que es lo que
-         da el "chorus" cansado del genero.
-      2. UN PULSO LENTO, a _LOFI_BPM. Bombo en el 1 y en el 3, y un "hat" de
-         ruido muy bajito en las corcheas. No es una bateria: es lo justo para
-         que la cosa respire y no parezca un dron.
-      3. RUIDO DE VINILO: ruido rosa muy bajo, constante, con algun "crack"
-         suelto. Es lo que hace que suene a disco y no a sintetizador.
-      4. FILTRO PASA-BAJOS suave sobre toda la mezcla, para quitarle el brillo
-         digital. Es una media movil: un pasa-bajos de pobre, pero para esto
-         sobra y cuesta una decima de lo que costaria uno de verdad.
-
-    El resultado va POR DEBAJO de la voz (_BED_GAIN), nunca encima: esto es un
-    fondo para que el arranque no suene a sala vacia, no una cancion.
-    """
-    largo = max(1, int(_BED_CHORD_S * sample_rate))
-    trozos = []
-    for acorde in _LOFI_CHORDS:
-        t = np.arange(largo) / sample_rate
-        # Entrada y salida suaves: que no se oiga el corte entre acordes.
-        env = np.clip(np.minimum(t / 0.6, (_BED_CHORD_S - t) / 0.7), 0, 1)
-        voces = []
-        for i, f in enumerate(acorde):
-            # Triangular via arcoseno de un seno: calida, con pocos armonicos.
-            desafine = 1.0 + _LOFI_DETUNE * (1 if i % 2 else -1)
-            voces.append(np.arcsin(np.sin(2 * np.pi * f * desafine * t)) * (2 / np.pi))
-        trozos.append(sum(voces) / len(voces) * env)
-    bucle = np.concatenate(trozos)
-
-    repes = int(n / len(bucle)) + 1
-    pad = np.tile(bucle, repes)[:n]
-
-    # --- pulso ---
-    t_all = np.arange(n) / sample_rate
-    beat = 60.0 / _LOFI_BPM
-    fase = (t_all % (beat * 4)) / beat  # compas de 4 tiempos
-    ritmo = np.zeros(n)
-    # Bombo: seno grave que cae rapido, en los tiempos 1 y 3.
-    for golpe in (0.0, 2.0):
-        d = np.clip(fase - golpe, 0, None)
-        hit = (fase >= golpe) & (fase < golpe + 0.35)
-        ritmo += np.where(hit, np.sin(2 * np.pi * 55 * d) * np.exp(-d * 18), 0.0)
-    # Hat: ruido cortito en cada corchea, muy por debajo del bombo.
-    rng = np.random.default_rng(7)  # semilla fija: el fondo suena igual siempre
-    corchea = (t_all % (beat / 2)) 
-    hat = (corchea < 0.03) * rng.standard_normal(n) * np.exp(-corchea * 90) * 0.06
-    ritmo = ritmo * 0.35 + hat
-
-    # --- vinilo ---
-    ruido = rng.standard_normal(n)
-    # Ruido "rosa" barato: el blanco suavizado pierde los agudos y queda mate.
-    k = 24
-    rosa = np.convolve(ruido, np.ones(k) / k, mode="same")
-    cracks = (rng.random(n) < 2e-4) * rng.standard_normal(n) * 0.5
-    vinilo = rosa * 0.05 + cracks
-
-    mezcla = pad * 0.85 + ritmo + vinilo
-
-    # --- pasa-bajos ---
-    k = max(2, int(sample_rate / 5200))
-    return np.convolve(mezcla, np.ones(k) / k, mode="same") * 7000.0
+    """Colchon lo-fi de n muestras: el bucle cacheado, repetido."""
+    bucle = _lofi_loop(sample_rate)
+    if n <= len(bucle):
+        return bucle[:n]
+    return np.tile(bucle, int(n / len(bucle)) + 1)[:n]
 
 
 # Nombre de siempre, para no tocar a quien ya lo llamaba.

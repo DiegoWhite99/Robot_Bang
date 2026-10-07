@@ -508,9 +508,17 @@ def run_command(line):
     if cmd == "tarjeta":
         return _card_cmd(arg)
     if cmd == "bienvenida":
+        if boot_running():
+            return "🎉 ya hay un arranque en curso: espera a que termine"
+
         def _bienvenida_y_menu():
-            _welcome()
-            _presentar_cerebro()
+            if not _boot_lock.acquire(blocking=False):
+                return
+            try:
+                _welcome()
+                _presentar_cerebro()
+            finally:
+                _boot_lock.release()
 
         threading.Thread(target=_bienvenida_y_menu, daemon=True, name="welcome").start()
         return "🎉 bienvenida al BANG + la presentación del cerebro activo"
@@ -524,6 +532,8 @@ def run_command(line):
         threading.Thread(target=_show_aviso, daemon=True, name="aviso").start()
         return "🛡 aviso de seguridad: campanilla + voz + GIF"
     if cmd == "arranque":
+        if boot_running():
+            return "▶️ ya hay un arranque en curso: espera a que termine (o /menu para cortarlo)"
         threading.Thread(target=_boot_sequence, daemon=True, name="boot").start()
         return "▶️ secuencia completa: aviso → BANG → QR del panel → PLUS/ESSENTIAL → presentación"
     if cmd == "wifi":
@@ -1055,12 +1065,18 @@ def _elegir_modo(intentos=2):
 
 # --- Paso 4: el panel de control (QR) -----------------------------------------
 
-# Cuanto se queda el QR en la pantalla, como MINIMO. La locucion dura ~18 s, y
-# con eso no alcanzaba: hay que sacar el celular, desbloquearlo, abrir la
-# camara y apuntar. Un minuto es el tiempo real de una persona haciendo eso sin
-# prisa, no el tiempo de leer la frase.
+# Cuanto se queda el QR en la pantalla. La locucion dura ~18 s, y con eso no
+# alcanzaba: hay que sacar el celular, desbloquearlo, abrir la camara y
+# apuntar. Un minuto es el tiempo real de una persona haciendo eso sin prisa.
 #
-# Es un minimo, no un maximo: si la locucion durara mas, manda la locucion.
+# OJO: ese minuto NO se pasa esperando. La primera version hacia sleep(42) con
+# el robot mudo y la pantalla quieta, y el arranque se sentia colgado. Ahora el
+# QR se queda puesto y el arranque SIGUE: mientras se ve el codigo, el robot ya
+# esta preguntando si PLUS o ESSENTIAL. El QR se retira solo al cumplirse el
+# minuto, o antes si hay que pintar otra cosa encima (el menu de guias).
+#
+# Que la cara no lo borre esta cubierto por el sketch: con el QR puesto, un
+# gesto solo cambia el color de fondo, no repinta (ver consumePendingGesture).
 QR_PANEL_S = 60.0
 
 
@@ -1079,6 +1095,9 @@ def _show_qr_panel():
     Se calcula con la IP de AHORA (gestures.send_qr), asi sigue siendo
     correcto cuando la placa cambia de red. assets/img/qr_webside/ guarda una
     copia del mismo codigo, solo para documentacion.
+
+    Devuelve el instante (time.monotonic) hasta el que el codigo tiene que
+    quedarse puesto; quien lo retira es _quitar_qr(), mas tarde.
     """
     url = dashboard_url()
     if not url:
@@ -1087,17 +1106,24 @@ def _show_qr_panel():
         # red (_network_if_needed) ya enseña su propio QR cuando hace falta.
         _broadcast_debug("📱 me salto el QR del panel: todavía no tengo dirección en la red")
         return
-    gestures.send_qr(url)
     t0 = time.monotonic()
-    try:
-        _locucion("intro_panel", status="📱 panel de control: apunta la cámara al código")
-        # Y se queda un rato mas, en silencio, para que de tiempo a escanearlo.
-        restante = QR_PANEL_S - (time.monotonic() - t0)
-        if restante > 0:
-            _broadcast_status(f"📱 el código se queda {int(restante)} s más: {url}")
-            time.sleep(restante)
-    finally:
-        gestures.send_qr()  # se quita el QR de la pantalla
+    info = gestures.send_qr(url)
+    if not info.get("ok"):
+        _broadcast_debug(f"⚠ no pude mostrar el QR: {info.get('error')}")
+        return 0.0
+    _locucion("intro_panel", status="📱 panel de control: apunta la cámara al código")
+    # No se espera aqui: el arranque sigue con el codigo puesto. Devuelve hasta
+    # cuando tiene que quedarse, y _boot_sequence() lo retira a su hora.
+    return t0 + QR_PANEL_S
+
+
+def _quitar_qr(hasta):
+    """Retira el QR de la pantalla, esperando si no ha cumplido su minuto."""
+    restante = hasta - time.monotonic()
+    if restante > 0:
+        _broadcast_status(f"📱 el código sigue en pantalla {int(restante)} s más")
+        time.sleep(restante)
+    gestures.send_qr()
 
 
 # --- Paso 5: que cerebro usa el robot -----------------------------------------
@@ -1197,19 +1223,19 @@ def _show_aviso():
     """Paso 1: el aviso de seguridad, con campanilla y dicho en voz alta.
 
     Suena una campanilla de atencion, y mientras el GIF corre el robot LEE el
-    aviso. La pantalla no pasa al siguiente paso hasta que termina de hablar
-    (con un minimo de AVISO_S por si la voz falla y no suena nada).
+    aviso (grabado, con musica lo-fi debajo). La pantalla no pasa al siguiente
+    paso hasta que termina de hablar (con un minimo de AVISO_S por si la voz
+    falla y no suena nada).
     """
-    _broadcast_status("🛡 aviso de seguridad")
     gestures.send_aviso(True)
-    ui.send_message("reply", {"persona": WELCOME_VOICE, "text": AVISO_TEXTO})
-
     t0 = time.monotonic()
     try:
         voice.attention()          # campanilla: "atencion, esto importa"
         time.sleep(0.35)
-        # Con musica de fondo: acordes suaves por debajo de la voz.
-        voice.say_with_music(WELCOME_VOICE, AVISO_TEXTO)
+        # Grabado, y con la musica lo-fi por debajo. Antes se sintetizaba con
+        # Google en cada encendido: eran ~10 s de robot callado antes de la
+        # primera palabra, y sin red no sonaba.
+        _locucion("intro_aviso", status="🛡 aviso de seguridad", music=True)
     except Exception as exc:
         _broadcast_debug(f"⚠ el aviso no se pudo decir en voz alta: {exc}")
 
@@ -1291,6 +1317,24 @@ def _network_if_needed():
     return conectado
 
 
+# UN SOLO ARRANQUE A LA VEZ.
+#
+# Sin esto, /arranque (o /menu, o /bienvenida) lanzaba una secuencia NUEVA
+# encima de la que ya estaba corriendo, y las dos se peleaban por la pantalla y
+# por el parlante. Se vio asi en una traza real: mientras una estaba en el paso
+# del QR —que se queda su minuto— la otra llego al paso de los guias y pinto el
+# MENU ENCIMA, asi que el QR desaparecia a los dos segundos de salir.
+#
+# Los candados que ya habia (_welcome_lock, _cerebro_lock) no alcanzaban: cada
+# uno protege SU paso, asi que la segunda secuencia se saltaba los pasos
+# ocupados y adelantaba a la primera, que es exactamente lo que no se quiere.
+_boot_lock = threading.Lock()
+
+
+def boot_running():
+    return _boot_lock.locked()
+
+
 def _boot_sequence():
     """El arranque completo, en este orden:
 
@@ -1320,13 +1364,24 @@ def _boot_sequence():
     contradecian. Se sigue pudiendo cambiar en cualquier momento diciendo
     "modo curioso" / "modo bang", con /modo_chat o con /elegir_modo.
     """
-    _show_aviso()
-    _welcome()
-    _network_if_needed()
-    _show_qr_panel()
-    if _elegir_cerebro():
-        return  # dijo el nombre de un guia: loop() atiende ese turno
-    _presentar_cerebro()
+    if not _boot_lock.acquire(blocking=False):
+        _broadcast_debug("▶️ ya hay un arranque en curso: no lo duplico")
+        return
+    try:
+        _show_aviso()
+        _welcome()
+        _network_if_needed()
+        # El QR se queda puesto mientras se pregunta el cerebro: asi cumple su
+        # minuto en pantalla sin que nadie espere mirando una pantalla quieta.
+        qr_hasta = _show_qr_panel()
+        try:
+            if _elegir_cerebro():
+                return  # dijo el nombre de un guia: loop() atiende ese turno
+        finally:
+            _quitar_qr(qr_hasta)
+        _presentar_cerebro()
+    finally:
+        _boot_lock.release()
 
 
 def _card_cmd(arg):
@@ -1357,8 +1412,17 @@ def _menu():
         # No se vuelve a preguntar el cerebro: eso lo elige un adulto una vez
         # (y sigue en /modo). Solo se repite la bienvenida y la presentacion
         # que toque — sin esto la pantalla se quedaba en la bienvenida.
-        _welcome()
-        _presentar_cerebro()
+        #
+        # Bajo el mismo candado que el arranque: si no, esto le pintaba el menu
+        # encima a una secuencia que seguia corriendo.
+        if not _boot_lock.acquire(blocking=False):
+            _broadcast_debug("🏠 hay un arranque en curso: no le pinto encima")
+            return
+        try:
+            _welcome()
+            _presentar_cerebro()
+        finally:
+            _boot_lock.release()
 
     threading.Thread(target=_volver_al_inicio, daemon=True, name="welcome").start()
     return "🏠 de vuelta al inicio: retos borrados, elige un guía"

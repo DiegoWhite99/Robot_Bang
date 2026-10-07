@@ -21,8 +21,9 @@
 # edad todavia no se lee. Cubre los tres limites del producto: que es virtual,
 # que no pide datos, y que ante un problema se acude a un adulto.
 #
-# Este NO esta grabado: suena con musica de fondo por debajo de la voz
-# (voice.say_with_music()), que se mezcla con el PCM de la sintesis.
+# Va grabado como todo lo demas (clave "intro_aviso"), y la musica se le mezcla
+# al reproducirlo. Antes se sintetizaba en vivo con Google en cada encendido, y
+# eran ~10 s de espera con el robot callado antes de decir la primera palabra.
 AVISO = (
     "Antes de empezar, dos cositas. Soy un robot, un personaje virtual: no soy una "
     "persona de verdad. No me cuentes datos tuyos como tu dirección, tu teléfono o "
@@ -33,6 +34,8 @@ AVISO = (
 # --- Pasos 2 a 6: las locuciones grabadas -------------------------------------
 # El orden de este diccionario es el orden en que se oyen (main._boot_sequence()).
 CLIPS = {
+    # Paso 1: el aviso de seguridad. Suena con musica de fondo (ver _show_aviso).
+    "intro_aviso": AVISO,
     # Paso 2: QUE ES BANG y QUIEN LO HIZO. Es la carta de presentacion del
     # producto, y por eso es la que se pidio grabada: tiene que sonar igual de
     # bien en una feria con mala red que en el laboratorio.
