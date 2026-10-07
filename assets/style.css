@@ -597,30 +597,3 @@ legend {
   font-style: normal;
 }
 
-
-/* Ventana del QR del panel de control (la abre Python en el arranque). */
-.qr-panel-body {
-  display: flex;
-  gap: 16px;
-  align-items: center;
-  padding: 16px;
-}
-.qr-panel-body img {
-  width: 180px;
-  height: 180px;
-  image-rendering: pixelated;  /* el QR es una matriz: nada de suavizado */
-  background: #fff;
-  padding: 8px;
-  border: 2px inset #c0c0c0;
-}
-.qr-panel-text {
-  flex: 1;
-  font-size: 14px;
-  line-height: 1.5;
-}
-.qr-panel-url {
-  margin-top: 8px;
-  font-family: "Courier New", monospace;
-  font-weight: bold;
-  word-break: break-all;
-}

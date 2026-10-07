@@ -533,14 +533,22 @@ def run_command(line):
         red = st.get("ssid") or "?" if isinstance(st, dict) else "?"
         return f"📶 nivel {nivel}/4 · red: {red}\nDashboard: {dashboard_url() or 'sin IP'}"
     if cmd == "qr":
-        if arg.strip().lower() in ("off", "cerrar", "salir"):
+        texto = arg.strip()
+        if texto.lower() in ("off", "cerrar", "salir"):
             gestures.send_qr()
             return "🔳 QR fuera de la pantalla"
-        url = dashboard_url()
+        # Con un texto detras ("/qr http://a.bc") se dibuja ESE codigo. Sirve
+        # para probar la pantalla con un QR mas chico: el mensaje del Bridge
+        # crece con el cuadrado del numero de modulos, y el buffer RPC son 256
+        # bytes, asi que un QR largo puede no caber. Sin texto, el dashboard.
+        url = texto or dashboard_url()
         if not url:
             return "⚠ no encuentro la IP de la placa: ¿está conectada a la red?"
-        gestures.send_qr(url)
-        return f"🔳 QR en la pantalla → {url}"
+        info = gestures.send_qr(url)
+        if not info.get("ok"):
+            return f"⚠ no pude mostrar el QR de {url}: {info.get('error')}"
+        return (f"🔳 QR en la pantalla → {url}\n"
+                f"   {info['size']}×{info['size']} módulos · {info['bytes']} bytes por el Bridge")
     if cmd == "wifi_sync":
         gestures.send_wifi_sync()
         return "📡 animación de WiFi sincronizado"
@@ -756,24 +764,93 @@ def _wifi_level():
     return 4  # hay internet pero no se puede medir la señal (cable, o sin permiso)
 
 
-def dashboard_url():
+# La direccion del dashboard se pregunta varias veces (el QR del arranque, el
+# del panel de red, /wifi, /qr) y averiguarla cuesta una llamada HTTP al
+# ayudante del host: se cachea un rato.
+_DASHBOARD_TTL_S = 30.0
+_dashboard_cache = {"url": "", "at": -1e9}
+
+
+def dashboard_url(force=False):
     """La direccion a la que apunta el QR de la pantalla.
 
+    OJO CON EL ORDEN, que aqui estuvo el bug del QR inservible: esta App corre
+    DENTRO de un contenedor, y desde dentro el truco de sockets (abrir un UDP
+    contra 8.8.8.8 y mirar que IP local eligio la ruta) devuelve la IP DEL
+    CONTENEDOR en una red interna de Docker. En esta placa daba
+    192.168.48.3 — que ademas NO empieza por "172.", asi que el filtro de
+    antes la dejaba pasar tal cual. El QR se dibujaba bien y se escaneaba
+    bien, pero no abria nada: esa direccion no existe fuera de Docker.
+
+    Quien SI conoce la IP de la placa en la red de verdad es el ayudante de
+    WiFi del host (tools/wifi_helper.py, via wifinet.status()), porque corre
+    FUERA del contenedor y se lo pregunta a NetworkManager. Por eso va
+    primero. El truco del socket queda de respaldo por si el ayudante no esta
+    instalado, y ahi se descartan tambien las /16 privadas tipicas de Docker.
+
     Se resuelve sola en cada arranque: si la placa cambia de red, el QR sigue
-    llevando al sitio correcto. Se descartan las redes internas de Docker,
-    que no sirven para llegar al robot desde un telefono.
+    llevando al sitio correcto.
     """
+    ahora = time.monotonic()
+    if not force and ahora - _dashboard_cache["at"] < _DASHBOARD_TTL_S:
+        return _dashboard_cache["url"]
+
+    url = ""
+    # 1. El ayudante del host: la IP de la placa en la red de verdad.
     try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-            s.connect(("8.8.8.8", 80))  # no manda nada: solo resuelve la ruta de salida
-            ip = s.getsockname()[0]
-        if ip and not ip.startswith(("172.", "127.")):
-            return f"https://{ip}:7000"
+        st = wifinet.status()
+        ip = st.get("ip") if isinstance(st, dict) else ""
+        if ip:
+            url = f"https://{ip}:7000"
+    except Exception as exc:
+        logger.debug(f"No pude preguntarle la IP al ayudante de WiFi: {exc}")
+
+    # 2. Respaldo: la ruta de salida de este proceso.
+    if not url:
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                s.connect(("8.8.8.8", 80))  # no manda nada: solo resuelve la ruta
+                ip = s.getsockname()[0]
+            if ip and not _es_ip_de_docker(ip):
+                url = f"https://{ip}:7000"
+        except Exception:
+            pass
+
+    _dashboard_cache.update(url=url, at=ahora)
+    return url
+
+
+# Las redes que Docker se inventa para sus contenedores. 172.16/12 es el rango
+# que usa por defecto; 192.168.x.x lo usa tambien cuando se queda sin sitio
+# (es lo que paso en esta placa), y ahi hay que hilar mas fino porque 192.168
+# es TAMBIEN el rango de casi cualquier casa: solo se descarta si esa IP cae en
+# una red que este contenedor tenga montada, que es justo lo que delata que es
+# suya y no de la red del colegio.
+def _es_ip_de_docker(ip):
+    if ip.startswith("127."):
+        return True
+    try:
+        import ipaddress
+
+        addr = ipaddress.ip_address(ip)
+        if addr in ipaddress.ip_network("172.16.0.0/12"):
+            return True
+        # /proc/net/route trae las redes de las interfaces de este contenedor.
+        import socket as _s
+        import struct
+
+        with open("/proc/net/route") as f:
+            for linea in f.readlines()[1:]:
+                campos = linea.split()
+                if len(campos) < 8 or campos[1] == "00000000":
+                    continue  # la default no dice a que red pertenece
+                destino = _s.inet_ntoa(struct.pack("<L", int(campos[1], 16)))
+                mascara = _s.inet_ntoa(struct.pack("<L", int(campos[7], 16)))
+                if addr in ipaddress.ip_network(f"{destino}/{mascara}", strict=False):
+                    return True
     except Exception:
         pass
-    st = wifinet.status()
-    ip = st.get("ip") if isinstance(st, dict) else ""
-    return f"https://{ip}:7000" if ip else ""
+    return False
 
 
 def _wifi_watch():
@@ -852,14 +929,6 @@ AVISO_S = 9.0
 # Lo que el robot DICE mientras se ve el aviso vive en python/intro.py, junto
 # con el resto de las locuciones del arranque (ahi esta explicado por que).
 AVISO_TEXTO = intro.AVISO
-
-# La ruta del QR del panel de control, tal como se guardo en el repositorio.
-# En la PANTALLA no se usa este PNG sino un QR calculado al vuelo con la IP de
-# ahora (gestures.send_qr), que es el mismo codigo mientras la placa no cambie
-# de red y sigue siendo correcto cuando la cambia. El PNG se manda al
-# dashboard, para poder compartir el enlace desde el navegador.
-QR_PNG = "img/qr_webside/https_10_3_16_177_7000_.png"
-
 
 def _welcome_text():
     """Lo que se ESCRIBE en el dashboard durante la bienvenida.
@@ -1003,9 +1072,13 @@ def _show_qr_panel():
     Si no se sabe que existe, no se usa — de ahi que sea un paso del arranque
     y no una linea en el README.
 
-    El QR se calcula con la IP de AHORA (gestures.send_qr), asi sigue siendo
-    correcto cuando la placa cambia de red; QR_PNG es la copia guardada del
-    mismo codigo, y es la que se le manda al dashboard.
+    El QR va SOLO en la pantalla del robot, nunca en el dashboard: el codigo
+    sirve para LLEGAR al dashboard, asi que enseñarlo dentro del dashboard no
+    le sirve a nadie — quien lo ve ya esta dentro.
+
+    Se calcula con la IP de AHORA (gestures.send_qr), asi sigue siendo
+    correcto cuando la placa cambia de red. assets/img/qr_webside/ guarda una
+    copia del mismo codigo, solo para documentacion.
     """
     url = dashboard_url()
     if not url:
@@ -1015,7 +1088,6 @@ def _show_qr_panel():
         _broadcast_debug("📱 me salto el QR del panel: todavía no tengo dirección en la red")
         return
     gestures.send_qr(url)
-    ui.send_message("qr_panel", {"url": url, "img": QR_PNG})
     t0 = time.monotonic()
     try:
         _locucion("intro_panel", status="📱 panel de control: apunta la cámara al código")
@@ -1026,7 +1098,6 @@ def _show_qr_panel():
             time.sleep(restante)
     finally:
         gestures.send_qr()  # se quita el QR de la pantalla
-        ui.send_message("qr_panel", {"url": "", "img": ""})
 
 
 # --- Paso 5: que cerebro usa el robot -----------------------------------------

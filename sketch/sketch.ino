@@ -624,7 +624,15 @@ void qr(std::vector<int> data) {
     return;
   }
   const uint16_t need = (uint16_t)((size * size + 7) / 8);
-  if (data.size() < (size_t)(1 + need) || need > QR_BYTES) return;
+  if (data.size() < (size_t)(1 + need) || need > QR_BYTES) {
+    // Llego cortado (el buffer RPC del Bridge son 256 bytes): mejor decirlo
+    // que quedarse callado, que es como se perdio el QR la primera vez.
+    Serial.print("[chat-bang] QR incompleto: llegaron ");
+    Serial.print((int)data.size());
+    Serial.print(" de ");
+    Serial.println(1 + need);
+    return;
+  }
   for (uint16_t i = 0; i < need; i++) qrBits[i] = (uint8_t)data[1 + i];
   qrSizePending = (uint8_t)size;
   qrPending = true;
@@ -1780,17 +1788,31 @@ void menu(uint8_t index) {
 // junto al resto del codigo del QR porque necesita overlayPersona.
 void consumePendingQr() {
   if (!qrPending) return;
+
+  // El aviso y la bienvenida mandan: mientras esten en pantalla, el QR ESPERA.
+  //
+  // Antes aqui se hacia "return" DESPUES de poner qrPending = false, y eso se
+  // comia la peticion: Bridge.notify() es fire-and-forget, asi que Python
+  // creia haberlo mostrado, se quedaba su minuto en silencio y lo retiraba, y
+  // en la pantalla no habia aparecido nada en ningun momento. Sin error por
+  // ningun lado. Ahora la peticion se queda pendiente y el QR sale solo en
+  // cuanto la pantalla queda libre.
+  if (qrSizePending > 0 && (splashOn || avisoOn)) return;
+
   qrPending = false;
   qrSize = qrSizePending;
   if (qrSize > 0) {
-    if (splashOn || avisoOn) return;  // el aviso y la bienvenida mandan
     if (!qrOn && currentPersona < FACE_COUNT) overlayPersona = currentPersona;
     qrOn = true;
     drawQr();
+    Serial.print("[chat-bang] QR en pantalla, ");
+    Serial.print(qrSize);
+    Serial.println(" modulos");
   } else if (qrOn) {
     qrOn = false;
     currentPersona = 255;
     applyPersonaColors(overlayPersona);
+    Serial.println("[chat-bang] QR retirado");
   }
 }
 

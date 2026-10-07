@@ -379,7 +379,7 @@ def send_qr(url=None):
             Bridge.notify("qr", [0])
         except Exception as exc:
             logger.debug(f"No se pudo cerrar el QR: {exc}")
-        return
+        return {"ok": True, "size": 0, "bytes": 0}
 
     try:
         import qrcode
@@ -390,12 +390,12 @@ def send_qr(url=None):
         matriz = q.get_matrix()
     except Exception as exc:
         logger.warning(f"No pude generar el QR de {url}: {exc}")
-        return
+        return {"ok": False, "error": str(exc)}
 
     size = len(matriz)
     if size > QR_MAX:
         logger.warning(f"El QR salio de {size} modulos y el maximo es {QR_MAX}: url demasiado larga")
-        return
+        return {"ok": False, "error": f"{size} modulos, el maximo del sketch es {QR_MAX}"}
 
     bits = bytearray((size * size + 7) // 8)
     for y, fila in enumerate(matriz):
@@ -407,7 +407,10 @@ def send_qr(url=None):
     try:
         Bridge.notify("qr", [size] + list(bits))
     except Exception as exc:
-        logger.debug(f"No se pudo mostrar el QR: {exc}")
+        logger.warning(f"No se pudo mostrar el QR: {exc}")
+        return {"ok": False, "error": str(exc)}
+    logger.info(f"QR mandado al sketch: {size}x{size} modulos, {1 + len(bits)} valores")
+    return {"ok": True, "size": size, "bytes": 1 + len(bits)}
 
 
 def send_wifi_sync():
