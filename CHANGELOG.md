@@ -3,7 +3,80 @@
 Cambios por actualización. El detalle técnico de cada punto está en
 `DOCUMENTACION.md` (se indica la sección).
 
-## Versión 1.2.0 — 2026-10-07
+## Versión 1.1.1 stable — 2026-10-07
+
+**La versión estable.** Junta todo lo de la 1.1.1 beta (más abajo) con lo de
+este día: la conversación en Plus deja de colgarse, el arranque guiado, la voz
+Piper, el sonido por emoción y los arreglos del QR. En la pantalla del robot
+se lee **"BANG v1.1.1 - stable"**.
+
+### La conversación fluye: de hasta 12 s por turno a ~1 s
+
+Medido en la placa. El problema número uno de Plus **no era la red ni el
+prompt: era el orden de los modelos.**
+
+| modelo | mediana | fallos (de 5) |
+|---|---|---|
+| `gemini-flash-lite-latest` | 0,90 s | 0 |
+| `gemini-3.5-flash-lite` | 1,13 s | 0 (un pico de 9,3 s) |
+| `gemini-3.1-flash-lite` | **11,7 s** | **3** — e iba **primero** en la lista |
+
+Cada turno esperaba hasta 12 s al modelo caído antes de probar otro. Y el
+orden no se puede dejar fijo: un mes antes, el ranking era **el inverso**.
+
+- **Ranking adaptativo** (`brain._ranked()`): cada llamada mide cuánto tardó
+  cada modelo, y un fallo lo aparta un rato (30 s, 60 s, 120 s… hasta 5 min).
+  La siguiente pregunta empieza siempre por el que mejor va *ahora*. Al
+  arrancar se mide en dos rondas (la primera incluye crear el cliente y no
+  cuenta).
+- **Petición escalonada** (*hedging*): si el mejor modelo no contesta en
+  **1,8 s**, se lanza también el siguiente y gana el primero que llegue. Mata
+  los picos sueltos sin pagar el doble de llamadas en el caso normal.
+- **Una sola memoria por conversación**, en `brain.py` y no en el brick.
+  Antes cada modelo tenía la suya: cuando contestaba otro (pasaba a menudo),
+  el guía *se olvidaba* del reto a media charla. Probado: recuerda el nombre,
+  la edad y el reto del niño aunque cambie el modelo.
+- **Resultado:** turnos completos de BANG y Curioso, con clasificador y
+  reescritura incluidos, de **0,94 a 2,28 s**. Antes, hasta 12 s o más.
+- `/status` muestra cómo va cada modelo ahora mismo.
+
+### La voz arranca antes
+
+- **TTS de Google en *streaming*** (`voice._synthesize_google_stream()`): la
+  frase completa llega 0,2–0,3 s antes que con el TTS normal (0,58 s contra
+  0,77 s en una frase corta). Se espera la frase entera a propósito: así la
+  boca sigue haciendo los visemas igual. Si falla, cae al TTS normal, y tras
+  3 fallos seguidos se apaga hasta reiniciar.
+- **Las frases de relleno** ("déjame pensarlo…") van **cacheadas a disco**
+  como el "¡Dime!": suenan al instante. En Essentials importa doble: antes
+  Piper las sintetizaba *mientras* Qwen pensaba, y los dos se peleaban por los
+  mismos 4 núcleos.
+- El relleno en Plus espera 3,5 s (antes 3,0): con la petición escalonada un
+  turno lento contesta en ~2,5–3 s, y el relleno arrancaba justo cuando
+  llegaba la respuesta, que entonces tenía que esperar a que terminara.
+- **Español de Colombia:** Gemini se iba al de España ("¡eso mola!", "tío").
+  Las reglas de voz lo prohíben ahora explícitamente.
+
+### Los arreglos del QR y del arranque
+
+- **El QR apuntaba a Docker** (`192.168.48.3`), una dirección que no existe
+  fuera del contenedor. Ahora se le pregunta la IP al ayudante de WiFi del
+  host: `10.3.16.177`.
+- **El sketch se comía el QR** si el aviso o la bienvenida seguían en
+  pantalla. Ahora espera y sale en cuanto la pantalla queda libre.
+- **Había dos arranques a la vez** (`/arranque` lanzaba otro encima), y uno le
+  pintaba el menú encima al QR del otro. Ahora hay un candado.
+- **El QR ya no está en el dashboard:** sirve para *llegar* al dashboard.
+- El QR se queda su minuto **mientras** el robot pregunta PLUS/ESSENTIAL, en
+  vez de esperar parado. Y la música lo-fi se oye (estaba en graves que el
+  parlante no saca) y ya no se recalcula en cada uso (eran ~15 s).
+- Del encendido a la pregunta PLUS/ESSENTIAL: **142 s → 83 s**.
+
+> **Pendiente de oír en el robot:** la latencia de Gemini y del TTS está
+> medida en la placa, pero no se ha cronometrado una conversación de punta a
+> punta con un niño hablando.
+
+## Versión 1.2.0 — 2026-10-07 (publicada como parte de la 1.1.1 stable)
 
 El **arranque** deja de ser una bienvenida y pasa a ser una presentación: el
 robot cuenta qué es BANG y quién lo hizo, enseña su panel de control, y
@@ -127,7 +200,7 @@ internet, pero con voz de persona.
   QR se calcula con la IP de ahora, así sigue siendo correcto cuando la placa
   cambia de red.
 
-## Versión 1.1.1 — 2026-10-06
+## Versión 1.1.1 beta — 2026-10-06
 
 Dos frentes: que **hablar con el robot se sienta como hablar con alguien**
 (era lo que peor estaba, en un 20 % de satisfacción) y que el modo

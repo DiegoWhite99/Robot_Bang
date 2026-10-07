@@ -390,7 +390,7 @@ def warmup():
     if llm_router.is_local():
         warm_cached([k for k in _CACHED_PHRASES["dime"] if k in localvoice.VOICES])
     else:
-        warm_cached(_CACHED_PHRASES["dime"])
+        warm_cached(list(_CACHED_PHRASES["dime"]))
 
 
 # --- Dispositivos de audio: headset USB o bocina Bluetooth -------------------
@@ -1200,7 +1200,67 @@ def _synthesize(text, voice_name):
     return _synthesize_google(text, voice_name)
 
 
+# TTS de Google en STREAMING. Medido en esta placa el 07/10/2026, por frase:
+#
+#     chars   normal    streaming (frase completa)   streaming (1er audio)
+#       16    0,77 s    0,58 s                       0,39 s
+#       42    0,97 s    0,65 s                       0,33 s
+#       75    1,38 s    1,07 s                       0,33 s
+#
+# Se usa esperando la frase COMPLETA, no el primer trozo, y es a proposito:
+# asi devuelve el mismo WAV que el TTS normal y la boca (visemas, que necesitan
+# el audio entero para repartir la forma de cada letra) y el corte por
+# barge-in siguen igual, sin tocar nada. Se gana 0,2-0,3 s por frase, y como
+# las frases se piden en paralelo, la respuesta entera llega antes.
+#
+# Solo existe para las voces Chirp3-HD (que son todas las de los guias). Si
+# falla por lo que sea, se cae al TTS normal: la voz nunca depende de esto.
+_TTS_STREAMING = True
+_tts_stream_ok = True  # se apaga solo si el streaming falla de forma sistematica
+_tts_stream_fails = 0
+
+
+def _synthesize_google_stream(text, voice_name):
+    cfg = texttospeech.StreamingSynthesizeConfig(
+        voice=texttospeech.VoiceSelectionParams(language_code="es-US", name=voice_name),
+        streaming_audio_config=texttospeech.StreamingAudioConfig(
+            audio_encoding=texttospeech.AudioEncoding.PCM, sample_rate_hertz=_TTS_SAMPLE_RATE,
+        ),
+    )
+
+    def peticiones():
+        yield texttospeech.StreamingSynthesizeRequest(streaming_config=cfg)
+        yield texttospeech.StreamingSynthesizeRequest(input=texttospeech.StreamingSynthesisInput(text=text))
+
+    pcm = b"".join(r.audio_content for r in _tts().streaming_synthesize(peticiones(), timeout=15))
+    if not pcm:
+        raise RuntimeError("el streaming no devolvio audio")
+    # PCM crudo (LINEAR16 sin cabecera): se envuelve en un WAV para devolver lo
+    # mismo que el TTS normal.
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(_TTS_SAMPLE_RATE)
+        w.writeframes(pcm)
+    return np.frombuffer(buf.getvalue(), dtype=np.uint8)
+
+
 def _synthesize_google(text, voice_name):
+    global _tts_stream_ok, _tts_stream_fails
+    if _TTS_STREAMING and _tts_stream_ok and "Chirp3-HD" in voice_name:
+        try:
+            wav = _synthesize_google_stream(text, voice_name)
+            _tts_stream_fails = 0
+            return wav
+        except Exception as exc:
+            _tts_stream_fails += 1
+            logger.warning(f"TTS en streaming fallo ({str(exc)[:80]}); uso el normal")
+            if _tts_stream_fails >= 3:
+                # Tres seguidos: algo de fondo (cuota, version de la API). Se
+                # deja de intentar hasta reiniciar, para no pagar el fallo cada vez.
+                _tts_stream_ok = False
+                logger.warning("Apago el TTS en streaming hasta reiniciar: fallo 3 veces seguidas")
     input_text = texttospeech.SynthesisInput(text=text)
     voice = texttospeech.VoiceSelectionParams(language_code="es-US", name=voice_name)
     # LINEAR16 con Google TTS trae el header WAV incluido: se puede
@@ -3078,7 +3138,29 @@ _CACHED_PHRASES = {
         "cori": "¡Dime, dime! Te escucho.",
         "cristal": "¡Dime! Te escucho.",
     },
+    # Las frases de relleno ("déjame pensarlo...") mientras el cerebro piensa.
+    # Antes se sintetizaban en cada turno, y eso era doblemente malo:
+    #   - en Plus, ~1 s de TTS antes de poder decir "estoy pensando";
+    #   - en Essentials, Piper sintetizaba JUSTO mientras Qwen generaba, y los
+    #     dos se peleaban por los mismos 4 nucleos: la respuesta tardaba mas
+    #     por culpa de la frase que tenia que disimular la espera.
+    # Cacheadas a disco, suenan al instante y no le roban CPU a nadie.
+    "pensar_0": {
+        "crispi": "Mmm, déjame pensarlo un momento...",
+        "carmel": "Buena. Dame un segundo para pensarlo.",
+        "cesia": "¡Uy! Déjame pensarlo un momento...",
+        "cori": "Mmm, a ver, a ver... déjame pensarlo.",
+        "cristal": "Déjame pensarlo un momento...",
+    },
+    "pensar_1": {
+        "crispi": "A ver, a ver... dame un segundo.",
+        "carmel": "Déjame pensarlo un momento...",
+        "cesia": "Mmm, dame un segundo...",
+        "cori": "¡Qué curioso! Dame un segundo...",
+        "cristal": "Mmm, qué interesante. Dame un segundo...",
+    },
 }
+FILLER_KEYS = ("pensar_0", "pensar_1")
 _TTS_CACHE_DIR = Path(__file__).resolve().parent.parent / "data" / "tts_cache"
 _cached_wavs = {}
 
@@ -3094,8 +3176,11 @@ def _cached_wav(persona, key):
     if wav is not None:
         return wav
     text = _cached_text(persona, key)
-    # El hash del texto va en el nombre: si se cambia la frase, se vuelve a sintetizar.
-    path = _TTS_CACHE_DIR / f"{persona}_{key}_{hashlib.md5((voz + text).encode()).hexdigest()[:8]}.wav"
+    # El hash del texto va en el nombre: si se cambia la frase, se vuelve a
+    # sintetizar. Con la voz local, tambien el modelo de Piper: si no, al
+    # cambiar de voz (data/piper_voice.txt) seguiria sonando la vieja.
+    motor = localvoice.piper_voice_name() if voz in _LOCAL_VOICE_NAMES else ""
+    path = _TTS_CACHE_DIR / f"{persona}_{key}_{hashlib.md5((voz + motor + text).encode()).hexdigest()[:8]}.wav"
     if path.exists():
         wav = np.frombuffer(path.read_bytes(), dtype=np.uint8)
     else:
@@ -3110,7 +3195,8 @@ def _cached_wav(persona, key):
 
 
 def warm_cached(personas):
-    """Deja listos los "¡Dime!" de todos los guias (en segundo plano)."""
+    """Deja listas las frases cacheadas ("¡Dime!", las de relleno) de esos
+    guias. Solo la primera vez sintetiza; despues salen de data/tts_cache/."""
     for persona in personas:
         for key in _CACHED_PHRASES:
             try:

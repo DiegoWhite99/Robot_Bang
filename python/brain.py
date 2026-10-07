@@ -5,7 +5,9 @@
 # nube (el codigo de este archivo) y ESSENTIALS = modelo local en la placa.
 # bang.py sigue llamando a chat() igual que antes; el router decide.
 
+import threading
 import time
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 
 from arduino.app_bricks.cloud_llm import CloudLLM
 from arduino.app_utils import Logger
@@ -22,34 +24,151 @@ PERSONAS = {
     "cristal": {"name": "Cristal", "gender": "f", "color": "#22d3ee", "tagline": "La musa reflexiva", "need": "Autorrealizacion", "voice": "Calmada, luminosa e inspiradora: busca referentes externos y simplifica."},
 }
 
-# Modelos medidos en esta placa, del mas rapido al mas lento (07/09/2026):
-#   google:gemini-3.1-flash-lite     ~1.1 s
-#   google:gemini-3.5-flash-lite     ~1.2 s
-#   google:gemini-flash-lite-latest  ~8 s
-# El de fabrica del brick (gemini-3.6-flash) tardaba mas de 35 s o fallaba.
+# --- Que modelo de Gemini, y como se le pregunta ------------------------------
 #
-# Dos detalles que costaron caro y no hay que tocar:
+# LA LECCION: el orden de los modelos NO se puede dejar fijo. El 07/09/2026 se
+# midio en esta placa y el mas rapido era gemini-3.1-flash-lite (~1,1 s) con
+# flash-lite-latest en ~8 s. Un mes despues, el 07/10/2026, era AL REVES:
+#
+#     modelo                          mediana   fallos de 5
+#     google:gemini-flash-lite-latest  0,90 s     0
+#     google:gemini-3.5-flash-lite     1,13 s     0   (un pico de 9,3 s)
+#     google:gemini-3.1-flash-lite    11,7 s      3   <- iba PRIMERO en la lista
+#
+# Con el orden fijo, cada turno de Plus esperaba hasta TIMEOUT (12 s) al modelo
+# caido antes de probar el siguiente: esa era la "conversacion que no fluye".
+#
+# Ahora hay dos mecanismos, y entre los dos el turno tarda lo que tarde el
+# modelo mas rapido de ESE momento:
+#
+#   1. RANKING ADAPTATIVO. Cada llamada mide cuanto tardo cada modelo (media
+#      movil) y un fallo lo aparta un rato (castigo que crece si repite). La
+#      siguiente pregunta empieza siempre por el que mejor va AHORA.
+#   2. PETICION ESCALONADA ("hedging"). Se pregunta al mejor; si en HEDGE_S no
+#      contesto, se lanza TAMBIEN al segundo, en paralelo, y gana el primero
+#      que llegue. Es lo que mata los picos sueltos (el 9,3 s de arriba) sin
+#      pagar el doble de llamadas en el caso normal, que contesta en ~1 s.
+#
+# Detalles que costaron caro y no hay que tocar:
 # - El prefijo "google:" es obligatorio. Sin el, el brick tira
 #   ValueError("Model not supported") y todo cae en la respuesta de reserva.
 # - El timeout no puede bajar de 10 s: Gemini rechaza deadlines menores con
 #   INVALID_ARGUMENT y ningun modelo llega a responder.
-MODELS = ("google:gemini-3.1-flash-lite", "google:gemini-3.5-flash-lite", "google:gemini-flash-lite-latest")
-# 12 s alcanzaba con el prompt corto de antes; con los prompts de fase de
-# bang.py (y Gemini cargado) varios turnos daban 504 DEADLINE_EXCEEDED, asi que
-# subio a 20. Pero 20 s era el plazo de UN intento: con un reintento y tres
-# modelos, un rato de 503 costaba minutos (medido el 05/10/2026: 48 s en el
-# primer modelo antes de pasar al segundo). Para un robot que contesta por voz
-# eso es un cuelgue. Ahora el plazo vuelve a 12 s (por debajo de 10 Gemini
-# rechaza el deadline con INVALID_ARGUMENT) y no hay reintentos: ante un 503 se
-# pasa al modelo siguiente, que suele contestar al toque.
+# - reasoning_effort=0 (apagar el razonamiento) hace FALLAR a estos modelos:
+#   medido, ni uno contesto. No se usa.
+MODELS = ("google:gemini-flash-lite-latest", "google:gemini-3.5-flash-lite", "google:gemini-3.1-flash-lite")
 TIMEOUT = 12
 MAX_RETRIES = 0
-# Y, pase lo que pase, la ronda entera de modelos no se lleva mas de esto: si
-# ninguno contesto en BUDGET segundos, mejor el modelo local (o la respuesta de
-# reserva) que seguir haciendo esperar al niño en silencio.
-BUDGET = 26
+# Cuanto se espera al mejor modelo antes de lanzar tambien el siguiente. El
+# caso normal contesta en ~0,9 s; pasado 1,8 s es que ese intento se atasco.
+HEDGE_S = 1.8
+# Y, pase lo que pase, la pregunta entera no se lleva mas de esto: si nadie
+# contesto, mejor el modelo local (o la respuesta de reserva) que seguir
+# haciendo esperar al niño en silencio.
+BUDGET = 14
 
-_llms = {}
+_pool = ThreadPoolExecutor(max_workers=6, thread_name_prefix="gemini")
+_stats_lock = threading.Lock()
+# Punto de partida del ranking: el orden de MODELS. warmup() lo corrige con
+# medidas reales al arrancar, y cada llamada despues.
+_stats = {m: {"ewma": 1.0 + 0.5 * k, "fails": 0, "down_until": 0.0} for k, m in enumerate(MODELS)}
+
+
+def _ranked():
+    """Los modelos en el orden en que conviene preguntarles AHORA."""
+    ahora = time.monotonic()
+    with _stats_lock:
+        return sorted(MODELS, key=lambda m: (ahora < _stats[m]["down_until"], _stats[m]["ewma"]))
+
+
+def _record(model, ok, dt):
+    with _stats_lock:
+        st = _stats[model]
+        if ok:
+            st["ewma"] = 0.6 * st["ewma"] + 0.4 * dt
+            st["fails"] = 0
+            st["down_until"] = 0.0
+        else:
+            st["fails"] += 1
+            st["ewma"] = max(st["ewma"], float(TIMEOUT))
+            # 30 s, 60 s, 120 s... hasta 5 minutos: un modelo caido no se vuelve
+            # a probar en cada turno, pero tampoco se olvida para siempre.
+            st["down_until"] = time.monotonic() + min(300.0, 30.0 * 2 ** (st["fails"] - 1))
+
+
+def model_stats():
+    """Para /status: como va cada modelo ahora mismo."""
+    ahora = time.monotonic()
+    with _stats_lock:
+        return [
+            {"model": m.split(":", 1)[-1], "ms": int(_stats[m]["ewma"] * 1000),
+             "apartado_s": max(0, int(_stats[m]["down_until"] - ahora))}
+            for m in _ranked_unlocked(ahora)
+        ]
+
+
+def _ranked_unlocked(ahora):
+    return sorted(MODELS, key=lambda m: (ahora < _stats[m]["down_until"], _stats[m]["ewma"]))
+
+
+# --- Memoria de la conversacion ----------------------------------------------
+# La memoria la lleva ESTE modulo, no el brick. Antes cada modelo tenia la suya
+# (CloudLLM.with_memory), asi que cuando un turno lo contestaba otro modelo —que
+# con Gemini pasa a menudo— ese no sabia nada de lo hablado: el guia "se
+# olvidaba" del reto a media charla. Con una sola memoria por conversacion,
+# cualquier modelo puede contestar cualquier turno, que es lo que permite el
+# ranking y la peticion escalonada de arriba.
+HIST_TURNS = 6  # intercambios que se recuerdan (= los 12 mensajes de antes)
+_HIST_USER_CHARS = 400  # del mensaje del usuario se guarda la COLA: ahi esta lo que dijo el niño
+_hist = {}
+_hist_lock = threading.Lock()
+_clients = {}
+_clients_lock = threading.Lock()
+
+
+def _client(model, system_prompt, temperature):
+    """Un CloudLLM SIN memoria por (modelo, prompt, temperatura), reutilizado:
+    construirlo cuesta, y la memoria ya va aparte."""
+    ck = (model, system_prompt, temperature)
+    with _clients_lock:
+        c = _clients.get(ck)
+        if c is None:
+            c = CloudLLM(model=model, system_prompt=system_prompt, temperature=temperature, timeout=TIMEOUT, max_retries=MAX_RETRIES)
+            _clients[ck] = c
+        return c
+
+
+def _with_history(cache_key, text):
+    with _hist_lock:
+        hist = list(_hist.get(cache_key) or ())
+    if not hist:
+        return text
+    lineas = ["Conversación hasta ahora (lo más reciente al final):"]
+    for usuario, respuesta in hist:
+        lineas.append(f"[Persona] {usuario}")
+        lineas.append(f"[Tú] {respuesta}")
+    lineas += ["", "Ahora:", text]
+    return "\n".join(lineas)
+
+
+def _remember(cache_key, text, reply):
+    with _hist_lock:
+        h = _hist.setdefault(cache_key, [])
+        h.append((text[-_HIST_USER_CHARS:], reply))
+        del h[:-HIST_TURNS]
+
+
+def _call(model, system_prompt, prompt, temperature):
+    t0 = time.monotonic()
+    try:
+        reply = (_client(model, system_prompt, temperature).chat(prompt) or "").strip()
+    except Exception as exc:
+        _record(model, False, time.monotonic() - t0)
+        logger.warning(f"{model} no respondio en {time.monotonic() - t0:.1f}s ({str(exc)[:80]})")
+        return None
+    dt = time.monotonic() - t0
+    _record(model, bool(reply), dt)
+    return reply or None
 
 
 def persona_intro(key):
@@ -74,7 +193,11 @@ SPOKEN_RULES = (
     "tu respuesta la dice el robot en voz alta y la persona esta esperando su turno, "
     "asi que se breve y deja que ella hable. Nunca pases de 45 palabras. "
     "No repitas lo que la persona acaba de decir con otras palabras. "
-    "No uses markdown, listas, vinetas ni emojis: solo texto hablado natural."
+    "No uses markdown, listas, vinetas ni emojis: solo texto hablado natural. "
+    # Gemini se iba al español de España ("¡eso mola!", "tío", "guay") y esto es
+    # un producto de la CUN para niños colombianos.
+    "Habla en español latinoamericano neutro, como en Colombia: nunca uses expresiones "
+    "de España como mola, guay, tío, vale, flipar, currar ni vosotros."
 )
 
 
@@ -97,36 +220,53 @@ def local_system(key):
     )
 
 
-def _get_llm(cache_key, model, system_prompt, temperature):
-    ck = (cache_key, model)
-    if ck not in _llms:
-        _llms[ck] = CloudLLM(model=model, system_prompt=system_prompt, temperature=temperature, timeout=TIMEOUT, max_retries=MAX_RETRIES).with_memory(max_messages=12)
-    return _llms[ck]
-
-
 def chat_gemini(cache_key, system_prompt, text, temperature=None, memory=True):
     """Pregunta a Gemini y devuelve su respuesta (o None si ningun modelo contesta).
 
     cache_key identifica la conversacion (p. ej. ("crispi", "solida")): cada
-    una guarda su propia memoria. Con memory=False es una llamada suelta
+    una guarda su propia memoria (_hist). Con memory=False es una llamada suelta
     (clasificador, reescritor...), sin historial.
 
-    Gemini devuelve 503/429 de forma intermitente, asi que si un modelo no
-    responde pasamos al siguiente en vez de reintentar el mismo: un modelo
-    alterno suele contestar en un par de segundos. Sin API_KEY, CloudLLM
-    lanza ValueError al construirse: tambien cae en None.
+    Ver arriba el porque: se empieza por el modelo que mejor va AHORA y, si no
+    contesta en HEDGE_S, se lanza tambien el siguiente; gana el primero.
     """
-    limite = time.monotonic() + BUDGET
-    for model in MODELS:
-        if time.monotonic() >= limite:
-            logger.warning(f"Gemini agoto los {BUDGET}s de margen; no pruebo mas modelos")
+    prompt = _with_history(cache_key, text) if memory else text
+    orden = _ranked()
+    t0 = time.monotonic()
+    limite = t0 + BUDGET
+    vivos = {}
+    siguiente = 0
+
+    def lanzar():
+        nonlocal siguiente
+        m = orden[siguiente]
+        siguiente += 1
+        vivos[_pool.submit(_call, m, system_prompt, prompt, temperature)] = m
+
+    lanzar()
+    while vivos:
+        queda = limite - time.monotonic()
+        if queda <= 0:
+            logger.warning(f"Gemini agoto los {BUDGET}s de margen")
             break
-        try:
-            if memory:
-                return _get_llm(cache_key, model, system_prompt, temperature).chat(text)
-            return CloudLLM(model=model, system_prompt=system_prompt, temperature=temperature, timeout=TIMEOUT, max_retries=MAX_RETRIES).chat(text)
-        except Exception as exc:
-            logger.warning(f"{model} no respondio ({exc}); pruebo el siguiente")
+        espera = min(HEDGE_S, queda) if siguiente < len(orden) else queda
+        hechos, _ = wait(list(vivos), timeout=espera, return_when=FIRST_COMPLETED)
+        if not hechos:
+            if siguiente < len(orden):
+                logger.info(f"{vivos[next(iter(vivos))]} tarda mas de {HEDGE_S}s: pregunto tambien a {orden[siguiente]}")
+                lanzar()
+            continue
+        for f in hechos:
+            m = vivos.pop(f)
+            reply = f.result()
+            if reply:
+                if memory:
+                    _remember(cache_key, text, reply)
+                logger.info(f"Gemini: {m.split(':', 1)[-1]} en {time.monotonic() - t0:.2f}s")
+                return reply
+        # El que termino fallo: el siguiente entra YA, sin esperar el escalon.
+        if siguiente < len(orden):
+            lanzar()
     return None
 
 
@@ -145,10 +285,10 @@ FALLBACK_REPLY = "Se me cruzaron los cables un segundo. Puedes repetirlo?"
 
 def clear(persona):
     """Borra la memoria de todas las conversaciones de un guia (las dos)."""
-    for ck in list(_llms):
-        key = ck[0]
-        if key == persona or (isinstance(key, tuple) and key[0] == persona):
-            _llms.pop(ck).clear_memory()
+    with _hist_lock:
+        for key in list(_hist):
+            if key == persona or (isinstance(key, tuple) and key and key[0] == persona):
+                _hist.pop(key, None)
     llm_router.clear(persona)
 
 
@@ -170,8 +310,21 @@ def warmup():
     if llm_router.is_local():
         llm_router.warmup_local()
         return
-    try:
-        CloudLLM(model=MODELS[0], system_prompt="Responde solo: ok", timeout=TIMEOUT).chat("ok")
-        logger.info("Modelo precalentado: la primera respuesta ya sera rapida")
-    except Exception as exc:
-        logger.warning(f"No se pudo precalentar el modelo: {exc}")
+    # Los TRES a la vez: asi se paga el arranque de cada cliente ahora y, de
+    # paso, el ranking sale de una medida real y no del orden de MODELS.
+    #
+    # DOS rondas: la primera incluye crear el cliente (~4-5 s, una sola vez por
+    # proceso) y no dice nada de lo rapido que contesta el modelo. Lo que vale
+    # para el ranking es la segunda, que es la que se parece a un turno.
+    futs = [_pool.submit(_call, m, "Responde solo: ok", "ok", None) for m in MODELS]
+    wait(futs, timeout=40)
+    with _stats_lock:
+        primera = {m: _stats[m]["ewma"] for m in MODELS}
+    futs = [_pool.submit(_call, m, "Responde solo: ok", "ok", None) for m in MODELS]
+    wait(futs, timeout=20)
+    with _stats_lock:
+        for m in MODELS:
+            # Si la segunda contesto, manda ella sola (sin arrastrar el arranque).
+            if _stats[m]["ewma"] != primera[m] and not _stats[m]["fails"]:
+                _stats[m]["ewma"] = (_stats[m]["ewma"] - 0.6 * primera[m]) / 0.4
+    logger.info("Modelos precalentados: " + ", ".join(f"{x['model']} {x['ms']} ms" for x in model_stats()))

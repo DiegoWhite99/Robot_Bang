@@ -51,8 +51,11 @@ import wifinet
 # Version del producto. FUENTE UNICA: el dashboard la pide al conectarse y
 # /status la repite, asi no hay dos numeros distintos dando vueltas. El tag
 # de git (1.1.0) se pone al final, sobre el commit ya validado.
-APP_VERSION = "1.2.0"
-VERSION_NOTICE = "Este producto está en desarrollo y seguirá recibiendo actualizaciones."
+APP_VERSION = "1.1.1"
+# "beta" mientras se prueba, "stable" la que se entrega. La pantalla del robot
+# lo muestra tambien (APP_CHANNEL de sketch/sketch.ino: tienen que coincidir).
+APP_CHANNEL = "stable"
+VERSION_NOTICE = "Versión estable. Seguirá recibiendo actualizaciones."
 
 # HTTPS con el certificado autofirmado de certs/ (si falta, el brick lo
 # genera solo). El navegador avisa la primera vez: "Avanzado -> continuar".
@@ -118,7 +121,7 @@ def _llm_mode_payload():
 
 
 def on_ui_connect(sid):
-    ui.send_message("version", {"version": APP_VERSION, "notice": VERSION_NOTICE}, sid)
+    ui.send_message("version", {"version": f"{APP_VERSION} {APP_CHANNEL}", "notice": VERSION_NOTICE}, sid)
     ui.send_message("llm_mode", _llm_mode_payload(), sid)
     ui.send_message("personas", _personas_payload(), sid)
     ui.send_message("active_persona", {"key": _current_persona}, sid)
@@ -240,8 +243,16 @@ def _status():
     escucha = "lista" if bs["lista"] else f"NO disponible ({bs['vosk']})"
     modo = curioso.MODE_NAMES[curioso.mode()]
     reto = reto if not curioso.is_curioso() else "charla libre (modo Curioso)"
+    gemini = ""
+    if not llm_router.is_local():
+        # Como va cada modelo AHORA, en el orden en que se le pregunta (ver
+        # brain._ranked()): si la charla se siente lenta, aqui se ve por que.
+        gemini = "\nGemini: " + " · ".join(
+            f"{m['model']} {m['ms']} ms" + (f" (apartado {m['apartado_s']} s)" if m["apartado_s"] else "")
+            for m in brain.model_stats()
+        )
     return (
-        f"Chat BANG v{APP_VERSION}\nModo: {modo}\nCerebro: {cerebro}\nDesbloqueados: {unlocked}\n"
+        f"Chat BANG v{APP_VERSION} {APP_CHANNEL}\nModo: {modo}\nCerebro: {cerebro}{gemini}\nDesbloqueados: {unlocked}\n"
         f"Activo: {active} ({reto})\nVoz: {voice.output_name()}\nMicrófono: {voice.input_name()}\n"
         f"Escucha activa: nativa, siempre encendida — {escucha} (Vosk: {bs['vosk']})"
     )
@@ -1624,17 +1635,15 @@ def _switch_to(new, old, depth=0, ask=True):
     return "ok"
 
 
-# Frases de relleno (Essentials, o Plus cuando Gemini se demora), por guia. Cortas a proposito: la
-# frase entera se sintetiza antes de sonar y el modelo ya esta pensando.
-_FILLERS = {
-    "crispi": ("Mmm, déjame pensarlo un momento...", "A ver, a ver... dame un segundo."),
-    "carmel": ("Buena. Dame un segundo para pensarlo.", "Déjame pensarlo un momento..."),
-    "cesia": ("¡Uy! Déjame pensarlo un momento...", "Mmm, dame un segundo..."),
-    "cori": ("Mmm, a ver, a ver... déjame pensarlo.", "¡Qué curioso! Dame un segundo..."),
-    "cristal": ("Déjame pensarlo un momento...", "Mmm, qué interesante. Dame un segundo..."),
-}
+# Frases de relleno (Essentials, o Plus cuando Gemini se demora). Los textos
+# viven en voice._CACHED_PHRASES ("pensar_0", "pensar_1"): van cacheados a
+# disco para que suenen al instante (ver alli por que importa tanto en local).
 _filler_turn = 0
-PLUS_FILLER_AFTER = 3.0  # s sin respuesta de Gemini antes de decir la frase de relleno
+# s sin respuesta de Gemini antes de decir la frase de relleno. Estaba en 3,0,
+# pero con la peticion escalonada (brain.HEDGE_S) un turno lento contesta en
+# ~2,5-3 s: el relleno arrancaba justo cuando llegaba la respuesta, y entonces
+# la respuesta tenia que esperar a que terminara el relleno (~2 s mas).
+PLUS_FILLER_AFTER = 3.5
 
 _SOURCE_LABELS = {"gemini": "☁️ Gemini", "gemini_web": "☁️🔎 Gemini + internet", "local": "🧠 modelo local",
                   "fijo": "🛡 respuesta fija", "plantilla": "📋 plantilla"}
@@ -1642,13 +1651,12 @@ _SOURCE_LABELS = {"gemini": "☁️ Gemini", "gemini_web": "☁️🔎 Gemini + 
 
 def _say_filler(persona):
     global _filler_turn
-    options = _FILLERS.get(persona) or _FILLERS["crispi"]
     _filler_turn += 1
     try:
         # Gesto de pensar: un brazo arriba, quieto. Es exactamente lo que dice
         # la frase ("déjame pensarlo"), y se nota que el robot no se colgó.
         gestures.send(gestures.THINK, persona)
-        voice.say(persona, options[_filler_turn % len(options)])
+        voice.say_cached(persona, voice.FILLER_KEYS[_filler_turn % len(voice.FILLER_KEYS)])
     except Exception as exc:
         _broadcast_debug(f"⚠ no pude decir la frase de relleno: {exc}")
 

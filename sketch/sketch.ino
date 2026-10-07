@@ -129,7 +129,11 @@
 
 // Version del producto, visible en la pantalla (ver drawVersionBadge()).
 // Debe coincidir con APP_VERSION de python/main.py.
-#define APP_VERSION "1.1.0"
+#define APP_VERSION "1.1.1"
+// Canal de la version: "beta" mientras se prueba, "stable" la que se entrega.
+// "BANG v1.1.1 - stable" son 20 caracteres a 6 px = 121 px, y el recuadro
+// (VER_W) mide 122: si el texto crece, hay que agrandar VER_W.
+#define APP_CHANNEL "stable"
 
 const int16_t SCREEN_W = 320;
 const int16_t SCREEN_H = 240;
@@ -517,7 +521,7 @@ void drawVersionBadge() {
   verCanvas.setTextSize(1);
   verCanvas.setTextColor(ST77XX_WHITE);
   verCanvas.setCursor(1, 1);
-  verCanvas.print("BANG v" APP_VERSION " - beta");
+  verCanvas.print("BANG v" APP_VERSION " - " APP_CHANNEL);
   verCanvas.flush();
 }
 

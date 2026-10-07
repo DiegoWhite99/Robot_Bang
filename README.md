@@ -7,7 +7,9 @@ hub USB-C alimentado — no hace falta ningún celular. Mientras responde, una
 carita animada en pantalla TFT mueve ojos y boca, y 2 microservos gesticulan
 sincronizados con ella.
 
-> **Versión 1.2.0** (2026-10-07): el **arranque** cuenta qué es BANG y que lo
+> **Versión 1.1.1 stable** (2026-10-07): la **conversación en Plus contesta en ~1 s**
+> (antes hasta 12 s: el modelo de Gemini que iba primero estaba caído; ahora
+> se elige solo el más rápido de cada momento). El **arranque** cuenta qué es BANG y que lo
 > creó la **CUN**, enseña el **QR del panel de control** un minuto, y
 > **pregunta por voz PLUS o ESSENTIAL** antes de presentar a nadie — con PLUS
 > aparecen los cinco guías; con ESSENTIAL se dicen sus límites de frente y
