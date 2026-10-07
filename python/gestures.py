@@ -263,12 +263,27 @@ def reset_emotions():
         _last_bang = -_BANG_EVERY
 
 
+# Cada gesto, ademas de verse, SUENA: main.py engancha aqui
+# voice.emotion_sound, que le pone a cada emocion su sonido (brillos para la
+# alegria, un gruñido para el enojo...). Va por reporter y no llamando a
+# voice.py directamente porque voice.py ya importa este modulo: llamarlo desde
+# aqui seria un import circular. Es el mismo patron de set_mouth_reporter().
+_sound_reporter = None
+
+
+def set_sound_reporter(fn):
+    global _sound_reporter
+    _sound_reporter = fn
+
+
 def send(gesture, persona):
     """Avisa al sketch. Sin pantalla (o sin sketch) la App sigue igual.
 
     Gesto y personaje viajan empaquetados en un solo entero (mismo mecanismo
     de Bridge.notify de un solo valor que ya se usaba), asi el sketch sabe
     con que colores pintar la carita ademas de si esta hablando.
+
+    Ademas dispara el sonido de la emocion, si hay quien lo toque.
     """
     persona_id = PERSONA_IDS.get(persona, 0)
     encoded = persona_id * _GESTURE_COUNT + int(gesture)
@@ -276,6 +291,11 @@ def send(gesture, persona):
         Bridge.notify("face_gesture", encoded)
     except Exception as exc:
         logger.debug(f"No se pudo actualizar la carita: {exc}")
+    if _sound_reporter is not None:
+        try:
+            _sound_reporter(gesture, persona)
+        except Exception as exc:
+            logger.debug(f"No sono la emocion: {exc}")
 
 
 def send_viseme(viseme):

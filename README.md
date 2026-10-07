@@ -7,17 +7,16 @@ hub USB-C alimentado — no hace falta ningún celular. Mientras responde, una
 carita animada en pantalla TFT mueve ojos y boca, y 2 microservos gesticulan
 sincronizados con ella.
 
-> **Versión 1.1.0** (2026-10-05): conversación fluida de verdad. La
-> **interrupción es nativa**: si el niño habla mientras el guía habla, el
-> guía se calla y escucha, sin palabras mágicas y sin interruptor que apagar.
-> Y el niño elige al empezar entre dos **modos de conversación**: **BANG**
-> (el guía acompaña su reto por las fases) y **CURIOSO** (charla libre, como
-> un asistente de voz: responde lo que le pregunten y obedece "ponte feliz",
-> "baila"), siempre con la personalidad de los guías. Además, **9 gestos
-> nuevos de brazos**: saludar, aplaudir, pensar, asentir, negar, bailar,
-> abrazar, dormir y estirarse. Ver `CHANGELOG.md`; el detalle técnico y el
-> checklist de pruebas en el robot están en `DOCUMENTACION.md` (§9.4, §10.6,
-> §12 y §20).
+> **Versión 1.2.0** (2026-10-07): el **arranque** cuenta qué es BANG y que lo
+> creó la **CUN**, enseña el **QR del panel de control** un minuto, y
+> **pregunta por voz PLUS o ESSENTIAL** antes de presentar a nadie — con PLUS
+> aparecen los cinco guías; con ESSENTIAL se dicen sus límites de frente y
+> acompaña solo **Cristal**. Las locuciones del arranque van **grabadas**
+> (`assets/audio/`, con música **lo-fi** por debajo), el modo local ya no
+> habla con espeak-ng sino con **Piper** (voz de persona, gratis y sin
+> internet), y cada emoción de la carita tiene **su propio sonido** (alegría =
+> brillos). Ver `CHANGELOG.md`; el detalle técnico y el checklist de pruebas
+> en el robot están en `DOCUMENTACION.md` (§9.4, §10.6, §12 y §20).
 
 ## Cómo funciona
 

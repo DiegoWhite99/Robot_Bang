@@ -19,7 +19,7 @@ ALWAYS_UNLOCKED = "crispi"
 # El unico guia del modo ESSENTIALS.
 #
 # Essentials corre entero en la placa: Qwen de 0.8B para pensar, Vosk para oir
-# y espeak-ng para hablar. Con cinco guias eso no da: cada uno tiene su propio
+# y Piper para hablar. Con cinco guias eso no da: cada uno tiene su propio
 # system prompt, y llama.cpp solo reusa el prefijo en cache mientras el prompt
 # no cambie — cambiar de guia tira la cache y el siguiente turno vuelve a
 # costar los ~22 s de releer todo. Con uno solo el prefijo se queda caliente y
@@ -28,7 +28,7 @@ ALWAYS_UNLOCKED = "crispi"
 # Y es Cristal, no Crispi (el de Plus), por dos razones: es la musa reflexiva,
 # que es la que mejor le sienta a un modelo pequeño —calmada, frases cortas,
 # preguntas en vez de recetas— y es mujer, que es la voz que se pidio para el
-# modo local (espeak-ng "es-419+f3", ver localvoice.py).
+# modo local (ver localvoice.py).
 ESSENTIALS_GUIDE = "cristal"
 
 

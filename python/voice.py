@@ -6,7 +6,7 @@
 #   ("API keys are not supported by this API"): hace falta la service
 #   account de google-credentials.json.
 # - Habla (TTS): Google Cloud Text-to-Speech, una voz Chirp3-HD distinta por
-#   guia. Si falla (sin internet, credencial invalida...) se cae a espeak si
+#   guia. Si falla (sin internet, credencial invalida...) se cae a la voz
 #   esta disponible; el contenedor de esta App no lo trae instalado (a
 #   diferencia del sistema host), asi que en la practica ese turno se salta
 #   en vez de sonar robotico.
@@ -252,7 +252,7 @@ def set_debug_reporter(fn):
 
 # --- Voz local (modo Essentials) -----------------------------------------------
 # Essentials es "todo en la placa": el modelo (Qwen), la escucha (Vosk) y la voz
-# (espeak-ng) sin tocar internet. Plus sigue con Google, que suena mucho mejor.
+# (Piper, con espeak-ng de respaldo) sin tocar internet. Plus sigue con Google.
 # Si falta alguna de las dos piezas locales se avisa UNA vez y ese pedazo se
 # hace con Google: es mejor que quedarse mudo o sordo.
 _sin_local_avisado = set()
@@ -266,7 +266,7 @@ def _falta_local(que, detalle):
 
 
 def local_voice():
-    """True si este turno habla con espeak-ng en vez de con Google TTS."""
+    """True si este turno habla con la voz local (Piper) en vez de con Google TTS."""
     if not llm_router.is_local():
         return False
     if localvoice.available():
@@ -286,7 +286,7 @@ def local_stt():
 
 
 def _voice_name(persona):
-    """El nombre de voz del guia en el motor que toca (Google o espeak-ng)."""
+    """El nombre de voz del guia en el motor que toca (Google o la voz local)."""
     if local_voice():
         return localvoice.VOICES.get(persona, localvoice.DEFAULT_VOICE)
     return _VOICES.get(persona, _DEFAULT_VOICE)
@@ -367,14 +367,16 @@ def warmup():
 
     Plus: abre los canales gRPC de STT y TTS (la primera llamada de cada
     cliente cuesta bastante mas que las siguientes). Essentials: carga
-    libespeak-ng y el modelo de Vosk del turno, que tambien tardan la primera
+    el modelo de Piper (~9 s) y el de Vosk del turno, que tambien tardan la primera
     vez y no tienen por que pagarse con un niño esperando.
     """
     try:
         if llm_router.is_local():
+            # Cargar el modelo de Piper cuesta ~11 s: se paga aqui, no con un
+            # niño esperando a que el robot conteste.
             localvoice.synthesize("Hola.", localvoice.DEFAULT_VOICE, _TTS_SAMPLE_RATE)
             localvoice.stt_ready(_SAMPLE_RATE)
-            logger.info("Voz local precalentada (espeak-ng + Vosk)")
+            logger.info(f"Voz local precalentada ({localvoice.tts_state()} + Vosk)")
         else:
             _speech()
             _synthesize("Hola.", _DEFAULT_VOICE)
@@ -383,7 +385,7 @@ def warmup():
         logger.warning(f"No se pudo precalentar la voz: {exc}")
     # Los "¡Dime!" de la escucha activa (una vez: despues salen de data/tts_cache/).
     # En Essentials solo habla Cristal, asi que no se sintetizan los otros
-    # cuatro: con espeak saldrian iguales (hay una sola voz local) y serian
+    # cuatro: con la voz local saldrian iguales (hay una sola) y serian
     # cuatro archivos de cache que nadie va a usar.
     if llm_router.is_local():
         warm_cached([k for k in _CACHED_PHRASES["dime"] if k in localvoice.VOICES])
@@ -1190,7 +1192,7 @@ _LOCAL_VOICE_NAMES = frozenset(localvoice.VOICES.values()) | {localvoice.DEFAULT
 
 
 def _synthesize(text, voice_name):
-    # Voz local (Essentials): espeak-ng devuelve el WAV al mismo sample rate que
+    # Voz local (Essentials): localvoice devuelve el WAV al mismo sample rate que
     # el parlante, asi que de aqui para abajo no cambia nada (boca, visemas y
     # corte por barge-in funcionan igual).
     if voice_name in _LOCAL_VOICE_NAMES:
@@ -1595,23 +1597,88 @@ _BED_CHORDS = (
     (174.61, 220.00, 261.63),  # Fa mayor
     (196.00, 246.94, 293.66),  # Sol mayor
 )
-_BED_CHORD_S = 2.4   # cuanto dura cada acorde
+_BED_CHORD_S = 3.2   # cuanto dura cada acorde (lo-fi = sin prisa)
 _BED_GAIN = 0.20     # respecto a la voz: se oye, pero no la tapa
 
+# Los mismos acordes, una octava abajo: lo-fi vive en los graves.
+_LOFI_CHORDS = tuple(tuple(f / 2 for f in acorde) for acorde in _BED_CHORDS)
+_LOFI_BPM = 72       # el tempo tipico del genero: lento, de fondo
+_LOFI_DETUNE = 0.003  # 0,3 % de desafine entre voces: el "chorus" cansado
 
-def _music_bed(n, sample_rate):
-    """Colchon de acordes en bucle, de n muestras."""
+
+def _lofi_bed(n, sample_rate):
+    """Colchon LO-FI en bucle, de n muestras (float, sin escalar).
+
+    "Lo-fi" aqui son cuatro cosas, todas sintetizadas con numpy (no hay
+    libreria de audio en el contenedor, ni falta):
+
+      1. ACORDES CALIDOS. Los mismos cuatro acordes de siempre pero una octava
+         abajo y con ondas triangulares en vez de senos puros: el seno suena a
+         pitido de laboratorio, el triangulo suena a teclado viejo. Cada voz va
+         un pelin desafinada (_LOFI_DETUNE) respecto a la otra, que es lo que
+         da el "chorus" cansado del genero.
+      2. UN PULSO LENTO, a _LOFI_BPM. Bombo en el 1 y en el 3, y un "hat" de
+         ruido muy bajito en las corcheas. No es una bateria: es lo justo para
+         que la cosa respire y no parezca un dron.
+      3. RUIDO DE VINILO: ruido rosa muy bajo, constante, con algun "crack"
+         suelto. Es lo que hace que suene a disco y no a sintetizador.
+      4. FILTRO PASA-BAJOS suave sobre toda la mezcla, para quitarle el brillo
+         digital. Es una media movil: un pasa-bajos de pobre, pero para esto
+         sobra y cuesta una decima de lo que costaria uno de verdad.
+
+    El resultado va POR DEBAJO de la voz (_BED_GAIN), nunca encima: esto es un
+    fondo para que el arranque no suene a sala vacia, no una cancion.
+    """
     largo = max(1, int(_BED_CHORD_S * sample_rate))
     trozos = []
-    for acorde in _BED_CHORDS:
+    for acorde in _LOFI_CHORDS:
         t = np.arange(largo) / sample_rate
         # Entrada y salida suaves: que no se oiga el corte entre acordes.
-        env = np.clip(np.minimum(t / 0.45, (_BED_CHORD_S - t) / 0.55), 0, 1)
-        onda = sum(np.sin(2 * np.pi * f * t) for f in acorde) / len(acorde)
-        trozos.append(onda * env)
+        env = np.clip(np.minimum(t / 0.6, (_BED_CHORD_S - t) / 0.7), 0, 1)
+        voces = []
+        for i, f in enumerate(acorde):
+            # Triangular via arcoseno de un seno: calida, con pocos armonicos.
+            desafine = 1.0 + _LOFI_DETUNE * (1 if i % 2 else -1)
+            voces.append(np.arcsin(np.sin(2 * np.pi * f * desafine * t)) * (2 / np.pi))
+        trozos.append(sum(voces) / len(voces) * env)
     bucle = np.concatenate(trozos)
+
     repes = int(n / len(bucle)) + 1
-    return np.tile(bucle, repes)[:n] * 7000.0
+    pad = np.tile(bucle, repes)[:n]
+
+    # --- pulso ---
+    t_all = np.arange(n) / sample_rate
+    beat = 60.0 / _LOFI_BPM
+    fase = (t_all % (beat * 4)) / beat  # compas de 4 tiempos
+    ritmo = np.zeros(n)
+    # Bombo: seno grave que cae rapido, en los tiempos 1 y 3.
+    for golpe in (0.0, 2.0):
+        d = np.clip(fase - golpe, 0, None)
+        hit = (fase >= golpe) & (fase < golpe + 0.35)
+        ritmo += np.where(hit, np.sin(2 * np.pi * 55 * d) * np.exp(-d * 18), 0.0)
+    # Hat: ruido cortito en cada corchea, muy por debajo del bombo.
+    rng = np.random.default_rng(7)  # semilla fija: el fondo suena igual siempre
+    corchea = (t_all % (beat / 2)) 
+    hat = (corchea < 0.03) * rng.standard_normal(n) * np.exp(-corchea * 90) * 0.06
+    ritmo = ritmo * 0.35 + hat
+
+    # --- vinilo ---
+    ruido = rng.standard_normal(n)
+    # Ruido "rosa" barato: el blanco suavizado pierde los agudos y queda mate.
+    k = 24
+    rosa = np.convolve(ruido, np.ones(k) / k, mode="same")
+    cracks = (rng.random(n) < 2e-4) * rng.standard_normal(n) * 0.5
+    vinilo = rosa * 0.05 + cracks
+
+    mezcla = pad * 0.85 + ritmo + vinilo
+
+    # --- pasa-bajos ---
+    k = max(2, int(sample_rate / 5200))
+    return np.convolve(mezcla, np.ones(k) / k, mode="same") * 7000.0
+
+
+# Nombre de siempre, para no tocar a quien ya lo llamaba.
+_music_bed = _lofi_bed
 
 
 def say_with_music(persona, text):
@@ -1771,6 +1838,185 @@ def ack():
             _reset_speaker()
 
     threading.Thread(target=play, daemon=True, name="ack").start()
+
+
+# --- Un sonido por emocion ----------------------------------------------------
+# Cada gesto de la carita (gestures.HAPPY, SAD, ANGRY...) suena distinto. No es
+# decoracion: el robot se usa con niños desde los 5 años, que todavia no leen,
+# y muchas veces no estan mirando la pantalla. El sonido dice la emocion sin
+# pedirle a nadie que lea ni que mire.
+#
+# Todo se sintetiza con numpy, como el resto de los tonos de este modulo: no
+# hay archivos de audio que empaquetar ni licencias que mirar, y suena igual en
+# cualquier placa.
+#
+# REGLAS que se respetan en las recetas de abajo:
+#   - CORTOS (<= 0,6 s). El sonido va JUSTO ANTES de hablar (main.py manda el
+#     gesto y enseguida la voz) y comparte el parlante con ella: lo que dure el
+#     sonido, lo espera la respuesta.
+#   - BAJOS. Van por debajo de la voz, no compiten con ella.
+#   - REST y TALK no suenan. Son los dos gestos que se mandan en cada turno;
+#     ponerles sonido seria un pitido cada vez que el robot abre la boca.
+#
+# Las formas de onda:
+#   bell    seno + armonicos con caida exponencial: campana, brillo
+#   soft    seno con entrada y salida suaves: calido, sin ataque
+#   growl   diente de sierra grave: el "grrr" contra el problema
+#   slide   glissando entre dos notas: sorpresa, bostezo
+#   noise   ruido filtrado: el aplauso
+
+_EMO_GAIN = 4200  # amplitud base; la voz va a ~12000-20000
+
+
+def _emo_note(freq, dur, sample_rate, forma="soft", freq2=None, gain=1.0):
+    n = max(1, int(dur * sample_rate))
+    t = np.arange(n) / sample_rate
+    if forma == "noise":
+        rng = np.random.default_rng(int(freq))
+        onda = np.convolve(rng.standard_normal(n), np.ones(8) / 8, mode="same")
+        env = np.exp(-t / max(0.004, dur * 0.18))
+    elif forma == "bell":
+        # Armonicos impares debiles: campanita, no pitido.
+        onda = np.sin(2 * np.pi * freq * t) + 0.35 * np.sin(4 * np.pi * freq * t) + 0.12 * np.sin(6 * np.pi * freq * t)
+        env = np.exp(-t / max(0.02, dur * 0.45))
+    elif forma == "growl":
+        # Diente de sierra: muchos armonicos = aspero. Grave y corto.
+        f = np.linspace(freq, freq2 or freq * 0.8, n)
+        fase = 2 * np.pi * np.cumsum(f) / sample_rate
+        onda = 2 * (fase / (2 * np.pi) % 1.0) - 1.0
+        env = np.clip(np.minimum(t / 0.02, (dur - t) / 0.08), 0, 1)
+    elif forma == "slide":
+        f = np.linspace(freq, freq2 or freq, n)
+        onda = np.sin(2 * np.pi * np.cumsum(f) / sample_rate)
+        env = np.clip(np.minimum(t / 0.02, (dur - t) / 0.06), 0, 1)
+    else:  # soft
+        onda = np.sin(2 * np.pi * freq * t) + 0.18 * np.sin(4 * np.pi * freq * t)
+        env = np.clip(np.minimum(t / 0.02, (dur - t) / 0.08), 0, 1)
+    return onda * env * gain
+
+
+# Cada receta es una lista de notas y un "solape": cuanto se monta cada nota
+# sobre la anterior (0 = una detras de otra; 0.6 = muy encabalgadas, que es lo
+# que convierte cuatro campanitas sueltas en un BRILLO).
+_EMOTION_SOUNDS = {
+    # Brillos: arpegio agudo de campanitas muy encabalgadas. Es el que se pidio
+    # para el modo feliz y el que mas se oye (alegria, aplauso, saludo...).
+    gestures.HAPPY: ([(1047, 0.30, "bell", None, 0.8), (1319, 0.30, "bell", None, 0.8),
+                      (1568, 0.32, "bell", None, 0.9), (2093, 0.42, "bell", None, 0.7)], 0.72),
+    # Sorpresa: un "¡uy!" que sube de golpe.
+    gestures.SURPRISE: ([(440, 0.20, "slide", 1320, 1.0), (1568, 0.16, "bell", None, 0.6)], 0.35),
+    # Enojo jugueton CONTRA EL PROBLEMA (nunca contra el niño): un gruñido
+    # grave y corto. Grave y breve = travieso; agudo y largo = daria miedo.
+    gestures.ANGRY: ([(120, 0.26, "growl", 82, 0.7)], 0.0),
+    # "Uff": un suspiro que baja.
+    gestures.FRUSTRATED: ([(392, 0.22, "soft", None, 0.8), (294, 0.34, "slide", 247, 0.7)], 0.25),
+    # Tristeza: tres notas que caen, lentas y suaves.
+    gestures.SAD: ([(440, 0.20, "soft", None, 0.7), (349, 0.22, "soft", None, 0.6),
+                    (262, 0.34, "soft", None, 0.5)], 0.15),
+    # Saludo: dos notas amables, como un "¡hola!".
+    gestures.WAVE: ([(784, 0.14, "bell", None, 0.8), (1047, 0.26, "bell", None, 0.8)], 0.3),
+    # Aplauso: tres palmadas de ruido.
+    gestures.CLAP: ([(311, 0.09, "noise", None, 0.9), (347, 0.09, "noise", None, 0.8),
+                     (383, 0.12, "noise", None, 0.9)], 0.1),
+    # Pensar: una nota sola, media, que se queda: el "hmmm".
+    gestures.THINK: ([(523, 0.40, "soft", None, 0.6)], 0.0),
+    # Si / no: dos blips, arriba y abajo. Son los mas cortos de todos porque
+    # acompañan a respuestas de una palabra.
+    gestures.YES: ([(880, 0.08, "bell", None, 0.8), (1175, 0.14, "bell", None, 0.8)], 0.2),
+    gestures.NO: ([(587, 0.08, "bell", None, 0.7), (440, 0.16, "bell", None, 0.7)], 0.2),
+    # Baile: un acorde picado, tres notas al trote.
+    gestures.DANCE: ([(523, 0.10, "bell", None, 0.8), (659, 0.10, "bell", None, 0.8),
+                      (784, 0.20, "bell", None, 0.9)], 0.25),
+    # Abrazo: un acorde calido que crece y se queda.
+    gestures.HUG: ([(262, 0.45, "soft", None, 0.7), (330, 0.45, "soft", None, 0.6),
+                    (392, 0.50, "soft", None, 0.5)], 0.9),
+    # Dormir: tres notas que se apagan hacia abajo.
+    gestures.SLEEP: ([(330, 0.24, "soft", None, 0.5), (262, 0.26, "soft", None, 0.4),
+                      (196, 0.40, "soft", None, 0.35)], 0.2),
+    # Estiron (bostezo): sube y vuelve a bajar, sin prisa.
+    gestures.STRETCH: ([(392, 0.26, "slide", 784, 0.7), (784, 0.30, "slide", 494, 0.6)], 0.1),
+}
+
+# Dos gestos iguales seguidos no suenan dos veces: en una conversacion la
+# emocion se repite mucho (tres respuestas felices seguidas) y el sonido pasaria
+# de marcar la emocion a ser un tic.
+_EMO_REPEAT_S = 6.0
+# Y nunca dos sonidos pegados, sea cual sea la emocion.
+_EMO_MIN_GAP_S = 1.2
+_emo_last = {}  # gesto -> time.monotonic()
+_emo_last_any = 0.0
+_emo_lock = threading.Lock()
+_emo_cache = {}  # (gesto, sample_rate) -> pcm
+
+
+def _emotion_pcm(gesture, sample_rate):
+    """El PCM del sonido de un gesto, o None si ese gesto no suena."""
+    hit = _emo_cache.get((gesture, sample_rate))
+    if hit is not None:
+        return hit
+    receta = _EMOTION_SOUNDS.get(gesture)
+    if receta is None:
+        return None
+    notas, solape = receta
+    trozos = [(_emo_note(f, d, sample_rate, forma, f2, g), d) for f, d, forma, f2, g in notas]
+    # Se montan unas sobre otras segun el solape, en un buffer comun.
+    pasos = [max(1, int(d * (1.0 - solape) * sample_rate)) for _, d in trozos]
+    total = sum(pasos[:-1]) + len(trozos[-1][0])
+    buf = np.zeros(total, dtype=np.float64)
+    pos = 0
+    for i, (onda, _) in enumerate(trozos):
+        buf[pos : pos + len(onda)] += onda
+        pos += pasos[i]
+    pico = float(np.abs(buf).max())
+    if pico > 0:
+        buf = buf / pico  # normalizar: ninguna emocion suena mas fuerte que otra
+    pcm = (buf * _EMO_GAIN).astype(np.int16)
+    _emo_cache[(gesture, sample_rate)] = pcm
+    return pcm
+
+
+def emotion_sound(gesture, persona=None):
+    """Suena la emocion de un gesto, sin bloquear. main.py la engancha a
+    gestures.set_sound_reporter(), asi que cada gestures.send() la dispara.
+
+    No suena si el gesto no tiene sonido (REST, TALK), si esa misma emocion
+    sono hace poco, o si acaba de sonar otra cosa (ver _EMO_REPEAT_S).
+    """
+    global _emo_last_any
+    ahora = time.monotonic()
+    with _emo_lock:
+        if gesture not in _EMOTION_SOUNDS:
+            return
+        if ahora - _emo_last.get(gesture, -1e9) < _EMO_REPEAT_S:
+            return
+        if ahora - _emo_last_any < _EMO_MIN_GAP_S:
+            return
+        _emo_last[gesture] = ahora
+        _emo_last_any = ahora
+
+    def play():
+        try:
+            with _spk_lock:
+                spk = _speaker()
+                pcm = _emotion_pcm(gesture, spk.sample_rate)
+                if pcm is None:
+                    return
+                chunk = spk.buffer_size
+                for i in range(0, len(pcm), chunk):
+                    spk.play(pcm[i : i + chunk])
+        except Exception as exc:
+            logger.debug(f"No sono la emocion {gesture}: {exc}")
+            _reset_speaker()
+
+    threading.Thread(target=play, daemon=True, name="emotion-sound").start()
+
+
+def emotion_sound_reset():
+    """Olvida cuando sono cada emocion (para /gesto, que quiere oirlas todas)."""
+    global _emo_last_any
+    with _emo_lock:
+        _emo_last.clear()
+        _emo_last_any = 0.0
 
 
 # --- Celebracion: la "cancioncita + baile" de Diome-chan ----------------------
@@ -2057,6 +2303,132 @@ def sing(barge=None):
                 out.update(interrupted=True, trigger=barge.trigger)
         resume_listening()
     return out
+
+
+# --- Locuciones grabadas del arranque -----------------------------------------
+# El arranque dice SIEMPRE lo mismo (que es BANG, que lo hizo la CUN, el menu
+# PLUS/ESSENTIAL, los cinco guias...), asi que no se sintetiza en cada
+# encendido: esta grabado en assets/audio/*.mp3 (tools/make_intro_audio.py).
+#
+# Por que grabado y no TTS en vivo:
+#   - en Essentials no hay red, y antes esas frases las leia la voz local:
+#     ahora el arranque suena igual de bien en los dos modos;
+#   - no cuesta cuota de Google ni los ~2 s de espera de cada frase;
+#   - y queda SIEMPRE igual, que para la carta de presentacion del producto
+#     (una feria, una demo) importa mas que poder cambiarle una coma.
+#
+# Se reproduce como la cancion: MP3 -> PCM con el ffmpeg del wheel
+# (song._decode()), boca por volumen y corte por barge-in. El texto se pasa
+# aparte para que la boca haga los visemas (la forma de cada letra) igual que
+# cuando habla de verdad.
+
+_CLIP_DIR = Path(__file__).resolve().parent.parent / "assets" / "audio"
+_clip_cache = {}  # nombre -> pcm al sample rate del parlante
+_clip_lock = threading.Lock()
+
+
+def clip_path(nombre):
+    """La ruta del MP3 de una locucion del arranque, o None si no esta."""
+    for ext in (".mp3", ".wav", ".ogg"):
+        p = _CLIP_DIR / f"{nombre}{ext}"
+        if p.exists():
+            return p
+    return None
+
+
+def clip_ready(nombre):
+    return clip_path(nombre) is not None
+
+
+def _clip_pcm(nombre, sample_rate):
+    """PCM del clip al sample rate del parlante, cacheado en memoria."""
+    with _clip_lock:
+        hit = _clip_cache.get((nombre, sample_rate))
+    if hit is not None:
+        return hit
+    path = clip_path(nombre)
+    if path is None:
+        return None
+    pcm = song._decode(path, sample_rate)
+    if pcm is None or not len(pcm):
+        return None
+    with _clip_lock:
+        _clip_cache[(nombre, sample_rate)] = pcm
+    return pcm
+
+
+def say_clip(nombre, text=None, barge=None, music=False):
+    """Reproduce la locucion grabada `nombre` (assets/audio/<nombre>.mp3).
+
+    music=True le pone debajo el colchon lo-fi (_lofi_bed): se usa en la
+    intro de BANG, para que la presentacion del producto no suene a sala
+    vacia. La boca sigue a la VOZ, no a la mezcla, o se movería con la musica
+    aunque el robot no este hablando.
+
+    Devuelve {"interrupted", "trigger", "ok"}. Si el MP3 no esta o no se puede
+    decodificar devuelve ok=False y NO habla: el que llama decide (main.py
+    sintetiza entonces el texto con la voz del momento, ver _locucion()).
+    """
+    out = {"interrupted": False, "trigger": None, "ok": False}
+    try:
+        spk_rate = _speaker().sample_rate
+    except Exception as exc:
+        logger.warning(f"No pude reproducir la locucion '{nombre}': {exc}")
+        return out
+    pcm = _clip_pcm(nombre, spk_rate)
+    if pcm is None:
+        logger.warning(f"No hay locucion grabada '{nombre}' en {_CLIP_DIR}")
+        return out
+
+    voz = pcm
+    if music:
+        try:
+            # Una colita de silencio para que la musica cierre sola y no se
+            # corte en seco justo al acabar la ultima palabra.
+            voz = np.concatenate([pcm, np.zeros(int(1.6 * spk_rate), dtype=np.int16)])
+            bed = _lofi_bed(len(voz), spk_rate) * _BED_GAIN
+            pcm = np.clip(voz.astype(np.int32) + bed.astype(np.int32), -32768, 32767).astype(np.int16)
+        except Exception as exc:
+            logger.warning(f"No pude ponerle musica a '{nombre}' ({exc}): suena sin ella")
+            pcm, voz = pcm, pcm
+
+    pause_listening(keep_mic=barge is not None)
+    if barge is not None and not barge.start():
+        barge = None
+    if barge is not None and text:
+        barge.set_sentence(text)
+    stop = barge.event if barge is not None else None
+    try:
+        with _spk_lock:
+            _play_pcm_with_mouth(_speaker(), pcm, pcm_boca=voz, text=text, stop=stop)
+        out["ok"] = True
+    except Exception as exc:
+        logger.warning(f"No pude reproducir la locucion '{nombre}': {exc}")
+        _debug(f"⚠ fallo el parlante con '{nombre}': {exc}")
+        _reset_speaker()
+    finally:
+        _report_mouth(0)
+        if barge is not None:
+            barge.stop()
+            if barge.fired():
+                out.update(interrupted=True, trigger=barge.trigger)
+        time.sleep(0.1 if out["interrupted"] else 0.4)
+        resume_listening()
+    return out
+
+
+def warm_clips(nombres):
+    """Decodifica las locuciones del arranque en segundo plano, al arrancar la
+    App: asi la primera no se hace esperar el ~1 s del ffmpeg."""
+    try:
+        rate = _speaker().sample_rate
+    except Exception:
+        return
+    for n in nombres:
+        try:
+            _clip_pcm(n, rate)
+        except Exception as exc:
+            logger.debug(f"No pude precargar la locucion '{n}': {exc}")
 
 
 def song_ready():

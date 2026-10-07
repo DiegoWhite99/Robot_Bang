@@ -24,8 +24,10 @@
 #   AlreadyGenerating si dos hilos usan la misma instancia, y aunque sean
 #   instancias distintas el runner tiene 4 hilos de CPU para todo.
 
+import re
 import threading
 import time
+import unicodedata
 from pathlib import Path
 
 from arduino.app_utils import Logger
@@ -126,6 +128,55 @@ def set_mode(m):
         if m == "essentials":
             threading.Thread(target=warmup_local, daemon=True, name="llm-warmup").start()
     return m
+
+
+# --- Elegirlo por voz ----------------------------------------------------------
+# En el arranque el niño (o el adulto que esta con el) DICE "plus" o
+# "essential": en el robot no hay botones, y el dashboard puede no estar
+# abierto todavia. Ver main._elegir_cerebro().
+#
+# Las dos palabras son dificiles para el reconocimiento: "plus" es un
+# monosilabo ingles que ni Google ni Vosk tienen bien en un modelo en español,
+# y "essential" se dice como "esencial". Los alias de abajo son las formas en
+# que SALEN ESCRITAS, no las formas correctas de escribirlas: por eso estan
+# "plas", "blus" o "escencial", que no existen pero son lo que llega.
+
+
+def _plain(text):
+    """Minusculas y sin tildes, que es como se comparan las palabras sueltas."""
+    t = unicodedata.normalize("NFD", (text or "").lower())
+    return "".join(c for c in t if unicodedata.category(c) != "Mn")
+
+
+_PIDE_PLUS = re.compile(r"\b(plus|pluss|plas|plos|blus|plux|plis|flus|pulse|full)\b|\bla\s+nube\b|\bgoogle\b")
+_PIDE_ESSENTIALS = re.compile(
+    r"\b(essential|essentials|esencial|esenciales|esencia|escencial|asencial|exencial|"
+    r"especial|secencial|potencial|sensorial)\b|\bsin\s+internet\b|\b(modo\s+)?local\b"
+)
+# "modo plus", "cambia a essential", "ponte en plus": hace falta cuando la
+# palabra puede aparecer en medio de una conversacion normal.
+_PIDE_CEREBRO = re.compile(r"\b(modo|cambia|cambiar|pasa|pasate|ponte|pon|quiero|dame|usa|usemos|en)\b")
+
+
+def find_cerebro(text, bare=False):
+    """Que cerebro esta pidiendo esta frase ('plus' / 'essentials'), o None.
+
+    bare=True (justo cuando se le acaba de preguntar) acepta la palabra sola:
+    "plus", "esencial". Si no, la frase tiene que sonar a pedido ("modo plus",
+    "cambia a essential"), para que un "google" o un "especial" sueltos en
+    mitad de un reto no le cambien el cerebro al robot.
+    """
+    t = _plain(text)
+    if not t:
+        return None
+    plus, ess = _PIDE_PLUS.search(t), _PIDE_ESSENTIALS.search(t)
+    if not plus and not ess:
+        return None
+    if not bare and not _PIDE_CEREBRO.search(t):
+        return None
+    if plus and ess:
+        return "plus" if plus.start() > ess.start() else "essentials"  # manda el ultimo
+    return "plus" if plus else "essentials"
 
 
 def reset_source():

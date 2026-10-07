@@ -27,7 +27,7 @@
         </div>
 
         <div id="version-notice" class="version-notice">
-          <span class="version-chip" id="version-chip">v1.1.0</span>
+          <span class="version-chip" id="version-chip">v1.2.0</span>
           <span id="version-text">Este producto está en desarrollo y seguirá recibiendo actualizaciones.</span>
         </div>
 
@@ -103,9 +103,31 @@
 
         <div class="statusbar-footer">
           <span>© 1996-2026 BANG ACADEMY</span>
-          <span id="footer-version">v1.1.0</span>
+          <span id="footer-version">v1.2.0</span>
           <span class="blink">● EN LÍNEA</span>
           <span id="hit-counter">VISITAS: 0000042</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- QR del panel de control. Lo abre y lo cierra Python durante el
+         arranque (mensaje "qr_panel" de main._show_qr_panel()), a la vez que
+         lo dibuja en la pantalla del robot: asi el adulto que esta mirando el
+         dashboard puede pasarle el enlace a otra persona con la camara. -->
+    <div id="qr-panel" class="terminal-overlay" hidden>
+      <div class="window terminal-window" role="dialog" aria-label="Panel de control">
+        <div class="titlebar">
+          <span class="titlebar-text">📱 PANEL DE CONTROL DE ROBOT BANG</span>
+          <div class="titlebar-buttons">
+            <span id="qr-panel-close" class="close" role="button" title="Cerrar">✕</span>
+          </div>
+        </div>
+        <div class="qr-panel-body">
+          <img id="qr-panel-img" alt="Código QR del panel de control de Robot BANG" />
+          <div class="qr-panel-text">
+            Apunta la cámara del celular al código.
+            <div id="qr-panel-url" class="qr-panel-url"></div>
+          </div>
         </div>
       </div>
     </div>

@@ -3,6 +3,130 @@
 Cambios por actualización. El detalle técnico de cada punto está en
 `DOCUMENTACION.md` (se indica la sección).
 
+## Versión 1.2.0 — 2026-10-07
+
+El **arranque** deja de ser una bienvenida y pasa a ser una presentación: el
+robot cuenta qué es BANG y quién lo hizo, enseña su panel de control, y
+**pregunta con qué cerebro quiere trabajar** antes de presentar a nadie. Y el
+**modo Essentials deja de sonar a robot de los 90**: habla con Piper.
+
+> **Pendiente de probar en el robot:** todo esto se verificó sin micrófono ni
+> parlante conectados (medidas de Piper, decodificación de las locuciones,
+> reconocimiento de PLUS/ESSENTIAL, arranque de la App). **Falta oírlo.**
+> Hacer `arduino-app-cli app restart` y seguir el checklist de
+> `DOCUMENTACION.md` §20.
+
+### El arranque, contado de principio a fin
+
+La secuencia (`main._boot_sequence()`) pasa a ser:
+
+1. **Aviso de seguridad** — igual que antes: campanilla, música y las tres
+   advertencias (soy virtual, no me des tus datos, habla con un adulto).
+2. **Qué es BANG y quién lo hizo** — la Academia de Innovación de la **CUN**,
+   y cómo se trabaja un reto. Va **grabado** (ver abajo) y con **música
+   lo-fi** por debajo.
+3. **Red** — solo si no hay internet: el QR del panel de red, como antes.
+4. **El panel de control** — el QR del dashboard **un minuto en pantalla**,
+   con una locución dirigida a la persona adulta. Antes el panel existía pero
+   nadie se enteraba.
+5. **PLUS o ESSENTIAL, por voz** — y esto va **antes** de presentar a los
+   guías, a propósito: de ello depende si hay cinco o uno solo.
+6. **La presentación que toque:**
+   - **PLUS** → cómo funciona la app y los **cinco guías**, uno a uno, y el
+     menú de caras en la pantalla.
+   - **ESSENTIAL** → sus **límites**, dichos de frente (más lento, más corto,
+     se equivoca más), que aquí acompaña **solo Cristal**, y que para algo
+     mejor hay que pasarse a PLUS. **No se muestra el menú de guías**:
+     enseñar cinco caras y contestar siempre con la misma sería mentir.
+
+- **La pregunta de BANG/Curioso sale del arranque.** Se contradecía con el
+  paso 6 (le decía al niño que dijera un nombre y acto seguido le preguntaba
+  otra cosa) y añadía ~40 s. Sigue cambiándose en cualquier momento diciendo
+  **"modo curioso"** / **"modo bang"**, o con `/modo_chat` y `/elegir_modo`.
+- **Nuevo comando `/elegir_cerebro`** (alias `/cerebro`): vuelve a preguntar
+  PLUS o ESSENTIAL por voz.
+- **`llm_router.find_cerebro()`** reconoce la respuesta. "plus" y "essential"
+  son palabras difíciles para el reconocimiento (un monosílabo inglés y una
+  palabra que se dice "esencial"), así que acepta cómo salen **escritas** de
+  verdad: `plas`, `blus`, `escencial`, `especial`, y también "la nube",
+  "google", "sin internet", "modo local". 16 casos de prueba, 16 correctos.
+
+### Las locuciones del arranque van grabadas
+
+- **`assets/audio/*.mp3`**: las seis frases fijas del arranque están grabadas
+  con la voz de la presentadora (Chirp3-HD Zephyr) por
+  `tools/make_intro_audio.py`. Los textos viven en **`python/intro.py`**, que
+  es la fuente única: de ahí salen el audio, lo que se lee en el dashboard y
+  los visemas de la boca.
+- **Por qué grabado:** suena **siempre igual y siempre bien** (es la carta de
+  presentación del producto, y se usa en ferias con mala red), no cuesta
+  cuota de Google ni los ~2 s de espera por frase, y **suena idéntico en los
+  dos modos** — antes, en Essentials, el arranque lo leía la voz local.
+- **Nunca hay un paso mudo:** si falta un MP3, `main._locucion()` sintetiza el
+  mismo texto con la voz del momento.
+- Se decodifican al arrancar (`voice.warm_clips()`), en 0,04–0,22 s cada uno.
+
+### La voz del modo Essentials: Piper
+
+Essentials hablaba con **espeak-ng**, un sintetizador por formantes de los
+años 90. Se entendía, pero sonaba a robot de dibujos animados. Ahora habla con
+**Piper** (red neuronal VITS sobre onnxruntime): gratis, en la placa y sin
+internet, pero con voz de persona.
+
+- **Voz de fábrica: `es_MX-claude-high`** — mujer, latinoamericana, calidad
+  alta. Medido en esta placa con el runner del LLM encendido:
+
+  | voz | RTF | sexo | acento |
+  |---|---|---|---|
+  | `es_MX-claude-high` | **0,53** | mujer | mexicano |
+  | `es_ES-sharvard-medium` | 0,67 | mujer | España |
+  | `es_MX-ald-medium` | 0,66 | hombre | mexicano |
+  | `es_AR-daniela-high` | **4,97** | mujer | argentino |
+
+  **RTF** = segundos de CPU por segundo de audio; por encima de 1 el robot
+  tarda más en *preparar* la frase que en decirla.
+- **Por qué no `es_AR-daniela-high`,** que era la pedida y la que mejor suena:
+  con RTF 4,97 una respuesta de 10 s se hace esperar casi un minuto, y
+  Essentials ya es el lento de los dos. No es cuestión de hilos (91,8 s de CPU
+  para 27,5 s de reloj: ya usa ~3,3 de los 4 núcleos). Sigue disponible: se
+  escribe su nombre en `data/piper_voice.txt` (o en `BANG_PIPER_VOICE`) y el
+  robot la baja y la usa.
+- **El modelo va fuera de git** (son decenas de MB, como el de Vosk): lo baja
+  `tools/install_piper_voice.py` a `models/piper/` la primera vez.
+- **espeak-ng no se quita:** queda de respaldo. Si falta el `.onnx` o falla
+  onnxruntime, el robot habla igual —feo, pero habla— en vez de quedarse mudo.
+- Cargar el modelo cuesta ~9 s, y lo paga `voice.warmup()` al arrancar.
+
+### El robot suena, no solo se ve
+
+- **Un sonido por emoción** (`voice.emotion_sound()`): los 14 gestos con cara
+  tienen su propio sonido sintetizado. **Alegría = brillos** (un arpegio de
+  campanitas encabalgadas), sorpresa = un "¡uy!" que sube, enojo = un gruñido
+  grave y corto (siempre contra el problema, nunca contra el niño), tristeza =
+  tres notas que caen, aplauso = tres palmadas, abrazo = un acorde cálido…
+  El robot se usa con niños **desde los 5 años, que todavía no leen** y la
+  mitad del tiempo no están mirando la pantalla: el sonido es lo que les dice
+  cómo se siente.
+  - **`REST` y `TALK` no suenan**: se mandan en cada turno, y ponerles sonido
+    sería un pitido cada vez que el robot abre la boca.
+  - La misma emoción no suena dos veces en 6 s, ni dos sonidos seguidos en
+    menos de 1,2 s: en una conversación la emoción se repite mucho y el sonido
+    pasaría de marcar a ser un tic. `/gesto` sí las oye todas.
+  - Va por *reporter* (`gestures.set_sound_reporter()`), como la boca:
+    `voice.py` ya importa `gestures.py`, así que llamarlo al revés sería un
+    import circular.
+- **Música lo-fi** (`voice._lofi_bed()`) bajo la intro de BANG y el aviso de
+  seguridad: acordes cálidos una octava abajo con las voces algo desafinadas,
+  un pulso lento a 72 BPM, ruido de vinilo y un pasa-bajos. Todo con numpy,
+  sin archivos ni licencias que mirar.
+
+### El panel de control, en el dashboard
+
+- Nueva ventana con el **QR** y la dirección, que Python abre y cierra durante
+  el paso 4 del arranque (mensaje `qr_panel`). En la **pantalla del robot** el
+  QR se calcula con la IP de ahora, así sigue siendo correcto cuando la placa
+  cambia de red.
+
 ## Versión 1.1.1 — 2026-10-06
 
 Dos frentes: que **hablar con el robot se sienta como hablar con alguien**

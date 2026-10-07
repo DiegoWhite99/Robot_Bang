@@ -37,6 +37,26 @@ ui.on_message('chat_mode_response', onChatMode);
 ui.on_message('escucha', onEscucha);
 ui.on_message('escucha_response', onEscucha);
 ui.on_message('interrupted', onInterrupted);
+ui.on_message('qr_panel', onQrPanel);
+
+// QR del panel de control. Python lo abre en el arranque (paso 3) y lo cierra
+// al terminar la locución, a la vez que lo dibuja en la pantalla del robot.
+// Con img vacío se cierra. También se puede cerrar a mano con la ✕.
+const qrPanel = document.querySelector('#qr-panel');
+const qrPanelImg = document.querySelector('#qr-panel-img');
+const qrPanelUrl = document.querySelector('#qr-panel-url');
+document.querySelector('#qr-panel-close').addEventListener('click', () => (qrPanel.hidden = true));
+
+function onQrPanel(data) {
+  const img = (data && data.img) || '';
+  if (!img) {
+    qrPanel.hidden = true;
+    return;
+  }
+  qrPanelImg.src = img;
+  qrPanelUrl.textContent = (data && data.url) || '';
+  qrPanel.hidden = false;
+}
 
 // Version y aviso de actualizaciones: los manda Python al conectarse
 // (APP_VERSION en main.py), para que no haya dos numeros distintos entre el

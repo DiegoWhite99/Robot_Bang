@@ -8,9 +8,15 @@ qrcode==7.4.2
 # tools/install_vosk_model.py a models/vosk-es/ (voice.py lo llama solo).
 vosk==0.3.45
 
-espeakng-loader==0.2.4  # libespeak-ng + espeak-ng-data como wheel: voz LOCAL del modo
-                        # Essentials (ver python/localvoice.py). No hace falta apt:
-                        # trae la .so y el es_dict adentro.
+# Voz LOCAL del modo Essentials (python/localvoice.py): Piper, una red neuronal
+# (VITS) que corre en CPU con onnxruntime. Suena a persona, es gratis y no toca
+# internet. El modelo .onnx va fuera de git (son decenas de MB, como el de
+# Vosk): lo baja tools/install_piper_voice.py a models/piper/.
+piper-tts==1.8.0
+
+espeakng-loader==0.2.4  # RESPALDO de la voz local: si falta el .onnx o falla
+                        # onnxruntime, el robot habla igual (feo, pero habla).
+                        # Trae la .so y el es_dict adentro, sin apt.
 
 # La cancion "¡A despegar!" (assets/audio/) viene en MP3 y en el contenedor no
 # hay ffmpeg del sistema, ni libsndfile, ni rueda de miniaudio para aarch64.

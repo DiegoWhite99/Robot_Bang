@@ -42,6 +42,7 @@ import curioso
 import gestures
 import guardrails
 import guides
+import intro
 import llm_router
 import song
 import voice
@@ -50,7 +51,7 @@ import wifinet
 # Version del producto. FUENTE UNICA: el dashboard la pide al conectarse y
 # /status la repite, asi no hay dos numeros distintos dando vueltas. El tag
 # de git (1.1.0) se pone al final, sobre el commit ya validado.
-APP_VERSION = "1.1.1"
+APP_VERSION = "1.2.0"
 VERSION_NOTICE = "Este producto está en desarrollo y seguirá recibiendo actualizaciones."
 
 # HTTPS con el certificado autofirmado de certs/ (si falta, el brick lo
@@ -85,6 +86,11 @@ voice.set_debug_reporter(_broadcast_debug)
 voice.set_mouth_reporter(gestures.send_mouth)
 # Y los brazos bailan nota por nota con la melodia de celebracion.
 voice.set_arm_reporter(gestures.send_arm_step)
+# Cada emocion de la carita tiene ademas su sonido (brillos al ponerse feliz,
+# un gruñido jugueton al enojarse...): para un niño de 5 años que todavia no
+# lee, y que la mitad del tiempo no esta mirando la pantalla, el sonido es lo
+# que le dice como se siente el robot. Ver voice.emotion_sound().
+gestures.set_sound_reporter(voice.emotion_sound)
 # Los respaldos de Gemini al modelo local (y sus fallos) se ven en el panel.
 llm_router.set_reporter(_broadcast_debug)
 
@@ -129,14 +135,16 @@ ui.on_connect(on_ui_connect)
 _HELP = """Comandos:
   /help                 esta ayuda
   /status               guias desbloqueados, guia activo y salida de audio
-  /modo [plus|essentials]  cerebro del robot: plus = Gemini en la nube;
-                        essentials = todo en la placa, sin internet (modelo
-                        Qwen, oído con Vosk y voz con espeak-ng); solo Cristal
+  /modo [plus|essentials]  cerebro del robot: plus = Gemini en la nube, los 5
+                        guías; essentials = todo en la placa, sin internet
+                        (modelo Qwen, oído con Vosk y voz con Piper), solo
+                        Cristal y más lento. En el arranque se elige por voz
+  /elegir_cerebro       vuelve a preguntar por voz PLUS o ESSENTIAL
   /modo_chat [bang|curioso]  cómo conversa el robot: bang = acompaña el reto
                         por sus fases; curioso = charla libre, responde lo que
                         le pregunten y obedece "ponte feliz", "baila"...
                         Por voz: "modo curioso" / "modo bang"
-  /elegir_modo          vuelve a preguntar por voz cuál de los dos modos
+  /elegir_modo          pregunta por voz cuál de los dos modos de charla
   /unlock_<guia>        desbloquea un guia (carmel, cesia, cori, cristal)
   /unlock_all           desbloquea todos
   /lock_<guia>          vuelve a bloquear un guia (Crispi no se bloquea)
@@ -170,12 +178,14 @@ _HELP = """Comandos:
   /cantar               "¡A despegar!" (assets/audio/): la canción de verdad,
                         con la boca siguiendo la música y los brazos en el
                         golpe; háblale al robot para cortarla
-  /bienvenida           repite la bienvenida al BANG (GIF + presentadora)
+  /bienvenida           repite la bienvenida al BANG (GIF + presentadora) y
+                        la presentación del cerebro que esté activo
   /menu_guias           muestra el menú de los 5 guías en la pantalla, con su
                         tono; /menu_guias off lo cierra
   /aviso [off|mudo]     aviso de seguridad con campanilla y voz; "mudo" lo
                         muestra sin hablar, "off" lo quita
-  /arranque             repite la secuencia completa: aviso → BANG → menú
+  /arranque             repite la secuencia completa: aviso → BANG (quién lo
+                        hizo) → QR del panel → PLUS/ESSENTIAL → presentación
   /wifi                 estado de la red y dirección del dashboard
   /qr [off]             muestra el QR que lleva al dashboard (para el celular)
   /wifi_sync            repite la animación de "WiFi conectado"
@@ -342,10 +352,11 @@ def _set_llm_mode(arg):
         ui.send_message("personas", _personas_payload())
     ui.send_message("llm_mode", _llm_mode_payload())
     if m == "essentials":
-        _broadcast_debug("🧠 modo ESSENTIALS: todo en la placa (modelo, escucha y voz); cargando, ~20 s")
+        _broadcast_debug("🧠 modo ESSENTIALS: todo en la placa (modelo Qwen, oído Vosk, voz Piper); cargando, ~20 s")
         threading.Thread(target=voice.warmup, daemon=True, name="voz-warmup").start()
         return ("🧠 ESSENTIALS: todo corre en la placa, sin internet — modelo Qwen, escucha con Vosk y voz "
-                f"con espeak-ng. Te acompaña {brain.PERSONAS[guides.ESSENTIALS_GUIDE]['name']}, la única guía de este modo.")
+                f"con Piper. Te acompaña {brain.PERSONAS[guides.ESSENTIALS_GUIDE]['name']}, la única guía de este "
+                "modo, y las respuestas son más lentas que en PLUS.")
     _broadcast_debug("☁️ modo PLUS: Gemini en la nube (si falla, contesta el modelo local)")
     threading.Thread(target=voice.warmup, daemon=True, name="voz-warmup").start()
     return "☁️ PLUS: Gemini en la nube y voz de Google. Si Gemini falla, ese turno lo contesta el modelo local."
@@ -447,6 +458,9 @@ def run_command(line):
         return _set_llm_mode(line.split(maxsplit=1)[1] if len(line.split()) > 1 else "")
     if cmd == "modo_chat":
         return _set_chat_mode(line.split(maxsplit=1)[1] if len(line.split()) > 1 else "")
+    if cmd in ("elegir_cerebro", "cerebro"):
+        threading.Thread(target=_elegir_cerebro, daemon=True, name="cerebro").start()
+        return "🧠 pregunto por voz: ¿PLUS o ESSENTIAL?"
     if cmd == "elegir_modo":
         threading.Thread(target=_elegir_modo, daemon=True, name="modo").start()
         return "🎛 preguntando por voz: BANG o Curioso"
@@ -496,10 +510,10 @@ def run_command(line):
     if cmd == "bienvenida":
         def _bienvenida_y_menu():
             _welcome()
-            _show_menu()
+            _presentar_cerebro()
 
         threading.Thread(target=_bienvenida_y_menu, daemon=True, name="welcome").start()
-        return "🎉 bienvenida al BANG + menú de guías"
+        return "🎉 bienvenida al BANG + la presentación del cerebro activo"
     if cmd == "aviso":
         if arg.strip().lower() in ("off", "cerrar", "salir"):
             gestures.send_aviso(False)
@@ -511,7 +525,7 @@ def run_command(line):
         return "🛡 aviso de seguridad: campanilla + voz + GIF"
     if cmd == "arranque":
         threading.Thread(target=_boot_sequence, daemon=True, name="boot").start()
-        return "▶️ secuencia completa: aviso → BANG → menú"
+        return "▶️ secuencia completa: aviso → BANG → QR del panel → PLUS/ESSENTIAL → presentación"
     if cmd == "wifi":
         nivel = _wifi_level()
         gestures.send_wifi(nivel)
@@ -595,6 +609,9 @@ def _gesture_cmd(arg):
     gesto = _GESTOS[nombre]
 
     def run():
+        # /gesto existe para PROBAR los gestos uno a uno, asi que aqui si se
+        # quiere oir el sonido aunque esa emocion acabe de sonar.
+        voice.emotion_sound_reset()
         gestures.send(gesto, key)
         time.sleep(4)  # lo que dura la entrada del gesto mas un poco de vaiven
         gestures.send(gestures.REST, key)
@@ -832,37 +849,62 @@ WELCOME_VOICE = "bang"
 # manda la voz: el aviso no se va hasta terminar de decirlo.
 AVISO_S = 9.0
 
-# Lo que el robot DICE mientras se ve el aviso. Va hablado y no solo escrito
-# porque el producto arranca en 5 años, y a esa edad todavia no se lee.
-# Cubre los tres limites del producto: que es virtual, que no pide datos, y
-# que ante un problema se acude a un adulto.
-AVISO_TEXTO = (
-    "Antes de empezar, dos cositas. Soy un robot, un personaje virtual: no soy una "
-    "persona de verdad. No me cuentes datos tuyos como tu dirección, tu teléfono o "
-    "tus contraseñas, porque no los necesito. Y si algo te preocupa, cuéntaselo a una "
-    "persona adulta en la que confíes. ¡Ahora sí, vamos a crear!"
-)
+# Lo que el robot DICE mientras se ve el aviso vive en python/intro.py, junto
+# con el resto de las locuciones del arranque (ahi esta explicado por que).
+AVISO_TEXTO = intro.AVISO
+
+# La ruta del QR del panel de control, tal como se guardo en el repositorio.
+# En la PANTALLA no se usa este PNG sino un QR calculado al vuelo con la IP de
+# ahora (gestures.send_qr), que es el mismo codigo mientras la placa no cambie
+# de red y sigue siendo correcto cuando la cambia. El PNG se manda al
+# dashboard, para poder compartir el enlace desde el navegador.
+QR_PNG = "img/qr_webside/https_10_3_16_177_7000_.png"
 
 
 def _welcome_text():
-    keys = guides.unlocked()
-    if len(keys) == 1:
-        # Essentials: ofrecer cinco guias y tener uno solo es prometer lo que
-        # no hay; el niño diria "Cori" y le contestaria Cristal.
-        p = brain.PERSONAS[keys[0]]
-        return (
-            "¡Hola! Bienvenidos a BANG, la Academia de Innovación de la CUN. "
-            "Aquí convertimos tus retos en ideas que se pueden construir. "
-            f"En este modo te acompaño yo, {p['name']}, {p['tagline'].lower()}. "
-            f"Di {p['name']} y cuéntame tu reto."
-        )
-    names = [f"{brain.PERSONAS[k]['name']}, {brain.PERSONAS[k]['tagline'].lower()}" for k in keys]
-    return (
-        "¡Hola! Bienvenidos a BANG, la Academia de Innovación de la CUN. "
-        f"Aquí convertimos tus retos en ideas que se pueden construir, con la ayuda de {len(names)} guías. "
-        f"¿Con qué guía quieres conversar? {'; '.join(names[:-1])}; o {names[-1]}. "
-        "Di su nombre para empezar."
-    )
+    """Lo que se ESCRIBE en el dashboard durante la bienvenida.
+
+    Lo que se OYE es la locucion grabada intro_bang (ver python/intro.py): no
+    depende del modo ni de cuantos guias haya, porque solo cuenta que es BANG
+    y quien lo hizo. A quien te acompaña lo dice el paso siguiente
+    (intro_plus / intro_essential).
+    """
+    return intro.text("intro_bang")
+
+
+# --- Locuciones grabadas ------------------------------------------------------
+
+
+def _locucion(clave, barge=None, status=None, music=False):
+    """Dice una locucion del arranque y devuelve lo que paso.
+
+    Primero intenta el MP3 grabado (assets/audio/<clave>.mp3, ver
+    tools/make_intro_audio.py): suena siempre igual, no cuesta cuota y
+    funciona sin red, que es lo que hace que el arranque de Essentials suene
+    tan bien como el de Plus.
+
+    Si el MP3 no esta —instalacion nueva, o alguien vacio assets/audio/— se
+    sintetiza el mismo texto con la voz del momento. Nunca hay un paso mudo.
+
+    music=True le pone debajo el colchon lo-fi (voice._lofi_bed).
+    """
+    text = intro.text(clave)
+    if status:
+        _broadcast_status(status)
+    ui.send_message("reply", {"persona": WELCOME_VOICE, "text": text})
+    res = voice.say_clip(clave, text=text, barge=barge, music=music)
+    if res.get("ok"):
+        return res
+    _broadcast_debug(f"⚠ falta la locución grabada '{clave}': la digo con la voz del momento")
+    return voice.say(WELCOME_VOICE, text, barge=barge)
+
+
+def _warm_clips():
+    """Deja las locuciones del arranque decodificadas antes de que hagan falta."""
+    try:
+        voice.warm_clips(list(intro.CLIPS))
+    except Exception as exc:
+        _broadcast_debug(f"⚠ no pude precargar las locuciones: {exc}")
 
 
 _welcome_lock = threading.Lock()
@@ -942,6 +984,144 @@ def _elegir_modo(intentos=2):
         _modo_lock.release()
 
 
+# --- Paso 4: el panel de control (QR) -----------------------------------------
+
+# Cuanto se queda el QR en la pantalla, como MINIMO. La locucion dura ~18 s, y
+# con eso no alcanzaba: hay que sacar el celular, desbloquearlo, abrir la
+# camara y apuntar. Un minuto es el tiempo real de una persona haciendo eso sin
+# prisa, no el tiempo de leer la frase.
+#
+# Es un minimo, no un maximo: si la locucion durara mas, manda la locucion.
+QR_PANEL_S = 60.0
+
+
+def _show_qr_panel():
+    """Muestra el QR del dashboard en la pantalla y avisa de que existe.
+
+    Va dirigido a la persona adulta que esta con el niño: el panel es donde se
+    ve lo que el robot oye y responde, se cambia el cerebro y se le escribe.
+    Si no se sabe que existe, no se usa — de ahi que sea un paso del arranque
+    y no una linea en el README.
+
+    El QR se calcula con la IP de AHORA (gestures.send_qr), asi sigue siendo
+    correcto cuando la placa cambia de red; QR_PNG es la copia guardada del
+    mismo codigo, y es la que se le manda al dashboard.
+    """
+    url = dashboard_url()
+    if not url:
+        # Sin red no hay direccion a la que llevar: decir "apunta la camara al
+        # codigo" sin codigo en la pantalla es peor que callarse. El paso de
+        # red (_network_if_needed) ya enseña su propio QR cuando hace falta.
+        _broadcast_debug("📱 me salto el QR del panel: todavía no tengo dirección en la red")
+        return
+    gestures.send_qr(url)
+    ui.send_message("qr_panel", {"url": url, "img": QR_PNG})
+    t0 = time.monotonic()
+    try:
+        _locucion("intro_panel", status="📱 panel de control: apunta la cámara al código")
+        # Y se queda un rato mas, en silencio, para que de tiempo a escanearlo.
+        restante = QR_PANEL_S - (time.monotonic() - t0)
+        if restante > 0:
+            _broadcast_status(f"📱 el código se queda {int(restante)} s más: {url}")
+            time.sleep(restante)
+    finally:
+        gestures.send_qr()  # se quita el QR de la pantalla
+        ui.send_message("qr_panel", {"url": "", "img": ""})
+
+
+# --- Paso 5: que cerebro usa el robot -----------------------------------------
+# Esto se elige ANTES que nada porque de ello depende todo lo que viene
+# despues: con PLUS hay cinco guias y se muestra el menu; con ESSENTIAL hay
+# una sola (Cristal) y el menu NO se muestra.
+
+CEREBRO_WAIT_S = 40.0  # cuanto se espera la respuesta
+_cerebro_lock = threading.Lock()
+
+
+def _elegir_cerebro(intentos=2):
+    """Pregunta por voz PLUS o ESSENTIAL y deja el cerebro elegido.
+
+    Devuelve True si el niño, en vez del cerebro, dijo el nombre de un guia:
+    ahi se queda el cerebro que estuviera guardado y ese turno pasa a loop()
+    por _pending_turn, para no perder lo que dijo.
+
+    Si no contesta en dos intentos se queda el guardado (que de fabrica es
+    PLUS) y el arranque sigue: dejar al robot preguntando para siempre es peor
+    que elegir por el.
+    """
+    global _pending_turn
+    if not _cerebro_lock.acquire(blocking=False):
+        return False  # ya se está preguntando
+    try:
+        for intento in range(intentos):
+            clave = "menu_cerebro" if intento == 0 else "menu_cerebro_repite"
+            gestures.send(gestures.TALK, guides.default_guide())
+            # Se puede contestar sin esperar a que termine la pregunta: lo que
+            # oiga la escucha activa mientras habla ya vale de respuesta.
+            res = _locucion(
+                clave,
+                barge=voice.make_barge(WELCOME_VOICE, tuple(brain.PERSONAS)),
+                status="🧠 ¿PLUS o ESSENTIAL? dilo en voz alta",
+            )
+            gestures.send(gestures.REST, guides.default_guide())
+            wake, text = voice.listen_turn(
+                list(brain.PERSONAS) + list(AUTO_WAKE), follow_up=_MODO_FOLLOW,
+                follow_up_s=CEREBRO_WAIT_S, name_only=tuple(brain.PERSONAS) + AUTO_WAKE,
+            )
+            if wake in brain.PERSONAS:
+                _pending_turn = (wake, text or "")
+                _broadcast_debug(f"🧠 eligió guía sin elegir cerebro: sigo en {llm_router.MODE_LABELS[llm_router.mode()]}")
+                return True
+            dicho = f"{wake if wake in AUTO_WAKE else ''} {text or ''}".strip()
+            if not dicho:
+                # No alcanzó a entrar al STT, pero la escucha activa sí lo oyó.
+                dicho = ((res.get("trigger") or {}).get("text") or "").strip()
+            elegido = llm_router.find_cerebro(dicho, bare=True)
+            if elegido:
+                _broadcast_debug(_set_llm_mode(elegido))
+                return False
+        _broadcast_debug(f"🧠 nadie eligió: me quedo en {llm_router.MODE_LABELS[llm_router.mode()]}")
+        return False
+    finally:
+        _cerebro_lock.release()
+
+
+# --- Paso 6: que se cuenta despues, segun el cerebro elegido -------------------
+
+
+def _presentar_plus():
+    """Rama PLUS: como funciona la app y quienes son los cinco guias.
+
+    Al terminar se muestra el menu de los cinco en la pantalla, para que el
+    niño vea las caras mientras decide a quien llamar.
+    """
+    _locucion("intro_plus", status="✨ modo PLUS: te presento a los 5 guías")
+    _show_menu()
+
+
+def _presentar_essentials():
+    """Rama ESSENTIAL: lo que este modo NO puede hacer, dicho de frente.
+
+    Aqui NO se muestra el menu de guias, y es a proposito: en este modo solo
+    esta Cristal (guides.ESSENTIALS_GUIDE). Enseñar cinco caras y que conteste
+    siempre la misma seria prometer lo que no hay — es el mismo motivo por el
+    que la locucion dice que las respuestas son mas lentas y que, para algo
+    mejor, hay que pasarse a PLUS.
+    """
+    gestures.send_menu()  # por si quedaba abierto de un arranque anterior
+    _locucion("intro_essential", status="🧠 modo ESSENTIAL: te acompaña Cristal")
+    gestures.send(gestures.REST, guides.ESSENTIALS_GUIDE)
+    _broadcast_status(f"🎤 di {brain.PERSONAS[guides.ESSENTIALS_GUIDE]['name']} y cuéntale tu reto")
+
+
+def _presentar_cerebro():
+    """La rama que toque segun el cerebro que quedo elegido."""
+    if llm_router.is_local():
+        _presentar_essentials()
+    else:
+        _presentar_plus()
+
+
 def _show_aviso():
     """Paso 1: el aviso de seguridad, con campanilla y dicho en voz alta.
 
@@ -970,18 +1150,24 @@ def _show_aviso():
 
 
 def _welcome():
-    """Paso 2: la bienvenida de BANG (GIF + presentadora). Solo eso: quien
-    encadena los pasos es _boot_sequence()."""
+    """Paso 2: que es BANG y quien lo hizo (GIF + la locucion grabada).
+
+    Es la carta de presentacion del producto, y por eso va GRABADA
+    (assets/audio/intro_bang.mp3, ver python/intro.py): suena igual de bien en
+    una feria sin red que en el laboratorio, y suena igual en los dos modos.
+
+    Solo eso: quien encadena los pasos es _boot_sequence().
+    """
     if not _welcome_lock.acquire(blocking=False):
         return  # ya hay una sonando
-    text = _welcome_text()
     try:
         gestures.send_splash(True)
-        _broadcast_status("🎉 ¡Bienvenidos a BANG!")
-        ui.send_message("reply", {"persona": WELCOME_VOICE, "text": text})
         # Con el GIF en pantalla el gesto solo mueve los brazos.
         gestures.send(gestures.HAPPY, guides.default_guide())
-        voice.say(WELCOME_VOICE, text)
+        # Con musica lo-fi por debajo: es la presentacion del producto y se
+        # oye en ferias y auditorios, donde el silencio entre frases suena a
+        # que el robot se colgo.
+        _locucion("intro_bang", status="🎉 ¡Bienvenidos a BANG!", music=True)
         gestures.send_splash(False)
     finally:
         gestures.send(gestures.REST, guides.default_guide())
@@ -1037,23 +1223,39 @@ def _network_if_needed():
 def _boot_sequence():
     """El arranque completo, en este orden:
 
-        1. ADVERTENCIA   aviso de seguridad (lo primero que se ve)
-        2. BANG          bienvenida con la presentadora
-        3. RED           solo si no hay internet: QR + panel de red
-        4. MODO          BANG o Curioso, elegido por voz (_elegir_modo())
-        5. MENU          los 5 guias, para elegir por voz
-        6. AGENTES       la conversacion, que la lleva loop() cuando el niño
-                         dice un nombre (ver _greet())
+        1. ADVERTENCIA  aviso de seguridad, con campanilla y musica (_show_aviso())
+        2. BANG         que es BANG y que lo hizo la CUN (_welcome())
+        3. RED          solo si no hay internet: QR + panel de red
+        4. PANEL        el QR del dashboard, para el adulto, un minuto en
+                        pantalla (_show_qr_panel())
+        5. CEREBRO      PLUS o ESSENTIAL, elegido por voz (_elegir_cerebro())
+        6. PRESENTACION la que toque segun el paso 5:
+                        PLUS      -> como funciona la app + los 5 guias + menu
+                        ESSENTIAL -> sus limites + Cristal, y SIN menu de guias
+        7. AGENTES      la conversacion, que la lleva loop() cuando el niño
+                        dice un nombre (ver _greet())
+
+    La red va ANTES del QR del panel a proposito: la direccion del dashboard
+    depende de la red, asi que preguntarla antes de tenerla daria un QR vacio.
+
+    Del paso 5 depende todo lo demas, y por eso se pregunta antes de presentar
+    a nadie: no se puede ofrecer cinco guias y despues resultar que solo hay uno.
 
     El sketch ya arranca mostrando el aviso sin esperar a Python (por si tarda
     o se cae); aqui solo se le dice cuando pasar al siguiente paso.
+
+    Como quiere hablar (BANG o Curioso) ya NO se pregunta aqui: alargaba el
+    arranque justo despues de haberle dicho al niño que dijera un nombre, y se
+    contradecian. Se sigue pudiendo cambiar en cualquier momento diciendo
+    "modo curioso" / "modo bang", con /modo_chat o con /elegir_modo.
     """
     _show_aviso()
     _welcome()
     _network_if_needed()
-    if _elegir_modo():
+    _show_qr_panel()
+    if _elegir_cerebro():
         return  # dijo el nombre de un guia: loop() atiende ese turno
-    _show_menu()
+    _presentar_cerebro()
 
 
 def _card_cmd(arg):
@@ -1081,10 +1283,11 @@ def _menu():
     _broadcast_bang(None)
 
     def _volver_al_inicio():
+        # No se vuelve a preguntar el cerebro: eso lo elige un adulto una vez
+        # (y sigue en /modo). Solo se repite la bienvenida y la presentacion
+        # que toque — sin esto la pantalla se quedaba en la bienvenida.
         _welcome()
-        if _elegir_modo():
-            return  # eligió guía mientras se le preguntaba el modo
-        _show_menu()  # sin esto la pantalla se quedaba en la bienvenida
+        _presentar_cerebro()
 
     threading.Thread(target=_volver_al_inicio, daemon=True, name="welcome").start()
     return "🏠 de vuelta al inicio: retos borrados, elige un guía"
@@ -1333,11 +1536,16 @@ def loop():
         # Decodificar el MP3 y buscarle el pulso cuesta ~3 s: se hace ahora, en
         # segundo plano, para que cuando el niño pida la canción suene ya.
         threading.Thread(target=song.warmup, args=(voice.TTS_SAMPLE_RATE,), daemon=True, name="song-warmup").start()
+        # Y lo mismo con las locuciones del arranque: decodificar cada MP3
+        # cuesta ~1 s, y la primera se necesita ya. Va antes de _boot_sequence()
+        # para que la bienvenida no espere al ffmpeg.
+        _warm_clips()
         _boot_sequence()
 
-    # Mientras se le pregunta el modo (arranque, /menu, /elegir_modo) manda esa
-    # escucha: dos sesiones de microfono a la vez se pisan.
-    while _modo_lock.locked():
+    # Mientras se le pregunta algo en el arranque (el cerebro con
+    # /elegir_cerebro, el modo de charla con /elegir_modo) manda ESA escucha:
+    # dos sesiones de microfono a la vez se pisan.
+    while _modo_lock.locked() or _cerebro_lock.locked():
         time.sleep(0.2)
 
     follow_up, _follow_up = _follow_up, None
