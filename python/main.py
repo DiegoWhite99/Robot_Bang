@@ -189,6 +189,10 @@ _HELP = """Comandos:
                         muestra sin hablar, "off" lo quita
   /arranque             repite la secuencia completa: aviso → BANG (quién lo
                         hizo) → QR del panel → PLUS/ESSENTIAL → presentación
+  /reboot               reinicia el ROBOT: se despide y vuelve en 1-2 min.
+                        Reinicia la placa entera si tiene permiso (una vez:
+                        bash tools/install_reboot_permission.sh); si no, la App
+  /reboot app           reinicia solo la App (~1 min, sin reiniciar la placa)
   /wifi                 estado de la red y dirección del dashboard
   /qr [off]             muestra el QR que lleva al dashboard (para el celular)
   /wifi_sync            repite la animación de "WiFi conectado"
@@ -542,6 +546,8 @@ def run_command(line):
             return "🛡 aviso en pantalla, sin voz (se quita con /aviso off)"
         threading.Thread(target=_show_aviso, daemon=True, name="aviso").start()
         return "🛡 aviso de seguridad: campanilla + voz + GIF"
+    if cmd in ("reboot", "reiniciar", "restart"):
+        return _reboot_cmd(arg)
     if cmd == "arranque":
         if boot_running():
             return "▶️ ya hay un arranque en curso: espera a que termine (o /menu para cortarlo)"
@@ -1393,6 +1399,46 @@ def _boot_sequence():
         _presentar_cerebro()
     finally:
         _boot_lock.release()
+
+
+# --- /reboot -----------------------------------------------------------------
+
+_REBOOT_ADIOS = "¡Me voy a reiniciar! Vuelvo en un minutito."
+_reboot_lock = threading.Lock()
+
+
+def _reboot_cmd(arg):
+    """/reboot: reinicia el robot (la placa, o si no hay permiso, la App).
+    /reboot app: solo la App.
+
+    El reinicio lo hace el ayudante del HOST (tools/wifi_helper.py), que lo
+    programa con unos segundos de margen: en ese margen el robot se despide en
+    voz alta, para que nadie piense que se colgo cuando la pantalla se apague.
+    """
+    if not _reboot_lock.acquire(blocking=False):
+        return "🔄 ya hay un reinicio en camino"
+    que = "app" if (arg or "").strip().lower() in ("app", "aplicacion", "aplicación", "software") else "board"
+    res = wifinet.reboot(que, delay=6)
+    if not res.get("ok"):
+        _reboot_lock.release()
+        return f"⚠ no pude reiniciar: {res.get('error') or 'el ayudante del host no contestó'}"
+
+    def adios():
+        try:
+            _broadcast_status("🔄 reiniciando... vuelvo en 1-2 minutos")
+            gestures.send(gestures.WAVE, _current_persona or guides.default_guide())
+            voice.say(WELCOME_VOICE, _REBOOT_ADIOS)
+        except Exception as exc:
+            _broadcast_debug(f"⚠ no me pude despedir: {exc}")
+
+    threading.Thread(target=adios, daemon=True, name="reboot").start()
+    if res.get("what") == "board":
+        return "🔄 la PLACA se reinicia en 6 s: el robot vuelve solo en 1-2 minutos (es la App de arranque)"
+    if res.get("fallback"):
+        return ("🔄 la APP se reinicia en 6 s (vuelve en ~1 min).\n"
+                "   La placa entera no: falta el permiso. Para eso, una vez en la placa:\n"
+                "   bash tools/install_reboot_permission.sh")
+    return "🔄 la APP se reinicia en 6 s: vuelve en ~1 minuto"
 
 
 def _card_cmd(arg):

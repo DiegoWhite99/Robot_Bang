@@ -19,11 +19,21 @@
 #   POST /scan                         {"networks": [{"ssid","signal","secure","active"}]}
 #   POST /connect {"ssid","password"}  conecta (crea el perfil si hace falta)
 #   POST /forget  {"ssid"}             borra el perfil guardado
+#   POST /reboot  {"what": "board"|"app"}  reinicia la placa entera o solo la App
+#
+# /reboot vive aqui y no en un ayudante aparte porque este ya es "el que hace
+# en el host lo que el contenedor no puede", con su token y su servicio. Desde
+# dentro del contenedor no hay forma de reiniciar nada: ni la placa (no hay
+# systemd) ni la App (matar main.py no la levanta: el contenedor tiene la
+# politica de reinicio "no").
 #
 #   Instalacion: bash tools/install_wifi_helper.sh
+#   Permiso para reiniciar la PLACA (una vez, pide sudo):
+#                bash tools/install_reboot_permission.sh
 
 import json
 import secrets
+import shlex
 import socket
 import subprocess
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -129,6 +139,60 @@ def forget(ssid):
     return st
 
 
+# --- Reinicio -------------------------------------------------------------------
+
+APP_DIR = Path(__file__).resolve().parent.parent
+# Cuanto espera el host antes de reiniciar: lo justo para que el robot termine
+# de despedirse en voz alta ("vuelvo en un minutito") y la respuesta HTTP
+# llegue al dashboard. Lo pide main.py en cada llamada.
+REBOOT_DELAY_S = 6
+
+
+def can_reboot():
+    """True si este usuario puede reiniciar la placa sin contraseña.
+
+    De fabrica NO puede (logind contesta "challenge": pide autenticacion). Lo
+    habilita, una sola vez, tools/install_reboot_permission.sh.
+    """
+    try:
+        out = subprocess.run(
+            ["busctl", "call", "org.freedesktop.login1", "/org/freedesktop/login1",
+             "org.freedesktop.login1.Manager", "CanReboot"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout
+    except Exception:
+        return False
+    return '"yes"' in out
+
+
+def _later(cmd, delay):
+    """Corre `cmd` dentro de `delay` segundos, DESPEGADO de este proceso: la
+    respuesta tiene que salir antes, y al reiniciar la App el contenedor que
+    hizo la peticion desaparece."""
+    subprocess.Popen(
+        ["sh", "-c", f"sleep {int(delay)}; exec {shlex.join(cmd)}"],
+        start_new_session=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+
+
+def reboot(what, delay=REBOOT_DELAY_S):
+    """Reinicia la placa ("board") o solo la App ("app").
+
+    Si se pide la placa y no hay permiso, reinicia la App y lo dice: un boton
+    de reiniciar que no hace nada es peor que uno que hace la mitad.
+    """
+    delay = max(1, min(30, int(delay)))
+    if what == "board":
+        if can_reboot():
+            _later(["systemctl", "reboot"], delay)
+            return {"ok": True, "what": "board", "delay": delay}
+        _later(["arduino-app-cli", "app", "restart", str(APP_DIR)], delay)
+        return {"ok": True, "what": "app", "delay": delay, "fallback": True,
+                "error": "sin permiso para reiniciar la placa: corre una vez bash tools/install_reboot_permission.sh"}
+    _later(["arduino-app-cli", "app", "restart", str(APP_DIR)], delay)
+    return {"ok": True, "what": "app", "delay": delay}
+
+
 class Handler(BaseHTTPRequestHandler):
     def _send(self, code, data):
         body = json.dumps(data).encode()
@@ -146,6 +210,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(403, {"ok": False, "error": "token"})
         if self.path == "/status":
             return self._send(200, status())
+        if self.path == "/can_reboot":
+            return self._send(200, {"ok": True, "board": can_reboot()})
         self._send(404, {"ok": False, "error": "no existe"})
 
     def do_POST(self):
@@ -157,6 +223,11 @@ class Handler(BaseHTTPRequestHandler):
             ssid = str(data.get("ssid", "")).strip()
             if self.path == "/scan":
                 return self._send(200, scan())
+            if self.path == "/reboot":
+                que = str(data.get("what", "board")).strip().lower()
+                if que not in ("board", "app"):
+                    return self._send(400, {"ok": False, "error": "what tiene que ser board o app"})
+                return self._send(200, reboot(que, data.get("delay", REBOOT_DELAY_S)))
             if self.path in ("/connect", "/forget") and not ssid:
                 return self._send(400, {"ok": False, "error": "falta el nombre de la red"})
             if self.path == "/connect":

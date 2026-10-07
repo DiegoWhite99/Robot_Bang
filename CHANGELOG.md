@@ -3,6 +3,22 @@
 Cambios por actualización. El detalle técnico de cada punto está en
 `DOCUMENTACION.md` (se indica la sección).
 
+## Sin publicar (después de la 1.1.1 stable)
+
+- **Reiniciar el robot** con el botón **🔄 REINICIAR** del dashboard (pide
+  confirmación) o con **`/reboot`** en la terminal. El robot se despide en voz
+  alta y vuelve solo en 1–2 minutos (es la App de arranque de la placa).
+  - Reinicia la **placa entera** si tiene permiso. De fábrica el usuario
+    `arduino` no lo tiene (logind pide contraseña), así que hay que darlo
+    **una vez**: `bash tools/install_reboot_permission.sh` (pide sudo; instala
+    una regla de polkit que solo permite *reiniciar*, nada más).
+  - Sin ese permiso, reinicia **la App**, y lo dice: un botón que no hace nada
+    sería peor. `/reboot app` reinicia solo la App a propósito (~1 min).
+  - Lo hace el ayudante del host (`tools/wifi_helper.py`, nuevo `POST
+    /reboot`), porque desde el contenedor no se puede reiniciar nada. Protegido
+    con el mismo token que el resto del ayudante.
+  - Probado: `/reboot` sin el permiso reinició la App y volvió sola.
+
 ## Versión 1.1.1 stable — 2026-10-07
 
 **La versión estable.** Junta todo lo de la 1.1.1 beta (más abajo) con lo de

@@ -76,3 +76,14 @@ def connect(ssid, password=""):
 
 def forget(ssid):
     return _call("POST", "/forget", {"ssid": ssid})
+
+
+def can_reboot():
+    """{"ok", "board"}: si el host puede reiniciar la placa entera."""
+    return _call("GET", "/can_reboot", timeout=10)
+
+
+def reboot(what="board", delay=6):
+    """Le pide al host que reinicie la placa ("board") o solo la App ("app").
+    Ver tools/wifi_helper.py: si no hay permiso para la placa, reinicia la App."""
+    return _call("POST", "/reboot", {"what": what, "delay": delay}, timeout=15)

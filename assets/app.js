@@ -382,6 +382,17 @@ terminalInput.addEventListener('keydown', (e) => {
 ui.on_message('terminal_response', (data) => {
   const out = (data && data.output) || '';
   if (out) termPrint(out, /^(⚠|Comando desconocido|No conozco)/.test(out) ? 'err' : 'ok');
+  // El reinicio se pide desde el boton, con la terminal cerrada: lo que pasa
+  // se cuenta en la barra de estado, que si se ve.
+  if (data && /^\/(reboot|reiniciar)/.test(data.line || '') && out) setStatus(out.split('\n')[0]);
+});
+
+// Boton REINICIAR = /reboot. Pide confirmacion: el dashboard lo abre un adulto,
+// pero un clic sin querer apaga el robot 1-2 minutos en mitad de una sesion.
+document.querySelector('#reboot-btn').addEventListener('click', () => {
+  if (!confirm('¿Reiniciar el robot?\n\nSe despide, se apaga y vuelve solo en 1-2 minutos.')) return;
+  setStatus('🔄 pidiendo el reinicio...');
+  ui.send_message('terminal', { line: '/reboot' });
 });
 ui.on_message('error', (msg) => {
   if (!terminal.hidden) termPrint(`⚠ ${msg}`, 'err');
