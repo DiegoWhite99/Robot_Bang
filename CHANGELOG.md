@@ -5,6 +5,24 @@ Cambios por actualización. El detalle técnico de cada punto está en
 
 ## Sin publicar (después de la 1.1.1 stable)
 
+- **El modo local ya no se repite** (`bang._no_repetir()`, `rag.py`). Visto en
+  el robot: el niño decía algo, Cristal contestaba *"¿Qué tan divertido sería
+  que el mundo fuera tan grande como la ciudad?"*, el niño decía *"escucha,
+  respóndeme"* y Cristal decía **lo mismo** otra vez. Dos causas y dos arreglos:
+  - **La pista del RAG era siempre la misma**: con el mismo reto, BM25
+    devolvía el mismo fragmento cada turno y Qwen recibía casi el mismo
+    mensaje. Ahora `rag.retrieve(exclude=...)` no repite los fragmentos de los
+    últimos 12 turnos: cada turno lleva una pista distinta de `knowledge/`.
+  - **Qwen copiaba su respuesta anterior** (un modelo de 0,8B con su respuesta
+    en la memoria tiende a repetirla). Si la respuesta nueva se parece ≥ 62 %
+    a una de las 4 últimas, se cambia por **una pregunta fresca de la
+    metodología** (`rag.fresh_question()`), al instante y sin volver a esperar
+    al modelo 15–30 s, y se le borra la memoria corta para cortar el bucle.
+    Las preguntas salen de `bang_metodologia.md` y de las fichas de los guías,
+    no de los ejemplos de otros retos ni del informe para adultos, y sin las
+    que sueltas no se entienden ("¿Qué haría *ella* aquí?").
+  - Probado con las frases exactas del robot: parecido 0,99 → detectado, y en
+    cada intento sale una pregunta distinta.
 - **Música de "estoy pensando"** (`voice.thinking_start()`): mientras el
   cerebro piensa suena un motivo suave de marimba, **"tu-lún… tu-lún"**, en
   bucle, en vez de silencio. Empieza tras el pitido de "te escuché" y se para

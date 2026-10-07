@@ -21,6 +21,7 @@
 # Prueba rapida:  python3 python/rag.py "mi reto es reciclar" crispi solida
 
 import math
+import random
 import re
 import sys
 import unicodedata
@@ -243,6 +244,7 @@ class _BM25:
 
 CHUNKS = _load()
 _INDEX = _BM25([tokens(c.text) for c in CHUNKS])
+_TEXTS = {c.text for c in CHUNKS}
 
 
 # Lo de la fase en curso y lo del propio guia pesa mas que lo general: con
@@ -254,23 +256,36 @@ def _boost(c, persona, phase):
     return (PHASE_BOOST if phase and c.phase == phase else 1.0) * (PERSONA_BOOST if persona and c.persona == persona else 1.0)
 
 
-def retrieve(query, persona=None, phase=None, k=2, max_chars=200, kinds=("pista", "perfil")):
+def retrieve(query, persona=None, phase=None, k=2, max_chars=200, kinds=("pista", "perfil"), exclude=(), used=None):
     """Los fragmentos mas utiles para esta frase, juntos en <= max_chars.
 
     Filtra por guia (los suyos + los generales), fase (los de esa fase + los
     que valen siempre) y tipo. Si nada coincide, devuelve la pista de la fase
     del propio guia, para que el modelo local siempre tenga un empujon.
+
+    exclude: textos de fragmentos que NO se quieren (los que ya se usaron hace
+    poco en esta conversacion). Es lo que evita que el modelo local repita:
+    con el mismo reto, BM25 devolvia el MISMO fragmento turno tras turno, Qwen
+    recibia casi el mismo mensaje y contestaba casi lo mismo. Si al excluir no
+    queda nada, se ignora exclude (mejor una pista repetida que ninguna).
+    used: si es una lista, se le agregan los fragmentos elegidos.
     """
     q = tokens(query)
-    pool = [
+    excluir = set(exclude or ())
+    base = [
         i for i, c in enumerate(CHUNKS)
         if c.kind in kinds and c.persona in (None, persona) and (c.phase is None or c.phase == phase)
     ]
+    pool = [i for i in base if CHUNKS[i].text not in excluir] or base
     ranked = sorted(((_INDEX.score(q, i) * _boost(CHUNKS[i], persona, phase), i) for i in pool), reverse=True)
     picks = [CHUNKS[i].text for s, i in ranked if s > 0][: max(k, 1) * 3]
     if not picks:
         picks = [c.text for c in CHUNKS if c.kind == "pista" and c.phase == phase and c.persona == persona]
         picks += [c.text for c in CHUNKS if c.kind == "pista" and c.phase == phase and c.persona is None][:1]
+        # Tambien aqui, que es justo el caso de las frases cortas o mal
+        # entendidas ("escuche respondeme"): sin esto salia siempre la misma.
+        picks = [t for t in picks if t not in excluir] or picks
+        random.shuffle(picks)
     out = []
     for text in picks:
         if len(out) >= k:
@@ -279,7 +294,52 @@ def retrieve(query, persona=None, phase=None, k=2, max_chars=200, kinds=("pista"
             out.append(text)
     if not out and picks:
         out = [picks[0][:max_chars].rsplit(" ", 1)[0]]
+    if used is not None:
+        used.extend(t for t in out if t in _TEXTS)
     return " ".join(out)
+
+
+_QUESTION = re.compile(r"¿[^?¿]{8,140}\?")
+# De donde NO sacar preguntas para decirle al niño: los ejemplos son de OTROS
+# retos ("¿y si en vez de sonar, se apagara la tele?" no viene al caso del
+# suyo) y el informe de tarjetas esta escrito para adultos ("¿Necesitas
+# estrategia y foco de valor?"). Sirven como pista para el modelo, no para
+# decirlas tal cual.
+_NO_DECIR = ("ejemplos_retos", "Informe_general")
+# Y preguntas que, sacadas de su parrafo, no se entienden: "¿Que haria ELLA
+# aqui?" (ella era "la persona que mas admiras", una frase antes) o "¿que idea
+# aparece para MI reto?" (lo dice el niño mirando una tarjeta, no el guia).
+_SUELTA_NO = re.compile(r"(?i)\b(ella|él|ellos|ellas|eso mismo|mi reto)\b")
+
+
+def fresh_question(query, persona, phase, exclude=()):
+    """Una PREGUNTA de knowledge/ lista para decir en voz alta, que no se haya
+    usado hace poco: (pregunta, texto del fragmento), o ("", "").
+
+    Es el plan B cuando el modelo local se repite: en vez de volver a esperarlo
+    15-30 s, el guia sigue con una pregunta de la metodologia, elegida por
+    parecido con lo que dijo el niño y siempre distinta a las ultimas.
+    """
+    q = tokens(query)
+    excluir = set(exclude or ())
+    cands = []
+    for i, c in enumerate(CHUNKS):
+        if c.kind != "pista" or c.persona not in (None, persona) or (c.phase not in (None, phase)):
+            continue
+        if c.text in excluir or any(x in c.source for x in _NO_DECIR):
+            continue
+        m = _QUESTION.search(c.text)
+        if m and "..." not in m.group(0) and "…" not in m.group(0) and not _SUELTA_NO.search(m.group(0)):
+            # ("¿Como podriamos...?" es una plantilla a medio escribir.)
+            pregunta = m.group(0)
+            pregunta = "¿" + pregunta[1:2].upper() + pregunta[2:]
+            cands.append((_INDEX.score(q, i) * _boost(c, persona, phase) + random.random() * 0.01, pregunta, c.text))
+    if not cands:
+        return "", ""
+    cands.sort(reverse=True)
+    # Entre las 3 mas parecidas, una al azar: relevante pero no siempre igual.
+    _, pregunta, texto = random.choice(cands[:3])
+    return pregunta, texto
 
 
 def card_reading(persona, card_text):

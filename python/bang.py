@@ -28,10 +28,12 @@
 # En los DOS modos, lo innegociable (identidad, datos privados, peligro,
 # malestar) se contesta con guardrails.respuesta_fija() antes de nada.
 
+import difflib
 import json
 import random
 import re
 import unicodedata
+from collections import deque
 from dataclasses import dataclass, field
 
 import brain
@@ -120,6 +122,11 @@ class Session:
     # De que guia viene el reto si se lo pasaron ("pasame con Cori"): tambien
     # una sola vez, para que el nuevo guia sepa que releva a otro.
     relevo: str = ""
+    # Contra las respuestas repetidas del modelo local (ver _no_repetir()):
+    # los fragmentos del RAG que ya se le dieron como pista, y lo ultimo que
+    # dijo el guia.
+    pistas_usadas: deque = field(default_factory=lambda: deque(maxlen=12))
+    dichas: deque = field(default_factory=lambda: deque(maxlen=4))
 
     def state(self):
         """Lo que la web necesita para mostrar el reto."""
@@ -296,7 +303,11 @@ _LOCAL_TASK = {
 def _local_user(s, text):
     """Mensaje corto para el modelo local (~90 tokens): fase, reto, pista, tarea."""
     query = text if len(text) >= 25 else f"{text} {s.reto}"
-    pista = rag.retrieve(query, s.persona, s.phase, k=2, max_chars=200)
+    # Una pista que no se haya usado en los ultimos turnos: con el mismo reto,
+    # BM25 devolvia el mismo fragmento cada vez y Qwen contestaba lo mismo.
+    usados = []
+    pista = rag.retrieve(query, s.persona, s.phase, k=2, max_chars=200, exclude=s.pistas_usadas, used=usados)
+    s.pistas_usadas.extend(usados)
     parts = [f"[{PHASE_LABELS[s.phase]}]"]
     if s.reto and s.reto.strip() != text.strip():
         parts.append("Reto: " + " ".join(s.reto.split()[:15]))
@@ -311,6 +322,42 @@ def _local_user(s, text):
     return "\n".join(parts)
 
 
+# --- Que el modelo local no se repita ------------------------------------------
+# Visto en el robot (modo Essentials, Cristal, fase gaseosa):
+#   niño:    "si y a mi me gustaria que practicas de arte..."
+#   Cristal: "¿Que tan divertida seria que el mundo fuera tan grande como la ciudad?"
+#   niño:    "escuche, respondeme"
+#   Cristal: "¿Que tan divertido seria que el mund..."   <- la misma
+# Un modelo de 0,8B con la respuesta anterior en su memoria tiende a copiarla.
+# Dos defensas: la pista del RAG rota (ver _local_user) y, si aun asi sale casi
+# igual a algo de lo ultimo que dijo, se cambia por una pregunta FRESCA de
+# knowledge/ (rag.fresh_question): al instante, sin volver a esperar al modelo
+# otros 15-30 s, y se le borra la memoria corta para cortar el bucle.
+_REPITE_RATIO = 0.62  # parecido (difflib, sin tildes) a partir del cual es "lo mismo"
+_VALIDA = ("¡Me gusta cómo piensas!", "Te sigo.", "Interesante.", "Vamos por otro lado.", "Buena.")
+
+
+def _parecido(a, b):
+    return difflib.SequenceMatcher(None, _plain(a), _plain(b)).ratio()
+
+
+def _no_repetir(s, text, reply):
+    """La respuesta, o una pregunta fresca del RAG si repite lo ultimo dicho."""
+    if not reply or not s.dichas:
+        return reply
+    peor = max(_parecido(reply, d) for d in s.dichas)
+    if peor < _REPITE_RATIO:
+        return reply
+    query = text if len(text) >= 25 else f"{text} {s.reto}"
+    pregunta, fuente = rag.fresh_question(query, s.persona, s.phase, exclude=s.pistas_usadas)
+    if not pregunta:
+        return reply
+    s.pistas_usadas.append(fuente)
+    llm_router.clear(s.persona)  # la memoria corta es de donde copiaba
+    logger.info(f"El modelo local se repitio ({peor:.2f}): uso una pregunta del RAG")
+    return f"{random.choice(_VALIDA)} {pregunta}"
+
+
 def _ask(s, text, temperature, fallback=True):
     """Una llamada al LLM del turno. Devuelve (texto, local): local=True si
     contesto el modelo local (modo Essentials, o respaldo porque Gemini fallo).
@@ -322,7 +369,10 @@ def _ask(s, text, temperature, fallback=True):
     )
     if raw is None and not fallback:
         return None, False
-    return (raw if raw is not None else brain.FALLBACK_REPLY), llm_router.last_source() == "local"
+    local = llm_router.last_source() == "local"
+    if local:
+        raw = _no_repetir(s, text, raw)
+    return (raw if raw is not None else brain.FALLBACK_REPLY), local
 
 
 # Muletillas y saludos con que suele empezar el reto dicho en voz alta.
@@ -443,6 +493,8 @@ def turn(persona, text):
     if s is not None:
         # Las notas de "te cortaron" y "te pasaron el reto" valen un turno.
         s.interrumpido = s.relevo = ""
+        if result.reply:
+            s.dichas.append(result.reply)  # para _no_repetir()
     # Tema delicado dicho como reto: el reto sigue, y una vez por reto se
     # recuerda hablarlo con un adulto.
     aviso = guardrails.aviso_adulto(text)
