@@ -1698,6 +1698,9 @@ _SOURCE_LABELS = {"gemini": "☁️ Gemini", "gemini_web": "☁️🔎 Gemini + 
 def _say_filler(persona):
     global _filler_turn
     _filler_turn += 1
+    # La musica de pensar se calla para la frase y vuelve despues: si no, la
+    # frase esperaria a que terminara el "tu-lun" que estuviera sonando.
+    voice.thinking_stop()
     try:
         # Gesto de pensar: un brazo arriba, quieto. Es exactamente lo que dice
         # la frase ("déjame pensarlo"), y se nota que el robot no se colgó.
@@ -1705,6 +1708,8 @@ def _say_filler(persona):
         voice.say_cached(persona, voice.FILLER_KEYS[_filler_turn % len(voice.FILLER_KEYS)])
     except Exception as exc:
         _broadcast_debug(f"⚠ no pude decir la frase de relleno: {exc}")
+    finally:
+        voice.thinking_start()
 
 
 def _turn_worker(job, box):
@@ -1856,14 +1861,20 @@ def loop():
     box = {}
     worker = threading.Thread(target=_turn_worker, args=(job, box), daemon=True, name="turn")
     worker.start()
-    if slow:
-        _broadcast_status(f"🤔 {name} está pensando (modelo local)...")
-        _say_filler(persona)
-    else:
-        worker.join(PLUS_FILLER_AFTER)
-        if worker.is_alive():
+    # "Tu-lun... tu-lun" mientras piensa (ver voice.thinking_start()). Se para
+    # en seco en cuanto la respuesta esta lista, antes de hablar.
+    voice.thinking_start()
+    try:
+        if slow:
+            _broadcast_status(f"🤔 {name} está pensando (modelo local)...")
             _say_filler(persona)
-    worker.join()
+        else:
+            worker.join(PLUS_FILLER_AFTER)
+            if worker.is_alive():
+                _say_filler(persona)
+        worker.join()
+    finally:
+        voice.thinking_stop()
     result = box.get("result") or bang.Turn(brain.FALLBACK_REPLY)
     reply = intro + result.reply
     # En Curioso, "ponte triste" trae su propio gesto; si no, se saca del texto.

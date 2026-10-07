@@ -324,6 +324,22 @@ def _wav_bytes(pcm, sample_rate):
     return np.frombuffer(buf.getvalue(), dtype=np.uint8)
 
 
+# El "mmm" no se dice en la voz local. Piper no sabe pronunciar una muletilla:
+# lee la palabra "Mmm" como un zumbido raro (eme-eme) que no suena a alguien
+# pensando sino a un fallo. Y puede venir de cualquier lado —las frases de
+# relleno, la orden "piensa" del modo Curioso, o el propio Qwen, que empieza
+# respuestas con "Mmm"—, asi que se quita AQUI, por donde pasa todo lo que se
+# dice en Essentials. En Plus se queda: la voz de Google si lo hace natural.
+_MULETILLA = re.compile(r"(?i)\b(?:h?m{2,}h*|mh+|hm+)\b[\s.,…!¡?¿]*")
+
+
+def sin_muletillas(text):
+    """El texto sin "mmm", "hmm", "mmh"... y con la mayuscula donde toca."""
+    t = _MULETILLA.sub("", text or "").strip()
+    t = re.sub(r"^[\s.,…;:]+", "", t)
+    return t[:1].upper() + t[1:] if t else ""
+
+
 def synthesize(text, voice=None, sample_rate=24000):
     """Un WAV (np.uint8) con `text` dicho por la voz local, al sample_rate pedido.
 
@@ -332,7 +348,7 @@ def synthesize(text, voice=None, sample_rate=24000):
     dos caminos de reproduccion que mantener.
     Lanza RuntimeError solo si NINGUNO de los dos esta disponible.
     """
-    data = (text or "").strip()
+    data = sin_muletillas(text)
     if not data:
         return _wav_bytes(np.zeros(0, dtype=np.int16), sample_rate)
 

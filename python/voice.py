@@ -2107,6 +2107,119 @@ def emotion_sound_reset():
         _emo_last_any = 0.0
 
 
+# --- Musica de "estoy pensando": tu-lun... tu-lun -------------------------------
+# Mientras el cerebro piensa, el robot no se queda en silencio: suena un motivo
+# suave de marimba, "tu-LUN... tu-LUN", en bucle. Es lo que hace un asistente
+# de voz: el silencio despues de hablarle se siente como que no te oyo; un
+# sonido de espera dice "te escuche y estoy en ello" sin decir una palabra.
+#
+# Como se porta:
+#   - empieza thinking_start() (main.py, al lanzar el turno) tras un pequeño
+#     respiro, para no pisar el pitido de "te escuche";
+#   - para con thinking_stop() en el bloque de audio siguiente (~43 ms): la
+#     respuesta no espera a que termine el motivo;
+#   - suelta el parlante entre motivo y motivo, asi la frase de relleno o el
+#     baile pueden meterse sin esperar;
+#   - tiene tope (_THINK_MAX_S): si algo falla y nadie la para, se calla sola.
+#
+# Va BAJITO (_THINK_GAIN), por debajo de la voz y de los sonidos de emocion:
+# acompaña la espera, no la llena.
+
+_THINK_GAIN = 3200
+_THINK_DELAY_S = 0.35   # despues del pitido de "te escuche" (~0,16 s)
+_THINK_MAX_S = 90.0
+# (nota, duracion) de cada "tu-lun", y el silencio despues. Dos variantes que
+# se alternan, para que en una espera larga (modo local: 15-30 s) no se
+# vuelva un taladro.
+_THINK_MOTIFS = (
+    ((659.25, 0.12), (880.00, 0.42)),   # mi - LA
+    ((587.33, 0.12), (783.99, 0.46)),   # re - SOL
+)
+_THINK_GAP_S = 0.55
+
+_think_stop = threading.Event()
+_think_thread = None
+_think_cache = {}
+
+
+def _marimba(freq, dur, sample_rate):
+    """Una nota de marimba: ataque seco y caida rapida, con el armonico que le
+    da el "toc" de madera (4x) apagandose antes que la fundamental."""
+    n = max(1, int(dur * sample_rate))
+    t = np.arange(n) / sample_rate
+    onda = (np.sin(2 * np.pi * freq * t) * np.exp(-t * 6.0)
+            + 0.35 * np.sin(2 * np.pi * freq * 4 * t) * np.exp(-t * 28.0))
+    ataque = np.clip(t / 0.004, 0, 1)
+    return onda * ataque
+
+
+def _thinking_pcm(k, sample_rate):
+    """El PCM de un "tu-lun" (variante k), con su silencio detras."""
+    key = (k, sample_rate)
+    hit = _think_cache.get(key)
+    if hit is not None:
+        return hit
+    trozos = []
+    for freq, dur in _THINK_MOTIFS[k % len(_THINK_MOTIFS)]:
+        trozos.append(_marimba(freq, dur, sample_rate))
+    trozos.append(np.zeros(int(_THINK_GAP_S * sample_rate)))
+    pcm = np.concatenate(trozos)
+    pico = float(np.abs(pcm).max()) or 1.0
+    pcm = (pcm / pico * _THINK_GAIN).astype(np.int16)
+    _think_cache[key] = pcm
+    return pcm
+
+
+def _thinking_loop():
+    fin = time.monotonic() + _THINK_MAX_S
+    if _think_stop.wait(_THINK_DELAY_S):
+        return
+    k = 0
+    while not _think_stop.is_set() and time.monotonic() < fin:
+        try:
+            with _spk_lock:
+                if _think_stop.is_set():
+                    return
+                spk = _speaker()
+                pcm = _thinking_pcm(k, spk.sample_rate)
+                chunk = spk.buffer_size
+                for i in range(0, len(pcm), chunk):
+                    if _think_stop.is_set():
+                        # Se deja de escribir y ya: lo que queda en el buffer
+                        # (~100 ms) es la cola de una nota de marimba, que se
+                        # apaga sola. NO se hace _drop_speaker(): eso cierra y
+                        # reabre el parlante, y con la bocina Bluetooth da un
+                        # "pop" y retrasa la respuesta en CADA turno.
+                        return
+                    spk.play(pcm[i : i + chunk])
+        except Exception as exc:
+            logger.debug(f"No sono la musica de pensar: {exc}")
+            _reset_speaker()
+            return
+        k += 1
+        # Fuera del candado: aqui la frase de relleno puede tomar el parlante.
+        time.sleep(0.01)
+
+
+def thinking_start():
+    """Empieza la musica de "estoy pensando" (no bloquea)."""
+    global _think_thread
+    thinking_stop()
+    _think_stop.clear()
+    _think_thread = threading.Thread(target=_thinking_loop, daemon=True, name="thinking")
+    _think_thread.start()
+
+
+def thinking_stop():
+    """La para ya. Vuelve cuando el parlante quedo libre (un bloque, ~43 ms)."""
+    global _think_thread
+    _think_stop.set()
+    t = _think_thread
+    if t is not None and t is not threading.current_thread():
+        t.join(timeout=1.0)
+    _think_thread = None
+
+
 # --- Celebracion: la "cancioncita + baile" de Diome-chan ----------------------
 #
 # Viene del tutorial de Diome-chan (Drive "Tutorial diome-chan", partes 2 y 3):
@@ -3167,7 +3280,10 @@ _cached_wavs = {}
 
 def _cached_text(persona, key):
     table = _CACHED_PHRASES.get(key) or {}
-    return table.get(persona) or next(iter(table.values()), "")
+    text = table.get(persona) or next(iter(table.values()), "")
+    # En la voz local, sin "mmm" (ver localvoice.sin_muletillas): asi la boca
+    # no hace la forma de una "m" que no suena.
+    return localvoice.sin_muletillas(text) if local_voice() else text
 
 
 def _cached_wav(persona, key):
@@ -3261,6 +3377,11 @@ def say(persona, text, barge=None):
     stop = barge.event if barge is not None else None
     t0 = time.monotonic()
     voice_name = _voice_name(persona)
+    if voice_name in _LOCAL_VOICE_NAMES:
+        # Sin "mmm" en la voz local (ver localvoice.sin_muletillas). Se quita
+        # aqui tambien, y no solo al sintetizar, para que la boca no gesticule
+        # una "m" que no suena.
+        text = localvoice.sin_muletillas(text)
     parts = _split_sentences(text)
     futures = [_tts_pool.submit(_synthesize, p, voice_name) for p in parts]
     spoken = []

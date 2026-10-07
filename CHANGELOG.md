@@ -5,6 +5,19 @@ Cambios por actualización. El detalle técnico de cada punto está en
 
 ## Sin publicar (después de la 1.1.1 stable)
 
+- **Música de "estoy pensando"** (`voice.thinking_start()`): mientras el
+  cerebro piensa suena un motivo suave de marimba, **"tu-lún… tu-lún"**, en
+  bucle, en vez de silencio. Empieza tras el pitido de "te escuché" y se para
+  en ~20 ms cuando llega la respuesta. Va bajito (pico 3200; la voz anda por
+  12000–20000) y alterna dos variantes para que en las esperas largas del modo
+  local no se vuelva un taladro. Se calla para la frase de relleno y vuelve
+  después. No cierra el parlante al pararse (con la bocina Bluetooth eso daba
+  un "pop" en cada turno).
+- **Sin "mmm" en el modo local** (`localvoice.sin_muletillas()`): Piper no
+  sabe decir una muletilla y "Mmm" sonaba a zumbido. Se quita en la voz local,
+  por donde pasa todo lo de Essentials (relleno, la orden "piensa" de Curioso
+  y lo que conteste Qwen). **La frase sigue sonando**, solo sin el "mmm":
+  "Qué interesante. Dame un segundo...". En Plus se queda: ahí suena natural.
 - **Reiniciar el robot** con el botón **🔄 REINICIAR** del dashboard (pide
   confirmación) o con **`/reboot`** en la terminal. El robot se despide en voz
   alta y vuelve solo en 1–2 minutos (es la App de arranque de la placa).
